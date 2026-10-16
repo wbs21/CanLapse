@@ -2,8 +2,8 @@
 
 > 面向手绘创作者（SAI2 > Photoshop > CLIP STUDIO PAINT > Krita）的 **Windows 画布窗口缩时录屏工具**。
 
-当前状态：**技术验证已完成，垂直切片的抓帧半边已跑通**；视频合成已在原型中打通并复核，
-正在接入正式代码；GUI（460×380 单页 + 悬浮操作条）尚未开始。
+当前状态：**垂直切片已闭环** —— 拾取窗口 → 差分 → PNG 缓存 → 合成 MP4 已端到端实测出片；
+GUI（460×380 单页 + 悬浮操作条）尚未开始。
 
 ## 它怎么工作
 
@@ -24,12 +24,20 @@
 | 帧差分（静止画面不存帧） | ✅ 已实测 | 4fps×6s：变化目标存 24 帧，静止目标存 1 帧 |
 | 会话缓存 `frame_xxxx.png` + `markers.json` | ✅ 有单测覆盖 | `cargo test`（11 项全过） |
 | 录制容错（目标窗口消失 / 单帧失败跳过） | ✅ 已实测 | 目标关闭后自动停止并写 `completed:false` |
-| 视频合成（H.264 MP4） | 🟡 原型已验证，**未接入 `src/`** | [FINDINGS](spikes/encode-mp4/FINDINGS.md) |
+| 视频合成（H.264 MP4） | ✅ 已接入并端到端实测 | 24 帧 → 480×320 / 2.4s，`ffprobe -count_frames` = 24 |
+| 取消合成（部分文件仍可播放） | ✅ 已实测 | `--frames 8` → 8 帧 / 0.8s，解码退出码 0 |
 | 单页 GUI 460×380 + 悬浮操作条 | ❌ 未开始 | — |
 | 历史会话面板（重新导出/打开/删除） | 🟡 数据层已有，UI 未做 | `canlapse sessions` |
 | 帮助弹窗 / 预览大图 | ❌ 未开始 | — |
 
-`src/encode.rs` 目前是**明确返回 `Err` 的占位实现** —— 接入完成前它不会静默产出一个假的 MP4。
+编码走**导入库静态链接**：`build.rs` 会按 `CANLAPSE_FFMPEG_MIN`（默认 `D:\CapLite\ffmpeg-min`）
+输出链接参数，并把 6 个运行时 DLL（5 个 `av*` + `libwinpthread-1.dll`）自动复制到
+`target/<profile>` 与 `target/<profile>/deps`。**DLL 必须与 exe 同目录**——导入表在进程启动时
+就要解析，那时 `main()` 还没运行，在代码里 `SetDllDirectory` 来不及。
+
+`src/encode.rs` 相对原型多做了三件生产代码才需要的事：FFI 对象 RAII 释放、
+合成可中途取消（取消后仍写 trailer，产出**可播放的部分视频**）、
+会话里混有不同尺寸帧时（录制中用户改了画布窗口大小）自动统一缩放。
 
 ## 关键决策
 
@@ -54,6 +62,7 @@ cargo build --offline
 
 .\target\debug\canlapse.exe list                                  # 列出可见顶层窗口
 .\target\debug\canlapse.exe pick                                  # 鼠标拾取画布窗口
+.\target\debug\canlapse.exe doctor                                # 自检：抓帧/编码/运行时 DLL/缓存
 .\target\debug\canlapse.exe record --pick --fps 2 --threshold 0.01 # 录制（Esc 停止，F8 打标记）
 .\target\debug\canlapse.exe record --title Krita --duration 30 --name 下雨天
 .\target\debug\canlapse.exe sessions                              # 历史缓存会话

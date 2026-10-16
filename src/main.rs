@@ -74,7 +74,8 @@ fn help() {
   canlapse pick                                    鼠标拾取画布窗口并打印结果
   canlapse record [目标] [选项]                     开始录制（抓帧到缓存目录）
   canlapse sessions                                列出历史缓存会话
-  canlapse encode --session DIR [选项]             把会话缓存合成 MP4（尚未接入）
+  canlapse encode --session DIR [选项]             把会话缓存合成 MP4
+  canlapse doctor                                  自检（抓帧/编码/运行时 DLL/缓存）
   canlapse --help
 
 录制目标（三选一，都不给则进入鼠标拾取）:
@@ -89,6 +90,13 @@ fn help() {
   --threshold F        像素差异阈值 0.00~0.05（默认 0.01）
   --duration SEC       录制时长上限，0 或省略表示手动停止（Esc 或关闭画布窗口）
   --quiet              少打印
+
+导出选项（canlapse encode）:
+  --session DIR        会话缓存目录（必填）
+  --fps N              导出播放帧率，默认 10（常用 5/10/15/20/24）
+  --quality LEVEL      画质档位 high/medium/low（也接受 高/中/低），默认 high
+  --out FILE           输出 MP4 路径（默认 <会话目录>\timelapse.mp4）
+  --frames N           只导出前 N 帧，用于预览；走与【取消合成】相同的路径
 
 说明:
   * 抓帧走 DWM 缩略图（宿主窗口 + PrintWindow(PW_RENDERFULLCONTENT)）：
@@ -384,6 +392,7 @@ fn cmd_encode(args: &[String]) -> i32 {
     let mut fps = 10.0f64;
     let mut quality = encode::Quality::High;
     let mut out: Option<PathBuf> = None;
+    let mut max_frames: Option<u32> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -413,6 +422,13 @@ fn cmd_encode(args: &[String]) -> i32 {
                     out = Some(PathBuf::from(v));
                 }
             }
+            // 只导出前 N 帧（预览用）。它走的正是 GUI 上【取消合成】那条路径：
+            // 回调返回 Cancel 后仍会写 trailer，产出可播放的部分视频。
+            "--frames" => {
+                if let Some(v) = next_value(args, &mut i) {
+                    max_frames = v.parse().ok();
+                }
+            }
             _ => {}
         }
         i += 1;
@@ -426,17 +442,29 @@ fn cmd_encode(args: &[String]) -> i32 {
     };
     let output = out.unwrap_or_else(|| dir.join("timelapse.mp4"));
     let opts = encode::EncodeOptions { fps, quality, output: output.clone() };
+    println!(
+        "开始合成：{} fps，画质 {}，输出 {}",
+        fps,
+        quality.label(),
+        output.display()
+    );
     let mut last = 0u32;
     let r = encode::encode_session(&dir, &opts, &mut |done, total| {
         if done != last {
             last = done;
-            print!("\r编码 {done}/{total}");
+            print!("\r编码 {done}/{total} 帧");
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+        }
+        match max_frames {
+            Some(n) if done >= n => encode::Progress::Cancel,
+            _ => encode::Progress::Continue,
         }
     });
     match r {
-        Ok(s) => {
+        Ok(encode::EncodeOutcome::Done(s)) => {
             println!(
-                "\n完成：{} 帧，{:.1} MB，{}x{}，{:.1} 秒\n输出: {}",
+                "\n合成完成：{} 帧，{:.2} MB，{}x{}，{:.1} 秒\n输出: {}",
                 s.frames,
                 s.bytes as f64 / 1048576.0,
                 s.width,
@@ -446,11 +474,81 @@ fn cmd_encode(args: &[String]) -> i32 {
             );
             0
         }
+        Ok(encode::EncodeOutcome::Cancelled(s)) => {
+            println!(
+                "\n合成已取消：已写入 {} 帧（{:.2} MB），文件仍是可播放的部分视频\n输出: {}",
+                s.frames,
+                s.bytes as f64 / 1048576.0,
+                output.display()
+            );
+            1
+        }
         Err(e) => {
             eprintln!("合成失败: {e}");
             2
         }
     }
+}
+
+fn cmd_doctor() -> i32 {
+    println!("CanLapse {} 自检", env!("CARGO_PKG_VERSION"));
+
+    println!("\n[抓帧]");
+    let comp = capture::composition_enabled();
+    println!(
+        "  桌面合成 (DWM)：{}",
+        if comp {
+            "已开启 ✓"
+        } else {
+            "未开启 ✗ —— 缩略图抓帧不可用，录屏无法工作"
+        }
+    );
+
+    println!("\n[编码]");
+    let ffdir = std::env::var("CANLAPSE_FFMPEG_MIN")
+        .or_else(|_| std::env::var("FFMPEG_MIN_DIR"))
+        .unwrap_or_else(|_| r"D:\CapLite\ffmpeg-min".to_string());
+    println!("  ffmpeg-min 目录：{ffdir}");
+    println!(
+        "  libopenh264 编码器：{}",
+        if encode::encoder_available() {
+            "可用 ✓"
+        } else {
+            "不可用 ✗"
+        }
+    );
+    println!("  avcodec 构建配置：{}", encode::backend_info());
+
+    println!("\n[运行时 DLL]（导入表在进程启动时就要解析，必须在 exe 同目录）");
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            println!("  exe 目录：{}", dir.display());
+            let names: Vec<String> = std::fs::read_dir(dir)
+                .map(|rd| {
+                    rd.flatten()
+                        .map(|e| e.file_name().to_string_lossy().to_string())
+                        .filter(|n| n.to_ascii_lowercase().ends_with(".dll"))
+                        .collect()
+                })
+                .unwrap_or_default();
+            for prefix in ["avcodec-", "avformat-", "avutil-", "swscale-", "libwinpthread"] {
+                let hit = names
+                    .iter()
+                    .find(|n| n.to_ascii_lowercase().starts_with(prefix));
+                match hit {
+                    Some(n) => println!("  {prefix:<14} ✓ {n}"),
+                    None => println!("  {prefix:<14} ✗ 缺失"),
+                }
+            }
+        }
+    }
+
+    println!("\n[缓存]");
+    println!("  缓存根目录：{}", cache_root().display());
+    let sessions = session::Session::list(&cache_root());
+    println!("  已有会话：{} 个", sessions.len());
+
+    0
 }
 
 fn main() {
@@ -466,6 +564,7 @@ fn main() {
         "list" | "--list" => cmd_list(),
         "pick" | "--pick" => cmd_pick(),
         "sessions" => cmd_sessions(&cache_root()),
+        "doctor" => cmd_doctor(),
         "encode" => cmd_encode(&rest),
         "record" => {
             let mut a = RecordArgs::default();

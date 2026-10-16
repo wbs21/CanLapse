@@ -1,6 +1,6 @@
 # 0003 — 视频编码：手写 FFI 直链「自编译最小 ffmpeg（libopenh264）」
 
-- 状态：已接受
+- 状态：已接受，**已接入 `src/encode.rs` 并端到端实测出片**
 - 日期：2026-02-14
 - 关联证据：[spikes/encode-mp4/FINDINGS.md](../../spikes/encode-mp4/FINDINGS.md)（含完整复现步骤与实测偏移表）
 
@@ -94,3 +94,56 @@ target 为 `x86_64-pc-windows-msvc`、预编译 ffmpeg 位于 `D:\CapLite\ffmpeg
 0002 决定"谁来抓帧"，0003 决定"谁来编码"，两者互不依赖：
 抓帧走 DWM 缩略图，编码走 ffmpeg-min 的 libopenh264。导出参数与录制参数彼此独立，
 由上层（历史会话的「重新导出」）组合。
+
+## 接入实现（`src/encode.rs`）
+
+原型（spike）只关心"能不能跑通"，生产代码额外做了三件事：
+
+1. **FFI 对象 RAII 释放**：`Muxer` 持有 `oc/ctx/frame/pkt/sws`，任何一步失败直接返回错误，
+   由 `Drop` 统一释放；不会像原型那样在早退路径上泄漏 context。
+2. **合成可中途取消**（导出面板的【取消合成】）：`progress` 回调返回 `Progress::Cancel` 后
+   仍然 `avcodec_send_frame(NULL)` 冲刷并写 trailer，因此**已编码的部分是可播放的视频**，
+   而不是一个损坏文件。实测：`--frames 8` → 8 帧 / 0.800s，`ffmpeg -f null -` 退出码 0。
+3. **混合尺寸会话**：录制过程中用户若改了画布窗口大小，同一会话里会有不同尺寸的帧；
+   编码时统一缩放到**首帧**尺寸（宽高向下取偶数，libopenh264 要求偶数），而不是直接失败。
+
+`build.rs` 负责链接参数与 **运行时 DLL 部署**：把 5 个 `av*.dll` 与 `libwinpthread-1.dll`
+复制到 `target/<profile>` 与 `target/<profile>/deps`（后者是为了让 `cargo test` 的测试
+可执行文件也能启动——加载器只在 exe 自己的目录里找 DLL）。
+
+### 接入后实测（端到端）
+
+录制（DWM 抓帧，4fps×6s）→ 24 张 PNG → 合成：
+
+```
+codec_name=h264  profile=High  width=480  height=320  pix_fmt=yuv420p
+r_frame_rate=10/1  nb_read_frames=24  duration=2.400000   （ffprobe -count_frames）
+ffmpeg -f null - 退出码 0
+```
+
+从产出的 MP4 解出第 0 帧与源 `frame_0000.png` 目视比对：位条图案、四象限颜色、
+移动方块位置完全一致（仅边缘有 4:2:0 色度下采样带来的轻微过渡）。
+
+### 决定性证据：这套 ffmpeg 的真实构建参数
+
+`canlapse doctor` 会打印 `avcodec_configuration()`，实测输出：
+
+```
+--prefix='D:/tools/ffmpeg-min-new' --arch=x86_64 --target-os=mingw32
+--enable-shared --disable-static --disable-programs --disable-doc --disable-debug
+--disable-autodetect --disable-network --enable-libopenh264
+--pkg-config='D:/tools/wrappers/pkgconf-fit.exe'
+--disable-everything --enable-encoder='libopenh264,aac' --enable-decoder='h264,aac'
+--enable-parser='h264,aac' --enable-muxer='mp4,mov'
+--enable-demuxer='mov,mp4,matroska' --enable-protocol=file
+--enable-swscale --enable-swresample
+--extra-ldflags='-static-libstdc++ -static-libgcc' --extra-version=-capmin
+```
+
+据此可以确证三件事：
+
+* **视频编码器只有 `libopenh264` 一个，没有 x264** —— 完全符合需求；
+* 解码头 `h264,aac` 确实在（与"只保留编码、去除解码"的原始描述不符，见上文纠正）；
+* 构建出处是 `D:/tools/ffmpeg-min-new`，用的正是那个 `D:/tools/wrappers/pkgconf-fit.exe`
+  包装器；且 `--disable-network`，本地工具没有网络面。
+

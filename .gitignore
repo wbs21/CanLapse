@@ -51,3 +51,6 @@ spikes/*/_probe/
 
 # ---- 本地测试产物 ----
 .test-cache/
+
+# ---- 端到端测试产物 ----
+.e2e-cache/
