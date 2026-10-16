@@ -1,0 +1,41 @@
+# ---- 操作系统 ----
+.DS_Store
+Thumbs.db
+Desktop.ini
+desktop.ini
+
+# ---- 编辑器 / IDE ----
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json.example
+.idea/
+*.swp
+*.swo
+*~
+
+# ---- 环境变量与本地密钥 ----
+.env
+.env.*
+!.env.example
+*.local
+
+# ---- 日志与临时文件 ----
+*.log
+logs/
+tmp/
+temp/
+*.tmp
+
+# ---- 构建产物（通用，按最终技术栈删减）----
+dist/
+build/
+out/
+target/
+*.egg-info/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+node_modules/
+coverage/
+.cache/
