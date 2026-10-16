@@ -1,0 +1,25 @@
+[package]
+name = "dwm-capture-spike"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# CanLapse · DWM 缩略图抓帧可行性原型（spike，不属于正式产品代码）
+[[bin]]
+name = "dwm_capture_spike"
+path = "src/main.rs"
+
+[dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_Storage_Xps",
+    "Win32_UI_WindowsAndMessaging",
+] }
+png = "0.18"
+
+[profile.dev]
+opt-level = 1

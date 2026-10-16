@@ -1,0 +1,96 @@
+# 0003 — 视频编码：手写 FFI 直链「自编译最小 ffmpeg（libopenh264）」
+
+- 状态：已接受
+- 日期：2026-02-14
+- 关联证据：[spikes/encode-mp4/FINDINGS.md](../../spikes/encode-mp4/FINDINGS.md)（含完整复现步骤与实测偏移表）
+
+## 背景
+
+需求：录制结束后用**自编译最小 OpenH264** 批量合成 MP4，导出参数（播放帧率/画质/输出路径）
+独立于录制参数。
+
+环境约束：**离线**（crates.io 不通，只能用本地 registry 缓存里的 crate）、
+target 为 `x86_64-pc-windows-msvc`、预编译 ffmpeg 位于 `D:\CapLite\ffmpeg-min`。
+
+## 决定
+
+采用**手写 `extern "C"` 声明 + 直接链 ffmpeg-min 的 MSVC 导入库**，编码 crate 零第三方依赖：
+
+```toml
+[dependencies]   # 故意为空：--offline 完全不碰 registry
+```
+
+`build.rs` 输出的链接参数：
+
+```
+-L native=D:\CapLite\ffmpeg-min\bin -l dylib=avformat -l dylib=avcodec -l dylib=swscale -l dylib=avutil
+```
+
+`ffmpeg-min\bin\*.lib` 是原生 x64 COFF 导入库，MSVC `link.exe` 直接可用，**不需要 MinGW**。
+结构体只声明真正用到的字段，**偏移量用本机 `cl.exe` + 同一套头文件实测 `offsetof`**
+（探针保留在 `spikes/encode-mp4/_probe/ffprobe_min.c`）。
+
+## 依据（父代理已独立复核）
+
+`out.mp4`：1,199,665 字节，SHA256 `4059C635…D7A9CF`，H.264 `avc1` 640×360，48 帧，4.800 s @10fps。
+
+1. 自写 MP4 box 解析：`ftyp/free/mdat/moov` 齐备，1 条 `vide` 轨，`stsz` = 48 samples，`stss` = 5 关键帧；
+2. **真实解码回读**：ffmpeg-min 自带的 `mov` demuxer + `h264` 解码器解回 48 帧 640×360，
+   逐帧亮度与源 BGRA 帧 **Pearson r = 0.99992**；
+3. 完整构建的 `ffprobe -count_frames` → `nb_read_frames=48`、`duration=4.800000`、
+   `bit_rate≈1999441`；`ffmpeg -f null -` 退出码 0。
+
+实测**失败**的替代方案：`ffmpeg-sys-next` + `ffmpeg-next`（需要 bindgen → 需要 libclang）。
+本机确实没有 `libclang.dll`（VS / Python / Qt / mingw64 / msys64 / .cargo / .rustup 全查过，0 命中），
+并且其默认 features 还缺缓存里的 `prettyplease`。三段失败证据见 spike 的 FINDINGS.md。
+
+## 两处对原有认知的纠正
+
+1. **`h264` 解码器并没有被裁掉**。原始需求写的是"只保留编码，去除解码"，
+   但实测 `D:\CapLite\ffmpeg-min\bin\avcodec-63.dll` 里同时含 `h264` 编解码器，
+   所以解码回读验证是可以真做的（本次也确实做了）。
+2. **「自编译最小方案」的出处不在 `D:\CapLite` 下，而在 `D:\tools\`**：
+   `build-oh264.sh`（openh264 2.6.0 → `oh264-static\lib\libopenh264.a`）、
+   `oh264-src\`（源码树），以及关键的 `wrappers\pkgconf-fit.c`
+   （22 行 C，硬编码 `--with-path=D:\tools\oh264-static\lib\pkgconfig`，
+   专门骗过 FFmpeg configure 的 pkg-config 探针以链**静态** openh264）。
+   `libopenh264` 是这套构建里**唯一**的视频编码器，**静态编进了 `avcodec-63.dll`**，
+   不依赖 `D:\CapLite\includes\openh264\openh264.dll`（那份是独立构建，未被 avcodec 使用）。
+
+## 后果 / 必须遵守（都是实测踩出来的）
+
+1. **DLL 部署**：`avcodec-63.dll` 依赖 `libwinpthread-1.dll`，而 `ffmpeg-min\bin\` 里**没有**。
+   必须随包分发，且只能用 `D:\CapLite\build` 或 msys64 那份 ——
+   用 `C:\mingw64\bin` 那份会 **0xC0000139 STATUS_ENTRYPOINT_NOT_FOUND**（UCRT 系 vs msvcrt 系不匹配）；
+   完全没有则 **0xC0000135**。
+2. **`avformat_write_header` 会改写 `st->time_base`**（请求 1/1000 → mov muxer 实际选 1/16000）。
+   必须在**写头之后**再读它做 `av_packet_rescale_ts`，否则时长差 16 倍。
+3. **`AVFormatContext.streams` 是 `AVStream **`**（指向指针数组），不是内联数组；
+   当内联数组解再解引用会直接 `0xC0000005`。
+4. **`width/height/pix_fmt/framerate/gop_size/max_b_frames` 不是 AVOptions**
+   （设了会返回 `AVERROR_OPTION_NOT_FOUND`），只能走结构体偏移；
+   `AV_CODEC_FLAG_GLOBAL_HEADER` 必须在 `avcodec_open2` **之前**设，否则 mp4 拿不到 `avcC`。
+   宽高必须是偶数，每帧要 `av_frame_make_writable`。
+5. **偏移表随版本失效**：升级 `ffmpeg-min` 必须重跑探针并更新 `src/ffi.rs` 的偏移模块。
+   因此探针源码与偏移表要一起入库。
+6. **画质档位建议用 high**：默认的 `constrained_baseline` 会触发一条无害但吵的
+   openh264 警告（`doesn't support profile(578)`）；`high` 实测体积小 6.5%、质量更好且无警告。
+7. **⚠️ 授权（发布前必须处理）**：openh264 源码是 Cisco BSD-2 条款，但
+   **Cisco 代付 MPEG-LA 版税的承诺只覆盖"从 Cisco 官方渠道下载的二进制"**；
+   本项目用的是**自己编译的静态库**，不在代付范围内 →
+   **H.264 版税责任落在发布方**。FFmpeg 侧未开 `--enable-gpl/--enable-nonfree`，按 LGPL v2.1+ 走。
+
+## 尚未验证
+
+1. **fragmented（流模式）MP4**（`movflags=+frag_keyframe+empty_moov`）未实测。
+2. **`libloading` 运行时加载**路线未实测。它在本地缓存中（`libloading-0.8.9`），
+   且与上一代产品 CapLite「FFmpeg 仅运行时 LoadLibrary、不静态链接以保持 LGPL 合规」的做法一致，
+   是缺库降级与许可隔离的备选路线。
+3. **完全绕开 FFmpeg**（独立 `openh264.dll` + Bento4 `ap4.lib` 或自写 MP4 封装）未实测。
+4. **正式 `src/encode.rs` 尚未接入**：目前是**明确返回 Err 的占位实现**，不会静默产出坏文件。
+
+## 与 0002 的关系
+
+0002 决定"谁来抓帧"，0003 决定"谁来编码"，两者互不依赖：
+抓帧走 DWM 缩略图，编码走 ffmpeg-min 的 libopenh264。导出参数与录制参数彼此独立，
+由上层（历史会话的「重新导出」）组合。

@@ -1,0 +1,33 @@
+[package]
+name = "canlapse"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "面向手绘创作者的 Windows 画布窗口缩时录屏工具"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "canlapse"
+path = "src/main.rs"
+
+[dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_Storage_Xps",
+    "Win32_System_LibraryLoader",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+png = "0.18"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 2
+lto = "thin"
+strip = true

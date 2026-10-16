@@ -26,11 +26,14 @@ tmp/
 temp/
 *.tmp
 
-# ---- 构建产物（通用，按最终技术栈删减）----
+# ---- Rust ----
+# 注意：Cargo.lock 对二进制 crate 应当提交，不要忽略它。
+target/
+**/target/
+
+# ---- 构建产物（通用）----
 dist/
 build/
-out/
-target/
 *.egg-info/
 __pycache__/
 *.py[cod]
@@ -39,3 +42,12 @@ venv/
 node_modules/
 coverage/
 .cache/
+
+# ---- 原型产出的截图是验证证据，需要提交，因此不忽略 spikes/**/out/ ----
+
+# ---- 技术验证原型的临时抓取/编译产物（证据截图要提交，这些不要）----
+spikes/*/_probe/
+*.obj
+
+# ---- 本地测试产物 ----
+.test-cache/
