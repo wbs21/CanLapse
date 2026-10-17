@@ -67,3 +67,7 @@ add/
 .gui-pid
 .gui-out.txt
 .gui-err.txt
+
+# ---- 临时诊断输出（跑验证脚本时产生）----
+.*-err.txt
+.*-out.txt
