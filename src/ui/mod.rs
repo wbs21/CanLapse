@@ -481,7 +481,6 @@ unsafe fn app_mut(hwnd: HWND) -> Option<&'static mut App> {
 impl App {
     fn new(hwnd: HWND) -> App {
         let font = theme::font();
-        let root = default_cache_root();
         App {
             hwnd,
             ctl: Ctl::default(),
@@ -1443,43 +1442,13 @@ impl App {
 // 辅助
 // ---------------------------------------------------------------------------
 
+// 目录策略统一在 lib.rs（<exe 目录>\cache / output，不可写时退回 LOCALAPPDATA）
 fn default_cache_root() -> PathBuf {
-    if let Ok(p) = std::env::var("CANLAPSE_CACHE") {
-        return PathBuf::from(p);
-    }
-    let base = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(base).join("CanLapse").join("cache")
+    crate::default_cache_root()
 }
 
-/// 默认导出目录：**程序所在目录下的 output\\**（v1.0.0 增补需求）。
-///
-/// 放在 exe 旁边方便用户直接找到成片；如果程序装在 Program Files 这类不可写目录，
-/// 自动退回 `%LOCALAPPDATA%\CanLapse\output`，并仍会把目录建出来。
-pub fn default_output_dir() -> PathBuf {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let out = dir.join("output");
-            if std::fs::create_dir_all(&out).is_ok() && dir_writable(&out) {
-                return out;
-            }
-        }
-    }
-    let base = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".to_string());
-    let out = PathBuf::from(base).join("CanLapse").join("output");
-    let _ = std::fs::create_dir_all(&out);
-    out
-}
-
-/// 目录是否可写（写一个探针文件再删掉）
-fn dir_writable(dir: &std::path::Path) -> bool {
-    let probe = dir.join(".canlapse-write-test");
-    match std::fs::write(&probe, b"1") {
-        Ok(_) => {
-            let _ = std::fs::remove_file(&probe);
-            true
-        }
-        Err(_) => false,
-    }
+fn default_output_dir() -> PathBuf {
+    crate::default_output_dir()
 }
 
 /// 粗略判断"画布可能没浮动"：客户区里出现明显偏窄或偏宽的比例，
@@ -1543,6 +1512,9 @@ pub fn run(initial_target: Option<isize>) -> i32 {
     // 用户测试后只能靠这个文件定位问题）；release 构建需显式设 CANLAPSE_LOG 才写。
     let _ = crate::log::init();
     let t_start = std::time::Instant::now();
+    // 目录策略：缓存与成片都放在程序目录下；启动即建好，绿色分发时一眼可见
+    let _ = crate::default_cache_root();
+    let _ = crate::default_output_dir();
     unsafe { theme::prefer_dark() };
     logline!("");
     logline!(

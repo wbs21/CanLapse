@@ -14,12 +14,9 @@ use std::time::{Duration, Instant};
 
 use session::Session;
 
+// 目录策略统一在 lib.rs：CANLAPSE_CACHE > <exe 目录>\cache > %LOCALAPPDATA%\CanLapse\cache
 fn cache_root() -> PathBuf {
-    if let Ok(p) = std::env::var("CANLAPSE_CACHE") {
-        return PathBuf::from(p);
-    }
-    let base = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(base).join("CanLapse").join("cache")
+    canlapse::default_cache_root()
 }
 
 struct RecordArgs {

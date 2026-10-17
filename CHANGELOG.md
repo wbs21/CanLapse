@@ -58,6 +58,12 @@
 
 ### 变更
 
+- **缓存目录也改到「程序所在目录\cache」**（v1.0.0 收工后增补）
+  - 目录优先级：`CANLAPSE_CACHE` 环境变量 > `<exe 目录>\cache` > `%LOCALAPPDATA%\CanLapse\cache`；
+  - 程序目录不可写时自动退回 LOCALAPPDATA；GUI 与 CLI（record/sessions/encode 的默认根）共用同一策略；
+  - 现在解压到哪，`cache/`（会话帧）与 `output/`（成片）就都在那，适合绿色分发。
+
+
 - **默认导出目录改到「程序所在目录\output」**（v1.0.0 收工后增补）
   - 启动时自动创建 `<exe 目录>\output`，输出框默认 `<exe 目录>\output\timelapse.mp4`；
   - 若程序目录不可写（例如装在 Program Files），自动退回 `%LOCALAPPDATA%\CanLapse\output`

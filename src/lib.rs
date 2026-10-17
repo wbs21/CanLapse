@@ -58,3 +58,55 @@ pub fn ffmpeg_min_dir() -> std::path::PathBuf {
     }
     std::path::PathBuf::from(r"D:\CapLite\ffmpeg-min")
 }
+
+// ---------------------------------------------------------------------------
+// 目录策略（v1.0.0 收工后增补）
+// ---------------------------------------------------------------------------
+//
+// 用户要求"缓存和成片都放在程序所在文件夹"，便于绿色分发：解压到哪，数据就在哪。
+// 但程序可能被装在 Program Files 这类不可写目录，所以统一走"先程序目录、写不了再退
+// LOCALAPPDATA"，并且**环境变量 CANLAPSE_CACHE 仍然优先**（脚本/测试要用）。
+
+fn exe_dir() -> Option<std::path::PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+}
+
+fn dir_writable(dir: &std::path::Path) -> bool {
+    let probe = dir.join(".canlapse-write-test");
+    match std::fs::write(&probe, b"1") {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// 在"程序目录下的子目录"和"%LOCALAPPDATA%\CanLapse\<子目录>"之间选一个可写的位置
+fn preferred_dir(sub: &str) -> std::path::PathBuf {
+    if let Some(dir) = exe_dir() {
+        let p = dir.join(sub);
+        if std::fs::create_dir_all(&p).is_ok() && dir_writable(&p) {
+            return p;
+        }
+    }
+    let base = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".to_string());
+    let p = std::path::PathBuf::from(base).join("CanLapse").join(sub);
+    let _ = std::fs::create_dir_all(&p);
+    p
+}
+
+/// 会话缓存根目录：`CANLAPSE_CACHE` > `<exe 目录>\cache` > `%LOCALAPPDATA%\CanLapse\cache`
+pub fn default_cache_root() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("CANLAPSE_CACHE") {
+        return std::path::PathBuf::from(p);
+    }
+    preferred_dir("cache")
+}
+
+/// 默认导出目录：`<exe 目录>\output` > `%LOCALAPPDATA%\CanLapse\output`
+pub fn default_output_dir() -> std::path::PathBuf {
+    preferred_dir("output")
+}
