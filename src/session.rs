@@ -233,7 +233,11 @@ mod tests {
     use windows_sys::Win32::Foundation::RECT;
 
     fn tmp_root(tag: &str) -> PathBuf {
-        let p = std::env::temp_dir().join(format!("canlapse-test-{}-{}", std::process::id(), tag));
+        // 用**工作区内**的目录而不是 std::env::temp_dir()：
+        // 系统临时目录在受限令牌/被清理的环境下会建不了目录，导致测试假失败（实测踩过）。
+        let p = PathBuf::from("target")
+            .join("test-tmp")
+            .join(format!("canlapse-test-{}-{}", std::process::id(), tag));
         let _ = fs::remove_dir_all(&p);
         fs::create_dir_all(&p).unwrap();
         p

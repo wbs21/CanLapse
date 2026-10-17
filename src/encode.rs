@@ -635,7 +635,10 @@ mod tests {
     #[test]
     fn 帧号排序不按字符串() {
         // 文件名排序会把 frame_10000.png 排到 frame_9999.png 之前，必须按帧号
-        let dir = std::env::temp_dir().join(format!("canlapse-frames-{}", std::process::id()));
+        // 同上：用工作区内目录，避免系统临时目录不可写造成的假失败
+        let dir = std::path::PathBuf::from("target")
+            .join("test-tmp")
+            .join(format!("canlapse-frames-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         for n in [0u32, 2, 10, 9999, 10000] {
