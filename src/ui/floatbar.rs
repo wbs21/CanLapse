@@ -6,8 +6,8 @@
 //! 在不引入任何第三方 UI 框架的前提下做到接近现代浮层的观感。
 //!
 //! 交互：
+//! * 默认吸附在屏幕**右上角**，按住空白处只能**沿上边缘左右拖动**（y 固定、夹在工作区内）；
 //! * 点按钮 → 暂停/继续、标记、停止；
-//! * 按住按钮以外的任何位置 → 拖动整条（`HTCAPTION`）；
 //! * `WS_EX_NOACTIVATE` 保证点击不把焦点从绘画软件抢走。
 
 use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
@@ -20,16 +20,17 @@ use windows_sys::Win32::Graphics::Gdi::{
     FW_NORMAL, HDC, HGDIOBJ, NULL_PEN,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetCursorPos, LoadCursorW, RegisterClassW,
-    SetCursor, SetTimer, SetWindowPos, SetWindowTextW, ShowWindow,
-    HTCAPTION, HWND_TOPMOST, IDC_HAND, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_SHOWNOACTIVATE,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetCursorPos, GetWindowRect,
+    LoadCursorW, RegisterClassW,
+    SetCursor, SetTimer, SetWindowPos, SetWindowTextW, ShowWindow, SystemParametersInfoW,
+    HWND_TOPMOST, IDC_HAND, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_SHOWNOACTIVATE,
     WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_LBUTTONUP,
     WM_MOUSEMOVE, WM_NCHITTEST, WM_PAINT, WM_SETCURSOR, WM_TIMER, WNDCLASSW,
     WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 use windows_sys::Win32::UI::Controls::WM_MOUSELEAVE;
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture,TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
 
 use crate::recorder::{self, Shared};
 use crate::win;
@@ -37,6 +38,8 @@ use crate::win;
 const BAR_CLASS: &str = "CanLapseFloatBar";
 const TIMER_REFRESH: usize = 1;
 
+/// 默认距屏幕右上角的留白
+const BAR_MARGIN: i32 = 10;
 const BAR_W: i32 = 440;
 const BAR_H: i32 = 44;
 const PAD: i32 = 8;
@@ -58,6 +61,10 @@ static PRESSED: AtomicUsize = AtomicUsize::new(NONE);
 /// 跟踪鼠标离开（没有它，鼠标移出后按钮会一直保持悬停高亮）
 static TRACKING: AtomicIsize = AtomicIsize::new(0);
 static FONT: OnceLock<isize> = OnceLock::new();
+/// 拖动状态：只在**上边缘左右拖动**（y 固定）
+static DRAGGING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static DRAG_CURSOR_X: AtomicIsize = AtomicIsize::new(0);
+static DRAG_WIN_X: AtomicIsize = AtomicIsize::new(0);
 /// 定时器 tick 计数（红点脉冲用）
 static TICK: AtomicUsize = AtomicUsize::new(0);
 
@@ -93,6 +100,26 @@ fn hit_button(px: i32, py: i32) -> usize {
         }
     }
     NONE
+}
+
+/// 主显示器工作区（避开任务栏）
+/// 把控制条的 x 夹在工作区内（只允许左右移动，不越界）
+fn clamp_bar_x(work: RECT, x: i32) -> i32 {
+    x.clamp(work.left, (work.right - BAR_W).max(work.left))
+}
+
+unsafe fn work_area() -> RECT {
+    let mut r: RECT = std::mem::zeroed();
+    let ok = SystemParametersInfoW(0x0030, 0, &mut r as *mut _ as *mut _, 0); // SPI_GETWORKAREA
+    if ok == 0 || r.right <= r.left {
+        r = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+    }
+    r
 }
 
 unsafe fn cursor_client(hwnd: HWND) -> (i32, i32) {
@@ -320,14 +347,8 @@ unsafe fn bar_proc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
         }
         WM_ERASEBKGND => 1,
         WM_NCHITTEST => {
-            // ⚠️ WM_NCHITTEST 的 lparam 是**屏幕坐标**，必须先转客户区
-            let (cx, cy) = cursor_client(hwnd);
-            // 按钮区域让窗口自己处理（否则按不动），其余位置整条可拖
-            if hit_button(cx, cy) != NONE {
-                1 // HTCLIENT
-            } else {
-                HTCAPTION as LRESULT
-            }
+            // 一律返回 HTCLIENT：拖动由我们自己实现，这样才能限制成"只能左右移动"
+            1
         }
         WM_SETCURSOR => {
             // ⚠️ WM_SETCURSOR 的 lparam 是 (hit code | 消息号)，**不是坐标**
@@ -342,6 +363,26 @@ unsafe fn bar_proc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
             }
         }
         WM_MOUSEMOVE => {
+            // 拖动中：只改 x，y 固定在上边缘
+            if DRAGGING.load(Ordering::Relaxed) {
+                let mut p: windows_sys::Win32::Foundation::POINT = std::mem::zeroed();
+                GetCursorPos(&mut p);
+                let work = work_area();
+                let dx = p.x - DRAG_CURSOR_X.load(Ordering::Relaxed) as i32;
+                let nx = clamp_bar_x(work, DRAG_WIN_X.load(Ordering::Relaxed) as i32 + dx);
+                let mut wr: RECT = std::mem::zeroed();
+                GetWindowRect(hwnd, &mut wr);
+                let _ = SetWindowPos(
+                    hwnd,
+                    HWND_TOPMOST,
+                    nx,
+                    wr.top,
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+                return 0;
+            }
             let idx = hit_button(x, y);
             if HOVER.swap(idx, Ordering::Relaxed) != idx {
                 invalidate(hwnd);
@@ -363,11 +404,27 @@ unsafe fn bar_proc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
         }
         WM_LBUTTONDOWN => {
             let idx = hit_button(x, y);
-            PRESSED.store(idx, Ordering::Relaxed);
-            invalidate(hwnd);
+            if idx == NONE {
+                // 空白处按下 = 开始拖动（只允许左右）
+                DRAGGING.store(true, Ordering::Relaxed);
+                let mut p: windows_sys::Win32::Foundation::POINT = std::mem::zeroed();
+                GetCursorPos(&mut p);
+                DRAG_CURSOR_X.store(p.x as isize, Ordering::Relaxed);
+                let mut wr: RECT = std::mem::zeroed();
+                GetWindowRect(hwnd, &mut wr);
+                DRAG_WIN_X.store(wr.left as isize, Ordering::Relaxed);
+                SetCapture(hwnd);
+            } else {
+                PRESSED.store(idx, Ordering::Relaxed);
+                invalidate(hwnd);
+            }
             0
         }
         WM_LBUTTONUP => {
+            if DRAGGING.swap(false, Ordering::Relaxed) {
+                ReleaseCapture();
+                return 0;
+            }
             let idx = hit_button(x, y);
             let pressed = PRESSED.swap(NONE, Ordering::Relaxed);
             invalidate(hwnd);
@@ -467,13 +524,17 @@ pub fn create(shared: Arc<Shared>) -> Option<HWND> {
         ensure_class();
         let cls = win::wide(BAR_CLASS);
         let title = win::wide("CanLapse");
+        // 默认吸附在**右上角**（用户要求）；之后只能在上边缘左右拖
+        let work = work_area();
+        let x = clamp_bar_x(work, work.right - BAR_W - BAR_MARGIN);
+        let y = work.top + BAR_MARGIN;
         let hwnd = CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
             cls.as_ptr(),
             title.as_ptr(),
             WS_POPUP,
-            40,
-            120,
+            x,
+            y,
             BAR_W,
             BAR_H,
             std::ptr::null_mut(),
@@ -547,5 +608,26 @@ mod tests {
         for w in rects.windows(2) {
             assert!(w[0].0 + w[0].2 <= w[1].0, "按钮重叠");
         }
+    }
+
+    #[test]
+    fn 横向拖动被夹在工作区内() {
+        let work = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1040,
+        };
+        assert_eq!(clamp_bar_x(work, 500), 500);
+        assert_eq!(clamp_bar_x(work, -100), 0);
+        assert_eq!(clamp_bar_x(work, 5000), 1920 - BAR_W);
+        let wide = RECT {
+            left: -1680,
+            top: 0,
+            right: 1920,
+            bottom: 1040,
+        };
+        assert_eq!(clamp_bar_x(wide, -5000), -1680);
+        assert_eq!(clamp_bar_x(wide, 9999), 1920 - BAR_W);
     }
 }
