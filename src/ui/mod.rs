@@ -217,66 +217,58 @@ fn compute_layout(app: &App, cw: i32) -> (Vec<(HWND, RECT, bool)>, RECT, i32) {
     push(c.btn_help, rect(m + (bw + gap) * 2, y, inner - (bw + gap) * 2, 26), true);
     y += 32;
 
-    // 预览缩略图（固定 160×100，规格值）
+    // 预览缩略图（固定 160×100，规格值）+ 右侧的【开始录制】
     let prev = rect(m, y, PREVIEW_W, PREVIEW_H);
+    push(
+        c.btn_record,
+        rect(m + PREVIEW_W + 14, y + PREVIEW_H / 2 - 14, 130, 28),
+        true,
+    );
     y += PREVIEW_H + 6;
 
     push(c.status, rect(m, y, inner, 18), true);
     y += 24;
 
-    // 录制参数
-    push(c.hdr_rec, rect(m, y, inner, 22), true);
-    y += 24;
-    if app.rec_open {
-        push(c.lbl_fps, rect(m + 8, y, inner - 16, 16), true);
-        y += 18;
-        push(c.sld_fps, rect(m + 8, y, inner - 16, 24), true);
-        y += 26;
-        push(c.lbl_thr, rect(m + 8, y, inner - 16, 16), true);
-        y += 18;
-        push(c.sld_thr, rect(m + 8, y, inner - 16, 24), true);
-        y += 30;
-    }
+    // 录制参数（不折叠，直接显示）。折叠标题栏控件保留但隐藏、不占高度。
+    push(c.hdr_rec, rect(m, y, inner, 22), false);
+    push(c.lbl_fps, rect(m + 8, y, inner - 16, 16), true);
+    y += 18;
+    push(c.sld_fps, rect(m + 8, y, inner - 16, 24), true);
+    y += 26;
+    push(c.lbl_thr, rect(m + 8, y, inner - 16, 16), true);
+    y += 18;
+    push(c.sld_thr, rect(m + 8, y, inner - 16, 24), true);
+    y += 30;
 
-    // 导出视频参数
-    push(c.hdr_exp, rect(m, y, inner, 22), true);
+    // 导出视频参数（不折叠，直接显示）
+    push(c.hdr_exp, rect(m, y, inner, 22), false);
+    push(c.tip, rect(m + 8, y, inner - 16, 32), true);
+    y += 34;
+    push(c.chk_clean, rect(m + 8, y, inner - 16, 20), true);
     y += 24;
-    if app.exp_open {
-        push(c.tip, rect(m + 8, y, inner - 16, 32), true);
-        y += 34;
-        push(c.chk_clean, rect(m + 8, y, inner - 16, 20), true);
-        y += 24;
-        push(c.lbl_efps, rect(m + 8, y, 70, 20), true);
-        push(c.cmb_fps, rect(m + 80, y, 80, 22), true);
-        push(c.lbl_qual, rect(m + 170, y, 50, 20), true);
-        push(c.cmb_qual, rect(m + 220, y, inner - 220 + m - 8, 22), true);
-        y += 28;
-        push(c.lbl_out, rect(m + 8, y, 40, 20), true);
-        push(c.edit_out, rect(m + 48, y, inner - 48 - 60, 22), true);
-        push(c.btn_out, rect(cw - m - 52, y, 52, 22), true);
-        y += 28;
-    }
+    push(c.lbl_efps, rect(m + 8, y, 70, 20), true);
+    push(c.cmb_fps, rect(m + 80, y, 80, 22), true);
+    push(c.lbl_qual, rect(m + 170, y, 50, 20), true);
+    push(c.cmb_qual, rect(m + 220, y, inner - 220 + m - 8, 22), true);
+    y += 28;
+    push(c.lbl_out, rect(m + 8, y, 40, 20), true);
+    push(c.edit_out, rect(m + 48, y, inner - 48 - 60, 22), true);
+    push(c.btn_out, rect(cw - m - 52, y, 52, 22), true);
+    y += 28;
 
-    // 历史缓存会话
-    push(c.hdr_hist, rect(m, y, inner, 22), true);
-    y += 24;
-    if app.hist_open {
-        push(c.list, rect(m + 8, y, inner - 16, 96), true);
-        y += 100;
-        let bw2 = (inner - 16 - 8) / 3;
-        push(c.btn_reexport, rect(m + 8, y, bw2, 24), true);
-        push(c.btn_open, rect(m + 8 + bw2 + 4, y, bw2, 24), true);
-        push(c.btn_delete, rect(m + 8 + (bw2 + 4) * 2, y, bw2, 24), true);
-        y += 30;
-    }
+    // 历史缓存会话：按用户要求移除整块（控件保留但永久隐藏，不占高度）
+    push(c.hdr_hist, rect(m, y, inner, 22), false);
+    push(c.list, rect(m, y, inner - 16, 96), false);
+    push(c.btn_reexport, rect(m, y, 80, 24), false);
+    push(c.btn_open, rect(m, y, 80, 24), false);
+    push(c.btn_delete, rect(m, y, 80, 24), false);
 
-    // 底部操作区（常驻）
-    let bottom_h = 52;
-    let by = y.max(0) + 6;
+    // 底部操作区：状态 + 合成进度 + 取消合成（开始录制已移到预览区右侧）
+    let bottom_h = 46;
+    let by = y.max(0) + 2;
     push(c.state, rect(m, by, inner, 18), true);
-    push(c.btn_record, rect(m, by + 20, 120, 26), true);
-    push(c.progress, rect(m + 128, by + 22, inner - 128 - 64, 20), true);
-    push(c.btn_cancel, rect(cw - m - 60, by + 20, 60, 26), true);
+    push(c.progress, rect(m, by + 22, inner - 76, 20), true);
+    push(c.btn_cancel, rect(cw - m - 64, by + 20, 64, 26), true);
     let need = by + bottom_h;
 
     (out, prev, need)
@@ -348,6 +340,27 @@ unsafe extern "system" fn wndproc(
             (*mmi).ptMinTrackSize.y = MIN_H;
             0
         }
+        // 【开始录制】绿色底 + 白字。WM_CTLCOLORSTATIC = 0x0138：
+        // wparam 是 DC，lparam 是控件句柄。带视觉主题的普通按钮会忽略
+        // WM_CTLCOLORBTN，所以按钮改用 Static（静态控件认这个消息）。
+        0x0138 => {
+            if lparam as HWND
+                == windows_sys::Win32::UI::WindowsAndMessaging::GetDlgItem(
+                    hwnd,
+                    ID_RECORD as i32,
+                )
+            {
+                use windows_sys::Win32::Graphics::Gdi::{CreateSolidBrush, SetBkMode, SetTextColor};
+                SetBkMode(wparam as _, 1); // TRANSPARENT
+                SetTextColor(wparam as _, 0x00FF_FFFF);
+                static GREEN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+                let brush = *GREEN.get_or_init(|| CreateSolidBrush(0x0033_8A2E) as usize);
+                return brush as isize;
+            }
+            // 其它静态控件必须交回默认处理，否则返回 0 会让它们的背景被涂黑
+            // （实测：滑块/标签背景整条变黑）
+            windows_sys::Win32::UI::WindowsAndMessaging::DefWindowProcW(hwnd, 0x0138, wparam, lparam)
+        }
         WM_COMMAND => {
             let id = (wparam & 0xffff) as usize;
             let code = ((wparam >> 16) & 0xffff) as u32;
@@ -405,11 +418,11 @@ impl App {
             ctl: Ctl::default(),
             font,
             rec_open: true,
-            exp_open: false,
+            exp_open: true, // 按要求：导出参数不再折叠，直接显示
             hist_open: false,
             fps: 2.0,
             threshold: 0.01,
-            export_fps: 10.0,
+            export_fps: 24.0,
             quality: Quality::High,
             auto_clean: true,
             out_path: root.join("timelapse.mp4"),
@@ -467,7 +480,7 @@ impl App {
             let s = win::wide(rate);
             SendMessageW(c.cmb_fps, 0x0143, 0, s.as_ptr() as isize); // CB_ADDSTRING
         }
-        SendMessageW(c.cmb_fps, 0x014E, 1, 0); // CB_SETCURSEL = 1 (10 fps)
+        SendMessageW(c.cmb_fps, 0x014E, 4, 0); // CB_SETCURSEL = 4（24 fps 默认）
         c.lbl_qual = mk(h, "Static", "画质", ws, ID_LBL_QUAL, f);
         c.cmb_qual = mk(h, "ComboBox", "", ws | 0x0003 | 0x0020_0000, ID_CMB_QUAL, f);
         for q in ["高", "中", "低"] {
@@ -486,7 +499,17 @@ impl App {
         c.btn_delete = mk(h, "Button", "删除", ws, ID_DELETE, f);
 
         c.state = mk(h, "Static", "待机", ws, ID_STATE, f);
-        c.btn_record = mk(h, "Button", "开始录制", ws, ID_RECORD, f);
+        // 【开始录制】用 Static 而非常规按钮：带视觉主题的按钮会忽略 WM_CTLCOLORBTN，
+        // 而静态控件认 WM_CTLCOLORSTATIC，才能可靠地画成绿底白字。
+        // SS_CENTER(0x1) | SS_NOTIFY(0x100) | SS_CENTERIMAGE(0x200)
+        c.btn_record = mk(
+            h,
+            "Static",
+            "开始录制",
+            ws | 0x0000_0001 | 0x0000_0100 | 0x0000_0200,
+            ID_RECORD,
+            f,
+        );
         c.progress = mk(h, "msctls_progress32", "", ws, ID_PROGRESS, f);
         c.btn_cancel = mk(h, "Button", "取消合成", ws, ID_CANCEL, f);
         SendMessageW(c.progress, PBM_SETRANGE32, 0, 100);
