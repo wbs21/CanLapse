@@ -736,13 +736,38 @@ impl App {
     }
 
     unsafe fn do_pick(&mut self) {
-        // 拾取期间把主窗口让开，避免挡住用户要点选的目标
-        ShowWindow(self.hwnd, SW_MINIMIZE);
+        // 拾取期间**不最小化**：只把主窗口压到最底层（它只有 460x487，不会挡住画布），
+        // 这样状态栏里的提示一直可见，用户知道该往哪点。
+        // HWND_BOTTOM = 1；SWP_NOMOVE|NOSIZE|NOACTIVATE = 0x0002|0x0001|0x0010
+        SetWindowPos(
+            self.hwnd,
+            1 as HWND,
+            0,
+            0,
+            0,
+            0,
+            0x0002 | 0x0001 | 0x0010,
+        );
+        let t = win::wide("请在目标窗口的上边框（标题栏）上点一下左键；按 Esc 取消");
+        SetWindowTextW(self.ctl.state, t.as_ptr());
+        UpdateWindow(self.hwnd);
+
         let picked = win::pick_window_interactive();
-        ShowWindow(self.hwnd, SW_RESTORE);
+
+        // 拾取结束：立刻把界面拉回最上层，并让预览显示结果
+        // HWND_TOP = 0；SWP_NOMOVE|NOSIZE = 0x0003（允许激活）
+        SetWindowPos(self.hwnd, std::ptr::null_mut(), 0, 0, 0, 0, 0x0002 | 0x0001);
+        ShowWindow(self.hwnd, SW_RESTORE); // 拾取后确保界面可见（未最小化时等同显示）
         SetForegroundWindow(self.hwnd);
-        let Some(hwnd) = picked else { return };
-        let info = win::describe(hwnd);
+
+        let Some(hwnd) = picked else {
+            self.refresh_labels();
+            return;
+        };
+        // 统一解析到顶层窗口：点标题栏命中的本来就是顶层，这里再兜一次底，
+        // 保证"点画布"和"点标题栏"得到一致的目标。
+        let root = win::root_of(hwnd);
+        let info = win::describe(if root.is_null() { hwnd } else { root });
         // 释放上一个预览抓帧器
         self.preview_cap = None;
         match ThumbnailCapture::new(info.hwnd) {
