@@ -87,3 +87,9 @@ add/
 .warn-check/
 .warn-gui/
 .shot/
+
+# ---- 测试缓存统一入口 ----
+# 约定：所有验证脚本的 --out 一律指向 .testcache\<名字>，这样只需一条规则。
+# （此前每轮临时起一个点开头目录名，忘了加规则就会被 git add -A 扫进提交 —— 踩过两次）
+.testcache/
+.rz/
