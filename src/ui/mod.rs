@@ -29,7 +29,6 @@ use windows_sys::Win32::UI::Controls::{
     InitCommonControlsEx, INITCOMMONCONTROLSEX, ICC_BAR_CLASSES, ICC_PROGRESS_CLASS,
     ICC_STANDARD_CLASSES, PBM_SETPOS, PBM_SETRANGE32,
 };
-use windows_sys::Win32::UI::Controls::Dialogs::{GetSaveFileNameW, OPENFILENAMEW};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
     GetMessageW, GetWindowLongPtrW, GetWindowRect, LoadCursorW, MessageBoxW, MoveWindow, PostQuitMessage,
@@ -66,13 +65,12 @@ const ID_HINT_SENS: usize = 115;
 const ID_BTN_CLEAN: usize = 116;
 const ID_HDR_EXP: usize = 120;
 const ID_CHK_CLEAN: usize = 122;
-const ID_LBL_OUT: usize = 127;
-const ID_EDIT_OUT: usize = 128;
-const ID_BTN_OUT: usize = 129;
 const ID_HDR_HIST: usize = 130;
 const ID_LIST: usize = 131;
 const ID_REEXPORT: usize = 132;
 const ID_OPEN_DIR: usize = 133;
+/// 【打开视频文件夹】（打开合成文件所在目录）
+const ID_OPEN_OUT_DIR: usize = 135;
 const ID_DELETE: usize = 134;
 const ID_RECORD: usize = 140;
 const ID_PROGRESS: usize = 142;
@@ -172,13 +170,11 @@ struct Ctl {
     hint_sens: HWND,
     hdr_exp: HWND,
     chk_clean: HWND,
-    lbl_out: HWND,
-    edit_out: HWND,
-    btn_out: HWND,
     hdr_hist: HWND,
     list: HWND,
     btn_reexport: HWND,
     btn_open: HWND,
+    btn_open_out: HWND,
     btn_delete: HWND,
     btn_record: HWND,
     progress: HWND,
@@ -310,13 +306,8 @@ fn compute_layout(app: &App, cw: i32) -> (Vec<(HWND, RECT, bool)>, RECT, i32) {
     push(c.hdr_exp, rect(m, y, inner, 22), false);
     push(c.chk_clean, rect(m, y, inner, 20), true);
     y += 22;
-    // 输出路径：标签 32 + 输入框 + 选择按钮 44（输入框随之变窄）
-    let out_btn_w = 44;
-    let out_btn_x = cw - m - out_btn_w;
-    push(c.lbl_out, rect(m, y, 32, 20), true);
-    push(c.edit_out, rect(m + 36, y, out_btn_x - (m + 36) - 6, 22), true);
-    push(c.btn_out, rect(out_btn_x, y, out_btn_w, 22), true);
-    y += 26;
+    // 输出位置不再让用户选（固定为 <exe 目录>\output），这一行整体去掉；
+    // 想改就只能改程序目录结构 —— 少一个出错点。
 
     // 历史缓存会话：已移除整块（控件保留但永久隐藏，不占高度）
     push(c.hdr_hist, rect(m, y, inner, 22), false);
@@ -329,14 +320,12 @@ fn compute_layout(app: &App, cw: i32) -> (Vec<(HWND, RECT, bool)>, RECT, i32) {
     let by = y.max(0) + 2;
     push(c.progress, rect(m, by, inner - 52, 18), true);
     push(c.btn_cancel, rect(cw - m - 48, by, 48, 20), true);
-    // 最下方：清理缓存按钮（宽度为内容宽度的 1/3，居中）
-    let cy = by + 9; // 紧贴内容区（用户要求再上移 10px）
-    let clean_w = (inner / 3).max(88);
-    push(
-        c.btn_clean,
-        rect(m + (inner - clean_w) / 2, cy, clean_w, 24),
-        true,
-    );
+    // 最下方两个按钮：左【手动清理缓存】/ 右【打开视频文件夹】，各占一半
+    let cy = by + 9;
+    let gap = 6;
+    let btn_w = (inner - gap) / 2;
+    push(c.btn_clean, rect(m, cy, btn_w, 24), true);
+    push(c.btn_open_out, rect(m + btn_w + gap, cy, inner - btn_w - gap, 24), true);
     let need = cy + 40; // 按钮与下边框留 16px（用户两次各要求 +5px）
 
     (out, prev, need)
@@ -540,19 +529,17 @@ impl App {
         let sens_refs: Vec<&str> = sens_labels.iter().map(|s| s.as_str()).collect();
         dropdown::set_items(c.cmb_sens, &sens_refs);
         dropdown::set_sel(c.cmb_sens, SENS_DEFAULT);
-        c.hint_sens = mk(h, "Static", "画布越大越精细", ws, ID_HINT_SENS, f);
+        c.hint_sens = mk(h, "Static", "画布越大，要求越高。", ws, ID_HINT_SENS, f);
 
         c.hdr_exp = mk(h, "Button", "▶ 导出视频参数", ws, ID_HDR_EXP, f);
         c.chk_clean = mk(h, "Button", "合成成功自动清理缓存", ws | 0x0000_0003, ID_CHK_CLEAN, f);
         SendMessageW(c.chk_clean, 0x00F1, 1, 0); // BM_SETCHECK = BST_CHECKED
-        c.lbl_out = mk(h, "Static", "输出", ws, ID_LBL_OUT, f);
-        c.edit_out = mk(h, "Edit", "", ws | 0x0080, ID_EDIT_OUT, f); // ES_AUTOHSCROLL
-        c.btn_out = mk(h, "Button", "选择", ws, ID_BTN_OUT, f);
 
         c.hdr_hist = mk(h, "Button", "▶ 历史缓存会话", ws, ID_HDR_HIST, f);
         c.list = mk(h, "ListBox", "", ws | 0x0001 | 0x0020_0000 | 0x0080_0000, ID_LIST, f); // LBS_NOTIFY|WS_VSCROLL|WS_BORDER
         c.btn_reexport = mk(h, "Button", "重新导出", ws, ID_REEXPORT, f);
         c.btn_open = mk(h, "Button", "打开文件夹", ws, ID_OPEN_DIR, f);
+        c.btn_open_out = mk(h, "Button", "打开视频文件夹", ws, ID_OPEN_OUT_DIR, f);
         c.btn_delete = mk(h, "Button", "删除", ws, ID_DELETE, f);
 
         // 【开始录制】用 Static 而非常规按钮：带视觉主题的按钮会忽略 WM_CTLCOLORBTN，
@@ -575,19 +562,16 @@ impl App {
         theme::decorate(c.btn_pick, theme::Role::Ghost);
         theme::decorate(c.btn_help, theme::Role::Ghost);
         theme::decorate(c.btn_record, theme::Role::Accent);
-        theme::decorate(c.btn_out, theme::Role::Ghost);
+        theme::decorate(c.btn_open_out, theme::Role::Ghost);
         theme::decorate(c.btn_cancel, theme::Role::Ghost);
         theme::decorate(c.btn_clean, theme::Role::Ghost);
         theme::decorate(c.chk_clean, theme::Role::Check);
         theme::decorate(c.progress, theme::Role::Progress);
         // 下拉是自绘的，不需要系统主题
-        theme::darken(c.edit_out);
         self.ctl = c;
 
         // 初始可见性：拾取参数展开、导出/历史折叠
         self.set_panel_visible();
-        let s = win::wide(&format!("{}", self.out_path.display()));
-        SetWindowTextW(self.ctl.edit_out, s.as_ptr());
         // 会话列表**懒加载**：历史面板默认折叠，启动时没必要扫几百个目录、几万个 PNG。
         // 展开面板（ID_HDR_HIST）时才真正读盘。
         self.refresh_labels();
@@ -602,9 +586,7 @@ impl App {
         for h in [c.lbl_fps, c.cmb_recfps, c.lbl_thr, c.cmb_sens, c.hint_sens] {
             show(h, self.rec_open);
         }
-        for h in [c.chk_clean, c.lbl_out, c.edit_out, c.btn_out] {
-            show(h, self.exp_open);
-        }
+        show(c.chk_clean, self.exp_open);
         for h in [c.list, c.btn_reexport, c.btn_open, c.btn_delete] {
             show(h, self.hist_open);
         }
@@ -746,7 +728,6 @@ impl App {
                     self.auto_clean = v == 1;
                 }
                 ID_CMB_RECFPS | ID_CMB_SENS => self.sync_from_combos(),
-                ID_BTN_OUT => self.choose_output(),
                 ID_RECORD => {
                     let running = self.shared.as_ref().map(|s| s.phase().is_running()).unwrap_or(false);
                     if running {
@@ -763,6 +744,10 @@ impl App {
                     }
                 }
                 ID_REEXPORT => self.reexport_selected(),
+                ID_OPEN_OUT_DIR => {
+                    let dir = crate::default_output_dir();
+                    open_folder(&dir);
+                }
                 ID_OPEN_DIR => {
                     if let Some(s) = self.selected_session() {
                         let p = s.dir.clone();
@@ -926,34 +911,6 @@ impl App {
         );
     }
 
-    unsafe fn choose_output(&mut self) {
-        let mut buf = [0u16; 1024];
-        let init: Vec<u16> = self
-            .out_path
-            .to_string_lossy()
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
-        buf[..init.len().min(1024)].copy_from_slice(&init[..init.len().min(1024)]);
-        let filter: Vec<u16> = win::wide("MP4 视频\0*.mp4\0所有文件\0*.*\0");
-        let defext = win::wide("mp4");
-        let mut ofn: OPENFILENAMEW = std::mem::zeroed();
-        ofn.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
-        ofn.hwndOwner = self.hwnd;
-        ofn.lpstrFilter = filter.as_ptr();
-        ofn.lpstrFile = buf.as_mut_ptr();
-        ofn.nMaxFile = buf.len() as u32;
-        ofn.lpstrDefExt = defext.as_ptr();
-        ofn.Flags = 0x0000_0002 | 0x0000_0008; // OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST
-        if GetSaveFileNameW(&mut ofn) != 0 {
-            let s = String::from_utf16_lossy(
-                &buf[..buf.iter().position(|&c| c == 0).unwrap_or(buf.len())],
-            );
-            self.out_path = PathBuf::from(s);
-            let t = win::wide(&self.out_path.to_string_lossy());
-            SetWindowTextW(self.ctl.edit_out, t.as_ptr());
-        }
-    }
 
     unsafe fn start_recording(&mut self) {
         let Some(target) = &self.target else {
