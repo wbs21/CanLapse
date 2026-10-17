@@ -11,6 +11,15 @@ publish = false
 name = "canlapse"
 path = "src/main.rs"
 
+# 图形界面入口：windows 子系统，双击不弹控制台黑框。
+#
+# ⚠️ 名字**不能**叫 `CanLapse` —— Windows 文件名大小写不敏感，
+# `CanLapse.exe` 与 `canlapse.exe` 是同一个文件，会把命令行入口覆盖掉
+# （这个坑实测踩过：一直跑的都是 CLI，GUI 入口根本没生效）。
+[[bin]]
+name = "CanLapseGUI"
+path = "src/bin/canlapse-gui.rs"
+
 [dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",

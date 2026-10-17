@@ -28,9 +28,13 @@ const BAR_CLASS: &str = "CanLapseFloatBar";
 const ID_PAUSE: usize = 2001;
 const ID_MARK: usize = 2002;
 const ID_STOP: usize = 2003;
+/// 时长 / 帧计数 的显示控件。
+/// 注意：**不能**只写进窗口标题 —— 悬浮条是 WS_POPUP 无边框窗口，没有标题栏，
+/// 用户根本看不到（这个坑是靠截图发现的）。
+const ID_INFO: usize = 2004;
 const TIMER_REFRESH: usize = 1;
 
-const BAR_W: i32 = 320;
+const BAR_W: i32 = 344;
 const BAR_H: i32 = 44;
 const BTN_W: i32 = 58;
 const BTN_H: i32 = 28;
@@ -42,12 +46,24 @@ fn btn_class() -> Vec<u16> {
     win::wide("Button")
 }
 
-unsafe fn add_child(parent: HWND, text: &str, id: usize, x: i32, y: i32, w: i32, h: i32) -> HWND {
-    let cls = btn_class();
+fn static_class() -> Vec<u16> {
+    win::wide("Static")
+}
+
+unsafe fn add_child(
+    parent: HWND,
+    class: &[u16],
+    text: &str,
+    id: usize,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+) -> HWND {
     let t = win::wide(text);
     let hwnd = CreateWindowExW(
         0,
-        cls.as_ptr(),
+        class.as_ptr(),
         t.as_ptr(),
         WS_CHILD | WS_VISIBLE,
         x,
@@ -116,16 +132,19 @@ unsafe fn refresh(hwnd: HWND) {
     SetWindowTextW(pause_btn, t.as_ptr());
     // 时长 | 帧计数 | 标记数 显示在条标题上（条很窄，标题栏本来就空着）
     let info = format!(
-        "CanLapse  {}  |  {} 帧{}",
+        "{} | {} 帧{}",
         recorder::format_duration(shared.elapsed_ms()),
         shared.frames(),
         if shared.markers() > 0 {
-            format!("  |  {} 标记", shared.markers())
+            format!(" | {} 标记", shared.markers())
         } else {
             String::new()
         }
     );
+    // 写进可见的 Static 控件（用户看的是这里），标题也一并更新（便于自动化识别）
+    let info_ctl = GetDlgItem(hwnd, ID_INFO as i32);
     let t = win::wide(&info);
+    SetWindowTextW(info_ctl, t.as_ptr());
     SetWindowTextW(hwnd, t.as_ptr());
 }
 
@@ -176,9 +195,14 @@ pub fn create(shared: Arc<Shared>) -> Option<HWND> {
             return None;
         }
         let pad = 6;
-        add_child(hwnd, "暂停", ID_PAUSE, pad, pad, BTN_W, BTN_H);
-        add_child(hwnd, "标记", ID_MARK, pad + BTN_W + 4, pad, BTN_W, BTN_H);
-        add_child(hwnd, "停止", ID_STOP, pad + (BTN_W + 4) * 2, pad, BTN_W, BTN_H);
+        let bc = btn_class();
+        add_child(hwnd, &bc, "暂停", ID_PAUSE, pad, pad, BTN_W, BTN_H);
+        add_child(hwnd, &bc, "标记", ID_MARK, pad + BTN_W + 4, pad, BTN_W, BTN_H);
+        add_child(hwnd, &bc, "停止", ID_STOP, pad + (BTN_W + 4) * 2, pad, BTN_W, BTN_H);
+        // 时长 | 帧计数：必须是**可见的控件**，不能只放窗口标题
+        let info_x = pad + (BTN_W + 4) * 3;
+        let sc = static_class();
+        add_child(hwnd, &sc, "00:00 | 0 帧", ID_INFO, info_x, pad + 5, BAR_W - info_x - pad, 18);
         ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         let _ = SetWindowPos(
             hwnd,

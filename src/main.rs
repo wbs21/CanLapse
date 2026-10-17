@@ -5,14 +5,9 @@
 //!
 //! 用法见 `canlapse --help`。
 
-mod capture;
-mod encode;
-mod frame;
-mod png_io;
-mod recorder;
-mod session;
-mod ui;
-mod win;
+// 模块都在 lib（src/lib.rs）里；这里按名字引入，CLI 用到的路径写法保持不变，
+// 与 GUI 入口（src/bin/canlapse-gui.rs）共用同一份实现。
+use canlapse::{capture, encode, png_io, recorder, session, ui, win};
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
