@@ -10,6 +10,8 @@
 //!    而不是把控件裁掉。
 
 mod floatbar;
+mod dropdown;
+mod theme;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -18,9 +20,9 @@ use std::thread::JoinHandle;
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, DrawEdge, EndPaint, GetStockObject, InvalidateRect, SelectObject, SetBkMode,
-    StretchDIBits, UpdateWindow, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BDR_SUNKENOUTER, BF_RECT,
-    DEFAULT_GUI_FONT, DIB_RGB_COLORS, HGDIOBJ, PAINTSTRUCT, RGBQUAD, SRCCOPY,
+    BeginPaint, EndPaint, InvalidateRect, SelectObject, SetBkMode,
+    StretchDIBits, UpdateWindow, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HGDIOBJ,
+    PAINTSTRUCT, RGBQUAD, SRCCOPY,
 };
 use windows_sys::Win32::UI::Controls::{
     InitCommonControlsEx, INITCOMMONCONTROLSEX, ICC_BAR_CLASSES, ICC_PROGRESS_CLASS,
@@ -325,7 +327,7 @@ fn compute_layout(app: &App, cw: i32) -> (Vec<(HWND, RECT, bool)>, RECT, i32) {
     push(c.progress, rect(m, by, inner - 52, 18), true);
     push(c.btn_cancel, rect(cw - m - 48, by, 48, 20), true);
     // 最下方：清理缓存按钮（宽度为内容宽度的 1/3，居中）
-    let cy = by + 24;
+    let cy = by + 19; // 比进度行再上移 5px（用户要求）
     let clean_w = (inner / 3).max(88);
     push(
         c.btn_clean,
@@ -403,27 +405,11 @@ unsafe extern "system" fn main_wndproc(
             (*mmi).ptMinTrackSize.y = MIN_H;
             0
         }
-        // 【开始录制】绿色底 + 白字。WM_CTLCOLORSTATIC = 0x0138：
-        // wparam 是 DC，lparam 是控件句柄。带视觉主题的普通按钮会忽略
-        // WM_CTLCOLORBTN，所以按钮改用 Static（静态控件认这个消息）。
-        0x0138 => {
-            if lparam as HWND
-                == windows_sys::Win32::UI::WindowsAndMessaging::GetDlgItem(
-                    hwnd,
-                    ID_RECORD as i32,
-                )
-            {
-                use windows_sys::Win32::Graphics::Gdi::{CreateSolidBrush, SetBkMode, SetTextColor};
-                SetBkMode(wparam as _, 1); // TRANSPARENT
-                SetTextColor(wparam as _, 0x00FF_FFFF);
-                static GREEN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-                let brush = *GREEN.get_or_init(|| CreateSolidBrush(0x0033_8A2E) as usize);
-                return brush as isize;
-            }
-            // 其它静态控件必须交回默认处理，否则返回 0 会让它们的背景被涂黑
-            // （实测：滑块/标签背景整条变黑）
-            windows_sys::Win32::UI::WindowsAndMessaging::DefWindowProcW(hwnd, 0x0138, wparam, lparam)
-        }
+        // WM_CTLCOLORSTATIC = 0x0138：wparam 是 DC，lparam 是控件句柄。
+        // 所有标签/状态文字都走深色底 + 浅色字；"开始录制"已改为自绘按钮，不再特判。
+        0x0138 => theme::paint_static(wparam as _),
+        // WM_CTLCOLOREDIT = 0x0133：输出路径输入框深色底 + 浅色字
+        0x0133 => theme::paint_edit(wparam as _),
         WM_COMMAND => {
             let id = (wparam & 0xffff) as usize;
             let code = ((wparam >> 16) & 0xffff) as u32;
@@ -494,7 +480,7 @@ unsafe fn app_mut(hwnd: HWND) -> Option<&'static mut App> {
 
 impl App {
     fn new(hwnd: HWND) -> App {
-        let font = unsafe { GetStockObject(DEFAULT_GUI_FONT) };
+        let font = theme::font();
         let root = default_cache_root();
         App {
             hwnd,
@@ -540,19 +526,17 @@ impl App {
 
         c.hdr_rec = mk(h, "Button", "▼ 录制参数", ws, ID_HDR_REC, f);
         c.lbl_fps = mk(h, "Static", "帧密度", ws, ID_LBL_FPS, f);
-        c.cmb_recfps = mk(h, "ComboBox", "", ws | 0x0003 | 0x0020_0000, ID_CMB_RECFPS, f);
-        for (label, _) in REC_FPS_OPTIONS {
-            let s = win::wide(label);
-            SendMessageW(c.cmb_recfps, 0x0143, 0, s.as_ptr() as isize); // CB_ADDSTRING
-        }
-        SendMessageW(c.cmb_recfps, 0x014E, REC_FPS_DEFAULT, 0); // CB_SETCURSEL
+        // 下拉用自绘控件（系统 ComboBox 在深色下会保持白底）
+        c.cmb_recfps = dropdown::create(h, ID_CMB_RECFPS, 0, 0, 120, 22);
+        let fps_labels: Vec<&str> = REC_FPS_OPTIONS.iter().map(|(s, _)| *s).collect();
+        dropdown::set_items(c.cmb_recfps, &fps_labels);
+        dropdown::set_sel(c.cmb_recfps, REC_FPS_DEFAULT);
         c.lbl_thr = mk(h, "Static", "画面检测灵敏度", ws, ID_LBL_THR, f);
-        c.cmb_sens = mk(h, "ComboBox", "", ws | 0x0003 | 0x0020_0000, ID_CMB_SENS, f);
-        for level in 1..=SENS_LEVELS.len() {
-            let s = win::wide(&format!("{level}"));
-            SendMessageW(c.cmb_sens, 0x0143, 0, s.as_ptr() as isize);
-        }
-        SendMessageW(c.cmb_sens, 0x014E, SENS_DEFAULT, 0); // CB_SETCURSEL = 3（第 4 档 = 0.01）
+        c.cmb_sens = dropdown::create(h, ID_CMB_SENS, 0, 0, 56, 22);
+        let sens_labels: Vec<String> = (1..=SENS_LEVELS.len()).map(|i| i.to_string()).collect();
+        let sens_refs: Vec<&str> = sens_labels.iter().map(|s| s.as_str()).collect();
+        dropdown::set_items(c.cmb_sens, &sens_refs);
+        dropdown::set_sel(c.cmb_sens, SENS_DEFAULT);
         c.hint_sens = mk(h, "Static", "画布越大越精细", ws, ID_HINT_SENS, f);
 
         c.hdr_exp = mk(h, "Button", "▶ 导出视频参数", ws, ID_HDR_EXP, f);
@@ -583,6 +567,18 @@ impl App {
         c.btn_cancel = mk(h, "Button", "取消合成", ws, ID_CANCEL, f);
         c.btn_clean = mk(h, "Button", "请及时清理缓存", ws, ID_BTN_CLEAN, f);
         SendMessageW(c.progress, PBM_SETRANGE32, 0, 100);
+
+        // 深色主题：按钮/复选框/进度条自绘；下拉框与输入框交给系统深色主题
+        theme::decorate(c.btn_pick, theme::Role::Ghost);
+        theme::decorate(c.btn_help, theme::Role::Ghost);
+        theme::decorate(c.btn_record, theme::Role::Accent);
+        theme::decorate(c.btn_out, theme::Role::Ghost);
+        theme::decorate(c.btn_cancel, theme::Role::Ghost);
+        theme::decorate(c.btn_clean, theme::Role::Ghost);
+        theme::decorate(c.chk_clean, theme::Role::Check);
+        theme::decorate(c.progress, theme::Role::Progress);
+        // 下拉是自绘的，不需要系统主题
+        theme::darken(c.edit_out);
         self.ctl = c;
 
         // 初始可见性：拾取参数展开、导出/历史折叠
@@ -621,13 +617,13 @@ impl App {
     unsafe fn sync_from_combos(&mut self) {
         let c = &self.ctl;
         if !c.cmb_recfps.is_null() {
-            let i = SendMessageW(c.cmb_recfps, 0x0147, 0, 0) as usize; // CB_GETCURSEL
+            let i = dropdown::get_sel(c.cmb_recfps);
             if let Some((_, v)) = REC_FPS_OPTIONS.get(i) {
                 self.fps = *v;
             }
         }
         if !c.cmb_sens.is_null() {
-            let i = SendMessageW(c.cmb_sens, 0x0147, 0, 0) as usize;
+            let i = dropdown::get_sel(c.cmb_sens);
             if let Some(v) = SENS_LEVELS.get(i) {
                 self.threshold = *v;
             }
@@ -641,6 +637,7 @@ impl App {
             return;
         }
         self.relayouting = true;
+        dropdown::close_open();
         let mut cr: RECT = std::mem::zeroed();
         GetClientRect(self.hwnd, &mut cr);
         // 布局按**实际客户区**宽度算：MIN_W 是窗口最小宽度，不是客户区宽度，
@@ -657,18 +654,7 @@ impl App {
             }
         }
         self.preview_rect = prev;
-        // 【开始录制】小圆角：它是 Static（矩形），用窗口区域裁成圆角，
-        // 免得再去走 BS_OWNERDRAW 那条会崩的自绘路线。
-        // 宽度取控件当前实际尺寸（布局变了也不用同步改这里）。
-        {
-            use windows_sys::Win32::Graphics::Gdi::{CreateRoundRectRgn, SetWindowRgn};
-            let mut rr: RECT = std::mem::zeroed();
-            windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect(self.ctl.btn_record, &mut rr);
-            let rw = (rr.right - rr.left).max(1);
-            let rh = (rr.bottom - rr.top).max(1);
-            let rgn = CreateRoundRectRgn(0, 0, rw + 1, rh + 1, 8, 8);
-            SetWindowRgn(self.ctl.btn_record, rgn, 1);
-        }
+        // 【开始录制】的圆角改由 theme 自绘（不再用窗口区域裁剪，避免锯齿）
         self.set_panel_visible();
 
         // 内容装不下就把窗口长高（规格给了最小尺寸，说明窗口可变）
@@ -1403,12 +1389,19 @@ impl App {
         }
         if !painted && bw > 0 && bh > 0 {
             // 空框：画一圈浅凹陷边框 + 居中占位文字，让"这里会出画面"一眼可见。
-            let mut edge = r;
-            DrawEdge(hdc, &mut edge, BDR_SUNKENOUTER, BF_RECT);
+            let edge = r;
+            // 深色主题：用 1px 主题边框代替系统凹陷边
+            {
+                use windows_sys::Win32::Graphics::Gdi::FrameRect;
+                let br = windows_sys::Win32::Graphics::Gdi::CreateSolidBrush(theme::BORDER);
+                FrameRect(hdc, &edge, br);
+                windows_sys::Win32::Graphics::Gdi::DeleteObject(br as _);
+            }
             // ⚠️ 必须显式选 UI 字体。窗口 DC 的默认字体是 System 位图字体，
             //    高 DPI 下会大得离谱、又被 160×100 的框裁掉（实测踩过）。
             let old = SelectObject(hdc, self.font);
             SetBkMode(hdc, 1); // TRANSPARENT
+            windows_sys::Win32::Graphics::Gdi::SetTextColor(hdc, theme::MUTED);
             let t = win::wide("预览区域\n拾取窗口后显示");
             // 先量出两行文字的实际高度，再垂直居中 —— 固定 top 偏移在高 DPI 下会偏上。
             // ⚠️ DT_CALCRECT 会**改写矩形**（把 right/bottom 收到文字实际大小），
@@ -1515,6 +1508,7 @@ pub fn run(initial_target: Option<isize>) -> i32 {
     // 用户测试后只能靠这个文件定位问题）；release 构建需显式设 CANLAPSE_LOG 才写。
     let _ = crate::log::init();
     let t_start = std::time::Instant::now();
+    unsafe { theme::prefer_dark() };
     logline!("");
     logline!(
         "==== CanLapse {} ({}) 启动 ====",
@@ -1617,7 +1611,7 @@ pub fn run(initial_target: Option<isize>) -> i32 {
             wndproc as unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
         )] {
             let c = cls(name);
-            let brush = windows_sys::Win32::Graphics::Gdi::CreateSolidBrush(0x00F0_F0F0);
+            let brush = theme::bg_brush();
             let wc = WNDCLASSW {
                 style: 0,
                 lpfnWndProc: Some(proc_),
@@ -1655,6 +1649,7 @@ pub fn run(initial_target: Option<isize>) -> i32 {
         if hwnd.is_null() {
             return 2;
         }
+        theme::dark_window_frame(hwnd);
         logline!("[start] 窗口创建完成 {} ms", t_start.elapsed().as_millis());
         // 命令行预先指定目标（便于脚本化验证，也方便用户直接从命令行带目标启动）
         if let Some(h) = initial_target {

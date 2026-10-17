@@ -107,7 +107,7 @@ unsafe fn ui_font() -> HGDIOBJ {
     let h = *FONT.get_or_init(|| {
         let face = win::wide("Microsoft YaHei UI");
         let mut f = CreateFontW(
-            -15, // 字高（像素）
+            -14, // 字高（像素）
             0,
             0,
             0,
@@ -124,7 +124,7 @@ unsafe fn ui_font() -> HGDIOBJ {
         ) as isize;
         if f == 0 {
             let seg = win::wide("Segoe UI");
-            f = CreateFontW(-15, 0, 0, 0, FW_NORMAL as i32, 0, 0, 0, 1, 0, 0, 0, 0, seg.as_ptr())
+            f = CreateFontW(-14, 0, 0, 0, FW_NORMAL as i32, 0, 0, 0, 1, 0, 0, 0, 0, seg.as_ptr())
                 as isize;
         }
         if f == 0 {
