@@ -561,6 +561,23 @@ impl App {
         }
         let f = SendMessageW(c.sld_fps, TBM_GETPOS_C, 0, 0) as i32;
         let t = SendMessageW(c.sld_thr, TBM_GETPOS_C, 0, 0) as i32;
+        // 诊断：逐次记录滑块原始值。用户报告"只能往左调/往右崩"，
+        // 这份日志能回答"往右到底有没有触发 WM_HSCROLL"以及崩溃前最后一次的值。
+        {
+            let dir = std::env::var("LOCALAPPDATA")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                .join("CanLapse");
+            let _ = std::fs::create_dir_all(&dir);
+            use std::io::Write;
+            if let Ok(mut fh) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join("slider.log"))
+            {
+                let _ = writeln!(fh, "fps_pos={f} thr_pos={t}");
+            }
+        }
         self.fps = (f.clamp(1, 8)) as f64;
         self.threshold = (t.clamp(0, 50)) as f32 / 1000.0;
         self.refresh_labels();
