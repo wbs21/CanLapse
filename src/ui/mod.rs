@@ -736,12 +736,18 @@ impl App {
     }
 
     unsafe fn do_pick(&mut self) {
-        // 拾取期间**不最小化**：只把主窗口压到最底层（它只有 460x487，不会挡住画布），
-        // 这样状态栏里的提示一直可见，用户知道该往哪点。
-        // HWND_BOTTOM = 1；SWP_NOMOVE|NOSIZE|NOACTIVATE = 0x0002|0x0001|0x0010
+        // 拾取期间：**始终置顶 + 半透明**（按用户要求）。
+        // 置顶保证提示始终可见；半透明让我们不完全挡住下面的目标，方便点它的标题栏。
+        // GWL_EXSTYLE = -20，WS_EX_LAYERED = 0x00080000，LWA_ALPHA = 0x2
+        let ex = GetWindowLongPtrW(self.hwnd, -20) as i64;
+        SetWindowLongPtrW(self.hwnd, -20, (ex | 0x0008_0000) as isize);
+        windows_sys::Win32::UI::WindowsAndMessaging::SetLayeredWindowAttributes(
+            self.hwnd, 0, 190, 0x0000_0002,
+        );
+        // HWND_TOPMOST = -1；SWP_NOMOVE|NOSIZE|NOACTIVATE
         SetWindowPos(
             self.hwnd,
-            1 as HWND,
+            (-1isize) as HWND, // HWND_TOPMOST
             0,
             0,
             0,
@@ -754,11 +760,14 @@ impl App {
 
         let picked = win::pick_window_interactive();
 
-        // 拾取结束：立刻把界面拉回最上层，并让预览显示结果
-        // HWND_TOP = 0；SWP_NOMOVE|NOSIZE = 0x0003（允许激活）
+        // 拾取结束：取消半透明与置顶，把界面拉回最前并正常显示
+        // SWP_NOMOVE|NOSIZE
         SetWindowPos(self.hwnd, std::ptr::null_mut(), 0, 0, 0, 0, 0x0002 | 0x0001);
-        ShowWindow(self.hwnd, SW_RESTORE); // 拾取后确保界面可见（未最小化时等同显示）
+        let ex2 = GetWindowLongPtrW(self.hwnd, -20) as i64;
+        SetWindowLongPtrW(self.hwnd, -20, (ex2 & !0x0008_0000) as isize); // 去掉 WS_EX_LAYERED
+        ShowWindow(self.hwnd, SW_RESTORE);
         SetForegroundWindow(self.hwnd);
+        InvalidateRect(self.hwnd, std::ptr::null(), 1);
 
         let Some(hwnd) = picked else {
             self.refresh_labels();
