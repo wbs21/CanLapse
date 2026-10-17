@@ -732,7 +732,10 @@ impl App {
              Photoshop：拖拽画布标签向外拉出，脱离主框架\n\
              CSP / 优动漫 PAINT：拖拽画布标签分离，或 视图 → 新建视图\n\
              Krita：窗口 → 新建窗口\n\n\
-             💡提示：拾取后查看预览窗口，如果画面包含工具栏 / 图层面板，说明画布没有浮动。",
+             💡提示：拾取后查看预览窗口，如果画面包含工具栏 / 图层面板，说明画布没有浮动。\n\n\
+             ⚠️ 注意：绘画软件**自己的浮动面板**（SAI2 的「颜色」等）会被录进画面。\n\
+             这不是遮挡误判 —— 面板与画布属于同一个窗口组，而面板盖住的那部分画布像素\n\
+             软件根本没有绘制，任何录屏方式都取不回来。请把浮动面板移出画布范围。",
         );
     }
 
@@ -1030,6 +1033,17 @@ impl App {
                     self.preview = Some(f);
                     InvalidateRect(self.hwnd, &self.preview_rect, 0);
                 }
+                // 拾取阶段就提醒（动态刷新）：画布被自家浮动面板遮挡了多少。
+                // 被盖住的画布像素是拿不回来的，只能在录制开始前让用户移开面板。
+                let pct = (cap.covered_ratio() * 100.0).round().clamp(0.0, 100.0) as u32;
+                let base = self.status_text();
+                let text = if pct >= 5 {
+                    format!("{base} ｜ ⚠ 画布被浮动面板遮挡约 {pct}%，建议移开面板")
+                } else {
+                    base
+                };
+                let t = win::wide(&text);
+                SetWindowTextW(self.ctl.status, t.as_ptr());
             }
         }
     }

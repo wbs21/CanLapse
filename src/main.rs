@@ -258,8 +258,14 @@ fn cmd_record(a: RecordArgs) -> i32 {
             } else {
                 "待定".to_string()
             };
+            let cov = shared.covered_pct();
+            let warn = if cov >= 5 {
+                format!(" | ⚠ 被自家浮动面板遮挡 {cov}%（这部分画布像素取不回来，建议移开面板）")
+            } else {
+                String::new()
+            };
             print!(
-                "\r已录制 {} 帧 | 基准 {base} | 丢弃 {} | {}   ",
+                "\r已录制 {} 帧 | 基准 {base} | 丢弃 {} | {}{warn}   ",
                 shared.frames(),
                 shared.dropped(),
                 recorder::format_duration(shared.elapsed_ms())

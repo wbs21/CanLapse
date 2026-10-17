@@ -74,6 +74,8 @@ pub struct Shared {
     elapsed_ms: AtomicU64,
     base_w: AtomicI32,
     base_h: AtomicI32,
+    /// 画布被同属主面板遮挡的百分比（0~100），动态刷新
+    covered_pct: AtomicU32,
     stop: AtomicBool,
     paused: AtomicBool,
     mark: AtomicBool,
@@ -92,6 +94,7 @@ impl Shared {
             elapsed_ms: AtomicU64::new(0),
             base_w: AtomicI32::new(0),
             base_h: AtomicI32::new(0),
+            covered_pct: AtomicU32::new(0),
             stop: AtomicBool::new(false),
             paused: AtomicBool::new(false),
             mark: AtomicBool::new(false),
@@ -122,6 +125,12 @@ impl Shared {
             self.base_w.load(Ordering::SeqCst),
             self.base_h.load(Ordering::SeqCst),
         )
+    }
+
+    /// 画布被自家面板遮挡的百分比（0~100）。>0 表示画面里混进了面板 —— 详见
+    /// [`crate::win::covered_ratio`]：被盖住的画布像素是拿不回来的，只能提醒。
+    pub fn covered_pct(&self) -> u32 {
+        self.covered_pct.load(Ordering::SeqCst)
     }
     pub fn session_dir(&self) -> Option<PathBuf> {
         self.dir.lock().ok().and_then(|d| d.clone())
@@ -200,6 +209,7 @@ fn run(cfg: &RecorderConfig, shared: &Arc<Shared>) -> Result<(), String> {
     let mut base_size: Option<(i32, i32)> = None;
     let mut next_tick = Instant::now();
     let mut completed = true;
+    let mut tick: u32 = 0;
 
     loop {
         if shared.stop.load(Ordering::SeqCst) {
@@ -278,6 +288,14 @@ fn run(cfg: &RecorderConfig, shared: &Arc<Shared>) -> Result<(), String> {
             Err(_) => {
                 shared.dropped.fetch_add(1, Ordering::SeqCst);
             }
+        }
+
+        // 每 4 次采样统计一次遮挡（枚举窗口有成本，不必每帧都做）。
+        // 动态刷新：用户拖动面板时这个数字要跟着变。
+        tick = tick.wrapping_add(1);
+        if tick % 4 == 0 {
+            let pct = (cap.covered_ratio() * 100.0).round().clamp(0.0, 100.0) as u32;
+            shared.covered_pct.store(pct, Ordering::SeqCst);
         }
 
         let elapsed = start.elapsed().saturating_sub(paused_total);

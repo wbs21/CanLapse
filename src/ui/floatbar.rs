@@ -34,7 +34,7 @@ const ID_STOP: usize = 2003;
 const ID_INFO: usize = 2004;
 const TIMER_REFRESH: usize = 1;
 
-const BAR_W: i32 = 344;
+const BAR_W: i32 = 400;
 const BAR_H: i32 = 44;
 const BTN_W: i32 = 58;
 const BTN_H: i32 = 28;
@@ -131,12 +131,19 @@ unsafe fn refresh(hwnd: HWND) {
     let t = win::wide(if paused { "继续" } else { "暂停" });
     SetWindowTextW(pause_btn, t.as_ptr());
     // 时长 | 帧计数 | 标记数 显示在条标题上（条很窄，标题栏本来就空着）
+    // 遮挡提醒必须出现在**这里**：录制时主窗口已最小化，悬浮条是用户唯一能看到的界面。
+    let cov = shared.covered_pct();
     let info = format!(
-        "{} | {} 帧{}",
+        "{} | {} 帧{}{}",
         recorder::format_duration(shared.elapsed_ms()),
         shared.frames(),
         if shared.markers() > 0 {
             format!(" | {} 标记", shared.markers())
+        } else {
+            String::new()
+        },
+        if cov >= 5 {
+            format!(" | ⚠ 遮挡 {cov}%")
         } else {
             String::new()
         }
