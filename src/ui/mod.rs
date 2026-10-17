@@ -18,10 +18,10 @@ use std::thread::JoinHandle;
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, EndPaint,
-    GetStockObject, InvalidateRect, ReleaseDC, SelectObject, StretchDIBits, UpdateWindow, BITMAPINFO,
-    BITMAPINFOHEADER, BI_RGB, DEFAULT_GUI_FONT, DIB_RGB_COLORS, HGDIOBJ, PAINTSTRUCT, RGBQUAD,
-    SRCCOPY,
+    BeginPaint, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, DrawEdge, EndPaint,
+    GetStockObject, InvalidateRect, ReleaseDC, SelectObject, SetBkMode, StretchDIBits, UpdateWindow,
+    BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BDR_SUNKENOUTER, BF_RECT, DEFAULT_GUI_FONT, DIB_RGB_COLORS,
+    HGDIOBJ, PAINTSTRUCT, RGBQUAD, SRCCOPY,
 };
 use windows_sys::Win32::UI::Controls::{
     InitCommonControlsEx, INITCOMMONCONTROLSEX, ICC_BAR_CLASSES, ICC_PROGRESS_CLASS,
@@ -788,16 +788,26 @@ impl App {
         self.preview_cap = None;
         match ThumbnailCapture::new(info.hwnd) {
             Ok(cap) => {
+                win::pick_log("CAPTURE 建抓帧器 OK，开始抓第一帧");
                 self.preview = cap.grab().ok();
+                win::pick_log(&format!(
+                    "CAPTURE 首帧 = {}",
+                    if self.preview.is_some() { "成功" } else { "失败" }
+                ));
                 self.preview_cap = Some(cap);
             }
             Err(e) => {
                 // 不再弹模态框：把原因写进状态栏，用户可直接再点一次【拾取窗口】
+                // ⚠️ 必须把旧预览清掉：否则状态栏说"抓不到"，画面上却还留着上一个目标的图，
+                //    用户会以为拾取成功了（实测踩过）。
+                self.preview = None;
                 let t = win::wide(&format!("无法抓取该窗口：{e}　请重新拾取"));
                 SetWindowTextW(self.ctl.state, t.as_ptr());
+                InvalidateRect(self.hwnd, &self.preview_rect, 0);
                 return;
             }
         }
+        win::pick_log("DO_PICK 抓帧完成，准备更新界面");
         // 辅助提醒：目标客户区明显大于"典型画布比例"时提示可能没浮动
         // （规格：仅提示，允许强行继续）
         self.pick_state = if looks_like_panel(&info) {
@@ -806,8 +816,14 @@ impl App {
             PickState::Ok
         };
         self.target = Some(info);
+        win::pick_log("DO_PICK 已设置 target，调用 refresh_labels");
         self.refresh_labels();
+        win::pick_log("DO_PICK refresh_labels 完成，触发重绘");
+        // 拾取期间主窗口被最小化过，WM_PAINT 的时机不保证；这里**同步**重绘一次，
+        // 保证"点完标题栏，预览立刻出现"，而不是等下一个计时器/曝光周期。
         InvalidateRect(self.hwnd, std::ptr::null(), 1);
+        UpdateWindow(self.hwnd);
+        win::pick_log("DO_PICK 同步重绘完成");
     }
 
     unsafe fn show_help(&self) {
@@ -1167,11 +1183,16 @@ impl App {
     unsafe fn on_paint(&mut self) {
         let mut ps: PAINTSTRUCT = std::mem::zeroed();
         let hdc = BeginPaint(self.hwnd, &mut ps);
+        let r = self.preview_rect;
+        let (bw, bh) = (r.right - r.left, r.bottom - r.top);
         // 预览图：把最近一帧等比缩放到 160×100 的框里
+        let mut painted = false;
         if let Some(frame) = &self.preview {
-            let r = self.preview_rect;
-            let (bw, bh) = (r.right - r.left, r.bottom - r.top);
-            if bw > 0 && bh > 0 {
+            // 防御：缓冲区尺寸与声明尺寸不一致就别画（避免越界读）。
+            // ⚠️ 这里**不能 return** —— 那会跳过 EndPaint，每异常一次漏一个 DC。
+            let expect = (frame.width as usize).saturating_mul(frame.height as usize) * 4;
+            let sane = frame.width > 0 && frame.height > 0 && frame.bgra.len() == expect;
+            if sane && bw > 0 && bh > 0 {
                 let scale = f64::min(bw as f64 / frame.width as f64, bh as f64 / frame.height as f64);
                 let dw = (frame.width as f64 * scale) as i32;
                 let dh = (frame.height as f64 * scale) as i32;
@@ -1208,18 +1229,47 @@ impl App {
                     DIB_RGB_COLORS,
                     SRCCOPY,
                 );
+                painted = true;
+            } else {
+                win::pick_log("PAINT 帧数据异常，跳过绘制");
             }
-        } else {
-            let r = self.preview_rect;
-            let t = win::wide("预览区域（拾取窗口后显示）");
-            let mut rc = RECT { left: r.left + 6, top: r.top + 30, right: r.right, bottom: r.bottom };
+        }
+        if !painted && bw > 0 && bh > 0 {
+            // 空框：画一圈浅凹陷边框 + 居中占位文字，让"这里会出画面"一眼可见。
+            let mut edge = r;
+            DrawEdge(hdc, &mut edge, BDR_SUNKENOUTER, BF_RECT);
+            // ⚠️ 必须显式选 UI 字体。窗口 DC 的默认字体是 System 位图字体，
+            //    高 DPI 下会大得离谱、又被 160×100 的框裁掉（实测踩过）。
+            let old = SelectObject(hdc, self.font);
+            SetBkMode(hdc, 1); // TRANSPARENT
+            let t = win::wide("预览区域\n拾取窗口后显示");
+            // 先量出两行文字的实际高度，再垂直居中 —— 固定 top 偏移在高 DPI 下会偏上。
+            // ⚠️ DT_CALCRECT 会**改写矩形**（把 right/bottom 收到文字实际大小），
+            //    所以必须用单独的 measure 矩形量，否则后面的居中会按被收窄的框算，
+            //    文字表现为贴着左边（实测踩过）。
+            let mut measure = RECT { left: r.left + 4, top: 0, right: r.right - 4, bottom: 0 };
+            windows_sys::Win32::Graphics::Gdi::DrawTextW(
+                hdc,
+                t.as_ptr(),
+                -1,
+                &mut measure,
+                0x0000_0400 | 0x0000_0001 | 0x0000_0010, // DT_CALCRECT | DT_CENTER | DT_WORDBREAK
+            );
+            let th = measure.bottom - measure.top;
+            let mut rc = RECT {
+                left: r.left + 4,
+                top: r.top + (bh - th) / 2,
+                right: r.right - 4,
+                bottom: r.top + (bh - th) / 2 + th,
+            };
             windows_sys::Win32::Graphics::Gdi::DrawTextW(
                 hdc,
                 t.as_ptr(),
                 -1,
                 &mut rc,
-                0x0000_0000, // DT_LEFT
+                0x0000_0001 | 0x0000_0010, // DT_CENTER | DT_WORDBREAK
             );
+            SelectObject(hdc, old);
         }
         EndPaint(self.hwnd, &ps);
     }

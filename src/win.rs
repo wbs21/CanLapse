@@ -393,7 +393,6 @@ pub fn pick_window_interactive(hint: Option<HWND>) -> Option<HWND> {
     }
 }
 
-/// 把拾取过程的诊断写进 %LOCALAPPDATA%\CanLapse\pick.log（追加）。
 /// 这个窗口是否值得作为拾取目标。
 ///
 /// 实测教训：用户点击时光标可能落在**系统浮层**上（例如输入法/文本输入窗口
@@ -419,21 +418,27 @@ fn looks_pickable(h: HWND) -> bool {
     w >= 64 && ht >= 64
 }
 
+/// 把拾取过程的诊断**显式开启后才**写文件（见下方 `writes_pick_log`）。
+pub fn pick_log(line: &str) {
+    writes_pick_log(line);
+}
+
+/// 拾取诊断日志：只有设置了 `CANLAPSE_LOG` 才写。
+///
+/// 之前默认往 `%LOCALAPPDATA%\CanLapse\pick.log` 里写（每次拾取最多 300 行），
+/// 排查期很方便，但用户机器上不该留下这种调试残留 —— 而且预览每重绘一次也写一行，
+/// 长时间开着会一直长。改成**显式开启**：需要排查时设
+/// `CANLAPSE_LOG=<某文件路径>` 再启动，默认零副作用。
 fn writes_pick_log(line: &str) {
     use std::io::Write;
-    // 优先用 CANLAPSE_LOG 指定的文件（测试时写进工作区，保证可读）；
-    // 否则退回 %LOCALAPPDATA%\CanLapse\pick.log
-    let path = if let Ok(p) = std::env::var("CANLAPSE_LOG") {
-        std::path::PathBuf::from(p)
-    } else {
-        let dir = std::env::var("LOCALAPPDATA")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| std::path::PathBuf::from("."))
-            .join("CanLapse");
-        let _ = std::fs::create_dir_all(&dir);
-        dir.join("pick.log")
+    let Ok(path) = std::env::var("CANLAPSE_LOG") else {
+        return;
     };
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
         let _ = writeln!(f, "{line}");
     }
 }
