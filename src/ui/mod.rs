@@ -78,12 +78,12 @@ const TIMER_UI: usize = 1;
 /// 比每帧拷整张画布省一两个数量级的带宽/分配。
 const PREVIEW_MAX_W: i32 = 480;
 
-const PREVIEW_W: i32 = 160;
-const PREVIEW_H: i32 = 100;
-const DEFAULT_W: i32 = 460;
-const DEFAULT_H: i32 = 380;
-const MIN_W: i32 = 400;
-const MIN_H: i32 = 320;
+const PREVIEW_W: i32 = 140;
+const PREVIEW_H: i32 = 88;
+const DEFAULT_W: i32 = 330;
+const DEFAULT_H: i32 = 344;
+const MIN_W: i32 = 320;
+const MIN_H: i32 = 300;
 
 /// 帧密度四档：(界面文字, 每秒采样帧数)
 const REC_FPS_OPTIONS: [(&str, f64); 4] = [
@@ -237,7 +237,7 @@ impl App {
                 None => format!("✅ 已选中画布窗口（{picked}）"),
             },
             PickState::HasPanel => {
-                "⚠️ 检测到窗口包含工具栏，画布未浮动（点【如何定位窗口】查看做法）".to_string()
+                "⚠️ 画布未浮动？点【如何定位窗口】".to_string()
             }
         }
     }
@@ -252,10 +252,12 @@ fn rect(x: i32, y: i32, w: i32, h: i32) -> RECT {
 }
 
 /// 计算所有控件的目标位置，并返回（内容所需高度, 预览矩形）
+///
+/// 宽度按 330px 设计（用户要求）：左右边距 8px，控件按剩余宽度自适应。
 fn compute_layout(app: &App, cw: i32) -> (Vec<(HWND, RECT, bool)>, RECT, i32) {
-    let m = 10;
+    let m = 8;
     let inner = (cw - m * 2).max(120);
-    let mut y = 8;
+    let mut y = 6;
     let mut out: Vec<(HWND, RECT, bool)> = Vec::new();
     let c = &app.ctl;
     let mut push = |h: HWND, r: RECT, vis: bool| out.push((h, r, vis));
@@ -263,65 +265,73 @@ fn compute_layout(app: &App, cw: i32) -> (Vec<(HWND, RECT, bool)>, RECT, i32) {
     push(c.title, rect(m, y, inner, 20), true);
     y += 24;
 
-    // 拾取模块按钮组（按用户要求去掉【预览窗口】按钮，两按钮均分）
+    // 拾取模块按钮组（两个按钮均分）
     let gap = 6;
     let bw = (inner - gap) / 2;
-    push(c.btn_pick, rect(m, y, bw, 26), true);
-    push(c.btn_help, rect(m + bw + gap, y, inner - bw - gap, 26), true);
-    y += 32;
+    push(c.btn_pick, rect(m, y, bw, 24), true);
+    push(c.btn_help, rect(m + bw + gap, y, inner - bw - gap, 24), true);
+    y += 30;
 
-    // 预览缩略图（固定 160×100，规格值）+ 右侧的【开始录制】
-    // 尺寸与顶部三个按钮一致（同宽同高），并且**右对齐**到内容右边界
+    // 预览缩略图 + 右侧【开始录制】：按钮吃掉预览右侧的剩余宽度
     let prev = rect(m, y, PREVIEW_W, PREVIEW_H);
+    let rec_w = (inner - PREVIEW_W - 12).clamp(90, 160);
     push(
         c.btn_record,
-        rect(cw - m - bw, y + PREVIEW_H / 2 - 13, bw, 26),
+        rect(cw - m - rec_w, y + PREVIEW_H / 2 - 12, rec_w, 24),
         true,
     );
     y += PREVIEW_H + 6;
 
     push(c.status, rect(m, y, inner, 18), true);
-    y += 24;
+    y += 22;
 
     // 录制参数（不折叠，直接显示）。折叠标题栏控件保留但隐藏、不占高度。
     push(c.hdr_rec, rect(m, y, inner, 22), false);
-    push(c.lbl_fps, rect(m + 8, y, 120, 22), true);
-    push(c.cmb_recfps, rect(m + 132, y, 140, 22), true);
-    y += 28;
-    push(c.lbl_thr, rect(m + 8, y, 120, 22), true);
-    push(c.cmb_sens, rect(m + 132, y, 80, 22), true);
-    // 说明紧跟在选择框后面（按用户要求，不再单独占一行）
+    push(c.lbl_fps, rect(m, y, 108, 22), true);
+    push(c.cmb_recfps, rect(m + 108, y, inner - 108, 22), true);
+    y += 26;
+    push(c.lbl_thr, rect(m, y, 108, 22), true);
+    push(c.cmb_sens, rect(m + 108, y, 56, 22), true);
+    // 说明紧跟在选择框后面（不单独占一行）
     push(
         c.hint_sens,
-        rect(m + 132 + 80 + 8, y, inner - 132 - 80 - 8, 22),
+        rect(m + 108 + 56 + 6, y, inner - 108 - 56 - 6, 22),
         true,
     );
-    y += 28;
+    y += 26;
 
     // 导出视频参数（不折叠，直接显示）。播放帧率（固定 30fps）与画质（固定中）
-    // 不再提供选择，按用户要求从界面移除；缓存提示也去掉，改为最下方的按钮。
+    // 不提供选择；缓存提示改为最下方的按钮。
     push(c.hdr_exp, rect(m, y, inner, 22), false);
-    push(c.chk_clean, rect(m + 8, y, inner - 16, 20), true);
-    y += 24;
-    push(c.lbl_out, rect(m + 8, y, 40, 20), true);
-    push(c.edit_out, rect(m + 48, y, inner - 48 - 60, 22), true);
-    push(c.btn_out, rect(cw - m - 52, y, 52, 22), true);
-    y += 28;
+    push(c.chk_clean, rect(m, y, inner, 20), true);
+    y += 22;
+    // 输出路径：标签 32 + 输入框 + 选择按钮 44（输入框随之变窄）
+    let out_btn_w = 44;
+    let out_btn_x = cw - m - out_btn_w;
+    push(c.lbl_out, rect(m, y, 32, 20), true);
+    push(c.edit_out, rect(m + 36, y, out_btn_x - (m + 36) - 6, 22), true);
+    push(c.btn_out, rect(out_btn_x, y, out_btn_w, 22), true);
+    y += 26;
 
-    // 历史缓存会话：按用户要求移除整块（控件保留但永久隐藏，不占高度）
+    // 历史缓存会话：已移除整块（控件保留但永久隐藏，不占高度）
     push(c.hdr_hist, rect(m, y, inner, 22), false);
-    push(c.list, rect(m, y, inner - 16, 96), false);
-    push(c.btn_reexport, rect(m, y, 80, 24), false);
-    push(c.btn_open, rect(m, y, 80, 24), false);
-    push(c.btn_delete, rect(m, y, 80, 24), false);
+    push(c.list, rect(m, y, inner, 96), false);
+    push(c.btn_reexport, rect(m, y, 70, 24), false);
+    push(c.btn_open, rect(m, y, 70, 24), false);
+    push(c.btn_delete, rect(m, y, 70, 24), false);
 
-    // 合成进度 + 取消合成（开始录制已移到预览区右侧）
+    // 合成进度 + 取消合成
     let by = y.max(0) + 2;
-    push(c.progress, rect(m, by, inner - 76, 20), true);
-    push(c.btn_cancel, rect(cw - m - 64, by, 64, 24), true);
-    // 最下方：清理缓存按钮（替换原来的状态栏；点击打开缓存文件夹）
-    let cy = by + 26;
-    push(c.btn_clean, rect(m + 8, cy, inner - 16, 24), true);
+    push(c.progress, rect(m, by, inner - 52, 18), true);
+    push(c.btn_cancel, rect(cw - m - 48, by, 48, 20), true);
+    // 最下方：清理缓存按钮（宽度为内容宽度的 1/3，居中）
+    let cy = by + 24;
+    let clean_w = (inner / 3).max(88);
+    push(
+        c.btn_clean,
+        rect(m + (inner - clean_w) / 2, cy, clean_w, 24),
+        true,
+    );
     let need = cy + 30;
 
     (out, prev, need)
@@ -633,7 +643,9 @@ impl App {
         self.relayouting = true;
         let mut cr: RECT = std::mem::zeroed();
         GetClientRect(self.hwnd, &mut cr);
-        let cw = (cr.right - cr.left).max(MIN_W);
+        // 布局按**实际客户区**宽度算：MIN_W 是窗口最小宽度，不是客户区宽度，
+        // 用 .max(MIN_W) 会把 330 宽的窗口按 320 客户区排，右边缘控件整体右移。
+        let cw = (cr.right - cr.left).max(200);
         let (items, prev, need) = compute_layout(self, cw);
         for (h, r, vis) in items {
             if h.is_null() {
@@ -647,10 +659,14 @@ impl App {
         self.preview_rect = prev;
         // 【开始录制】小圆角：它是 Static（矩形），用窗口区域裁成圆角，
         // 免得再去走 BS_OWNERDRAW 那条会崩的自绘路线。
+        // 宽度取控件当前实际尺寸（布局变了也不用同步改这里）。
         {
-            let bw = (cw - 20 - 12) / 3;
             use windows_sys::Win32::Graphics::Gdi::{CreateRoundRectRgn, SetWindowRgn};
-            let rgn = CreateRoundRectRgn(0, 0, bw + 1, 27, 8, 8);
+            let mut rr: RECT = std::mem::zeroed();
+            windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect(self.ctl.btn_record, &mut rr);
+            let rw = (rr.right - rr.left).max(1);
+            let rh = (rr.bottom - rr.top).max(1);
+            let rgn = CreateRoundRectRgn(0, 0, rw + 1, rh + 1, 8, 8);
             SetWindowRgn(self.ctl.btn_record, rgn, 1);
         }
         self.set_panel_visible();
@@ -805,7 +821,7 @@ impl App {
         ShowWindow(self.hwnd, SW_MINIMIZE);
         logline!("[pick] 主窗口已最小化，进入拾取");
         // 说明清楚：拾取时 CanLapse 已最小化到任务栏（点不到），唯一该点的是画布边框。
-        let t = win::wide("请点击画布边框（CanLapse 已最小化到任务栏；Esc 取消）");
+        let t = win::wide("请点击画布边框；Esc 取消");
         SetWindowTextW(self.ctl.status, t.as_ptr());
         UpdateWindow(self.hwnd);
 
@@ -826,7 +842,7 @@ impl App {
         let Some(hwnd) = picked else {
             logline!("[pick] 拾取取消（Esc / 主窗口被恢复 / 点在本程序窗口上）");
             self.refresh_labels();
-            let t = win::wide("已取消拾取，请重新点【拾取窗口】");
+            let t = win::wide("已取消拾取，请重新拾取");
             SetWindowTextW(self.ctl.status, t.as_ptr());
             return;
         };
@@ -1316,7 +1332,7 @@ impl App {
         ShowWindow(self.ctl.btn_record, 0);
         ShowWindow(self.ctl.progress, 0);
         ShowWindow(self.ctl.btn_cancel, 0);
-        let t = win::wide("录制中…主窗口已最小化，请使用悬浮操作条（暂停 / 标记 / 停止）");
+        let t = win::wide("录制中…用悬浮条：暂停 / 标记 / 停止");
         SetWindowTextW(self.ctl.status, t.as_ptr());
     }
 
