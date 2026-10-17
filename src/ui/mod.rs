@@ -1443,6 +1443,18 @@ impl App {
 // ---------------------------------------------------------------------------
 
 // 目录策略统一在 lib.rs（<exe 目录>\cache / output，不可写时退回 LOCALAPPDATA）
+/// exe 里的应用图标（IDI_ICON1）；没注入资源时返回 NULL，不影响运行
+unsafe fn app_icon() -> *mut core::ffi::c_void {
+    windows_sys::Win32::UI::WindowsAndMessaging::LoadImageW(
+        win::module_handle(),
+        101 as *const u16,
+        1,    // IMAGE_ICON
+        0,
+        0,
+        0x0040 | 0x8000, // LR_DEFAULTSIZE | LR_SHARED
+    ) as *mut core::ffi::c_void
+}
+
 fn default_cache_root() -> PathBuf {
     crate::default_cache_root()
 }
@@ -1619,13 +1631,15 @@ pub fn run(initial_target: Option<isize>) -> i32 {
         )] {
             let c = cls(name);
             let brush = theme::bg_brush();
+            // 图标来自 exe 资源（IDI_ICON1 = 101，由 tools\embed-resources.ps1 注入）
+            let app_icon = app_icon();
             let wc = WNDCLASSW {
                 style: 0,
                 lpfnWndProc: Some(proc_),
                 cbClsExtra: 0,
                 cbWndExtra: 0,
                 hInstance: win::module_handle(),
-                hIcon: std::ptr::null_mut(),
+                hIcon: app_icon,
                 hCursor: windows_sys::Win32::UI::WindowsAndMessaging::LoadCursorW(
                     std::ptr::null_mut(),
                     32512 as *const u16, // IDC_ARROW
@@ -1655,6 +1669,12 @@ pub fn run(initial_target: Option<isize>) -> i32 {
         );
         if hwnd.is_null() {
             return 2;
+        }
+        // 任务栏/标题栏图标（大图标给 Alt-Tab 与任务栏）
+        let icon = app_icon();
+        if !icon.is_null() {
+            windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW(hwnd, 0x0080, 1, icon as isize); // WM_SETICON / ICON_BIG
+            windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW(hwnd, 0x0080, 0, icon as isize); // ICON_SMALL
         }
         theme::dark_window_frame(hwnd);
         logline!("[start] 窗口创建完成 {} ms", t_start.elapsed().as_millis());

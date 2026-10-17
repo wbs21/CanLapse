@@ -58,6 +58,14 @@
 
 ### 变更
 
+- **应用图标（v1.0.0 收工后增补）**
+  - 灰底 `#454950` 圆角方 + 方头红 C `#C0453A`（按用户参考稿重画，C 外圆角 26 / 笔画 36 / 右侧开口 104）；
+  - ICO **自己写**（未用 Pillow 的 sizes+append_images，那条路径会把大图裁成小图）：
+    ≤64px 用 BMP 条目、128/256 用 PNG 条目，16/24/32/48/64/128/256 七档全部**独立渲染**；
+  - 接入 `CanLapse.ico` → `CanLapse.rc` → `tools\embed-resources.ps1` 注入 exe；
+    主窗口 `WNDCLASS.hIcon` 与 `WM_SETICON`（大/小图标）都用同一资源，标题栏/任务栏/Alt-Tab 一致。
+
+
 - **缓存目录也改到「程序所在目录\cache」**（v1.0.0 收工后增补）
   - 目录优先级：`CANLAPSE_CACHE` 环境变量 > `<exe 目录>\cache` > `%LOCALAPPDATA%\CanLapse\cache`；
   - 程序目录不可写时自动退回 LOCALAPPDATA；GUI 与 CLI（record/sessions/encode 的默认根）共用同一策略；
