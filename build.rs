@@ -48,7 +48,38 @@ fn main() {
     println!("cargo:rerun-if-env-changed=FFMPEG_MIN_DIR");
     println!("cargo:rerun-if-env-changed=CANLAPSE_WINPTHREAD");
 
+    embed_manifest();
+
     deploy_runtime_dlls(&bin, &root);
+}
+
+/// 把 `CanLapse.manifest` 链接进 exe。
+///
+/// 它带来两件实在的事：
+/// 1. **现代主题控件**（comctl32 v6）—— 没有它，按钮/滚动条/进度条是 Windows 95 外观；
+/// 2. **PerMonitorV2 DPI 感知** —— 且能在进程启动前生效，避免首帧按错误缩放布局。
+///
+/// 只对 MSVC 目标有效（用的是 link.exe 的 `/MANIFESTINPUT`）。
+fn embed_manifest() {
+    let Ok(dir) = env::var("CARGO_MANIFEST_DIR") else {
+        return;
+    };
+    let manifest = PathBuf::from(dir).join("CanLapse.manifest");
+    if !manifest.is_file() {
+        println!("cargo:warning=缺少 CanLapse.manifest，控件会退回经典外观");
+        return;
+    }
+    let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    if target_env != "msvc" {
+        println!("cargo:warning=非 MSVC 目标，跳过清单嵌入");
+        return;
+    }
+    println!("cargo:rustc-link-arg=/MANIFEST:EMBED");
+    println!(
+        "cargo:rustc-link-arg=/MANIFESTINPUT:{}",
+        manifest.display()
+    );
+    println!("cargo:rerun-if-changed=CanLapse.manifest");
 }
 
 /// 把运行时 DLL 复制到「exe 同目录」和「exe 同目录\deps」。

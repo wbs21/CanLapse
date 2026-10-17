@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity type="win32" name="CanLapse" version="1.0.0.0" processorArchitecture="amd64"/>
+  <description>CanLapse 画布窗口缩时录屏</description>
+
+  <!--
+    现代主题控件。
+    没有这一段，所有控件（按钮 / 滑块 / 下拉框 / 滚动条 / 进度条）都会退回
+    Windows 95 的 3D 外观 —— 对比截图能一眼看出来。
+  -->
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity
+          type="win32"
+          name="Microsoft.Windows.Common-Controls"
+          version="6.0.0.0"
+          processorArchitecture="amd64"
+          publicKeyToken="6595b64144ccf1df"
+          language="*"/>
+    </dependentAssembly>
+  </dependency>
+
+  <!-- 声明支持 Windows 10/11，否则部分 API 会走兼容模式 -->
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+    </application>
+  </compatibility>
+
+  <!--
+    DPI：按显示器独立缩放（PerMonitorV2）。
+    代码里也调了 SetProcessDpiAwarenessContext 作为兜底，但清单是推荐做法，
+    且能在进程启动前就生效（避免首帧按错误缩放布局）。
+  -->
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2</dpiAwareness>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+      <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
+    </windowsSettings>
+  </application>
+</assembly>
