@@ -1,0 +1,40 @@
+// CanLapse 资源脚本：应用图标 + 版本信息
+//
+// 由 build.rs 调用 Windows SDK 的 rc.exe 编译成 .res 再交给 link.exe。
+//
+// 注意：**不要 `#include <windows.h>`**。rc.exe 原生就认识 ICON / VERSIONINFO，
+// 而那个头文件会要求 SDK 的 INCLUDE 环境变量 —— 在构建脚本里并没有设置，
+// 结果是 rc.exe 直接以退出码 1 失败、图标静默缺失（实测踩过）。
+// 用到的常量自己定义即可。
+#pragma code_page(65001)
+
+#define IDI_ICON1 101
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION    1,0,0,0
+ PRODUCTVERSION 1,0,0,0
+ FILEFLAGSMASK  0x3fL
+ FILEFLAGS      0x0L
+ FILEOS         0x40004L
+ FILETYPE       0x1L
+ FILESUBTYPE    0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404b0"
+        BEGIN
+            VALUE "CompanyName",      "CanLapse"
+            VALUE "FileDescription",  "CanLapse 画布窗口缩时录屏"
+            VALUE "FileVersion",      "1.0.0.0"
+            VALUE "InternalName",     "CanLapse"
+            VALUE "OriginalFilename", "CanLapse.exe"
+            VALUE "ProductName",      "CanLapse"
+            VALUE "ProductVersion",   "1.0.0.0"
+            VALUE "LegalCopyright",   "自用工具，未做商业授权评估"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x804, 1200
+    END
+END

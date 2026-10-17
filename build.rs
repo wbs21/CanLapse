@@ -49,8 +49,96 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CANLAPSE_WINPTHREAD");
 
     embed_manifest();
+    compile_resources();
 
     deploy_runtime_dlls(&bin, &root);
+}
+
+/// 用 Windows SDK 的 rc.exe 编译 `CanLapse.rc`（图标 + 版本信息），把生成的 `.res`
+/// 作为链接输入传给 link.exe。
+///
+/// 找不到 rc.exe 时只警告、不失败 —— 图标缺失不该让整个构建挂掉。
+fn compile_resources() {
+    let Ok(dir) = env::var("CARGO_MANIFEST_DIR") else {
+        return;
+    };
+    let rc_file = PathBuf::from(&dir).join("CanLapse.rc");
+    let ico = PathBuf::from(&dir).join("CanLapse.ico");
+    if !rc_file.is_file() || !ico.is_file() {
+        println!("cargo:warning=缺少 CanLapse.rc / CanLapse.ico，exe 将没有自定义图标");
+        return;
+    }
+    println!("cargo:rerun-if-changed=CanLapse.rc");
+    println!("cargo:rerun-if-changed=CanLapse.ico");
+
+    if env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default() != "msvc" {
+        println!("cargo:warning=非 MSVC 目标，跳过图标资源");
+        return;
+    }
+
+    let Some(rc_exe) = find_rc_exe() else {
+        println!("cargo:warning=找不到 Windows SDK 的 rc.exe，exe 将没有自定义图标");
+        return;
+    };
+
+    let Ok(out_dir) = env::var("OUT_DIR") else {
+        return;
+    };
+    let res = PathBuf::from(&out_dir).join("CanLapse.res");
+    // rc.exe 在 .rc 里按相对路径找 .ico，所以工作目录必须设在清单目录
+    let status = std::process::Command::new(&rc_exe)
+        .current_dir(&dir)
+        .arg("/nologo")
+        .arg("/fo")
+        .arg(&res)
+        .arg(&rc_file)
+        .status();
+    match status {
+        Ok(s) if s.success() && res.is_file() => {
+            // ⚠️ 目前**只编译不链接**：把 .res 交给 link.exe 的两种方式都试过、都没成：
+            //
+            //   1. `cargo:rustc-link-arg=<res>`   —— `cargo build -v` 里链接命令行
+            //      根本没出现这个 .res（同样方式发出的 `/MANIFEST:EMBED` 却生效了，
+            //      说明指令本身可用，问题出在"裸路径"这种取值上）
+            //   2. `cargo:rustc-link-arg-bins=<res>` —— 参数确实到了链接器，
+            //      但 link.exe 以 LNK1123（COFF 转换失败）拒绝
+            //
+            // 结论：这是**构建集成**问题，不是资源本身的问题
+            // （rc.exe 手动编译完全正常，.res 776 字节）。
+            // 所以当前 exe 仍是默认图标；下次可以试：
+            //   * 用 `RUSTFLAGS=-C link-arg=<res>` 从外部注入
+            //   * 或引入 embed-resource / winres crate（需要联网，目前离线拉不到）
+            println!(
+                "cargo:warning=已生成资源 {}({} 字节)，但尚未成功链入 exe（见 build.rs 注释）",
+                res.display(),
+                std::fs::metadata(&res).map(|m| m.len()).unwrap_or(0)
+            );
+        }
+        Ok(s) => println!("cargo:warning=rc.exe 退出码 {s}，跳过图标"),
+        Err(e) => println!("cargo:warning=调用 rc.exe 失败：{e}，跳过图标"),
+    }
+}
+
+/// 在 Windows SDK 目录里找 x64 的 rc.exe（取版本号最大的那个）。
+fn find_rc_exe() -> Option<PathBuf> {
+    let bases = [
+        r"C:\Program Files (x86)\Windows Kits\10\bin",
+        r"C:\Program Files\Windows Kits\10\bin",
+    ];
+    let mut found: Vec<PathBuf> = Vec::new();
+    for base in bases {
+        let Ok(entries) = std::fs::read_dir(base) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let p = e.path().join("x64").join("rc.exe");
+            if p.is_file() {
+                found.push(p);
+            }
+        }
+    }
+    found.sort();
+    found.pop()
 }
 
 /// 把 `CanLapse.manifest` 链接进 exe。
