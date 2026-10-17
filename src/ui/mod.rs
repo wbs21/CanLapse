@@ -565,7 +565,7 @@ impl App {
         );
         c.progress = mk(h, "msctls_progress32", "", ws, ID_PROGRESS, f);
         c.btn_cancel = mk(h, "Button", "取消合成", ws, ID_CANCEL, f);
-        c.btn_clean = mk(h, "Button", "请及时清理缓存", ws, ID_BTN_CLEAN, f);
+        c.btn_clean = mk(h, "Button", "手动清理缓存", ws, ID_BTN_CLEAN, f);
         SendMessageW(c.progress, PBM_SETRANGE32, 0, 100);
 
         // 深色主题：按钮/复选框/进度条自绘；下拉框与输入框交给系统深色主题
