@@ -76,7 +76,7 @@ fn compile_resources() {
         return;
     }
 
-    let Some(rc_exe) = find_rc_exe() else {
+    let Some(rc_exe) = find_tool("rc.exe") else {
         println!("cargo:warning=找不到 Windows SDK 的 rc.exe，exe 将没有自定义图标");
         return;
     };
@@ -94,51 +94,104 @@ fn compile_resources() {
         .arg(&rc_file)
         .status();
     match status {
-        Ok(s) if s.success() && res.is_file() => {
-            // ⚠️ 目前**只编译不链接**：把 .res 交给 link.exe 的两种方式都试过、都没成：
-            //
-            //   1. `cargo:rustc-link-arg=<res>`   —— `cargo build -v` 里链接命令行
-            //      根本没出现这个 .res（同样方式发出的 `/MANIFEST:EMBED` 却生效了，
-            //      说明指令本身可用，问题出在"裸路径"这种取值上）
-            //   2. `cargo:rustc-link-arg-bins=<res>` —— 参数确实到了链接器，
-            //      但 link.exe 以 LNK1123（COFF 转换失败）拒绝
-            //
-            // 结论：这是**构建集成**问题，不是资源本身的问题
-            // （rc.exe 手动编译完全正常，.res 776 字节）。
-            // 所以当前 exe 仍是默认图标；下次可以试：
-            //   * 用 `RUSTFLAGS=-C link-arg=<res>` 从外部注入
-            //   * 或引入 embed-resource / winres crate（需要联网，目前离线拉不到）
+        Ok(s) if s.success() && res.is_file() => {}
+        Ok(s) => {
+            println!("cargo:warning=rc.exe 退出码 {s}，跳过图标");
+            return;
+        }
+        Err(e) => {
+            println!("cargo:warning=调用 rc.exe 失败：{e}，跳过图标");
+            return;
+        }
+    }
+
+    // 关键一步：把 .res 打成**静态库**再链接。
+    //
+    // 为什么不能直接把 .res 当链接输入：
+    //   * `cargo:rustc-link-arg=<res>`      —— 裸路径没进链接命令行（实测）
+    //   * `cargo:rustc-link-arg-bins=<res>` —— 进了，但 link.exe 报 LNK1123
+    //     （它把 .res 当对象文件去做 COFF 转换，失败了）
+    // 走"资源库 + /WHOLEARCHIVE"这条路：link-lib / link-search 是 rustc 的
+    // 常规能力，/WHOLEARCHIVE 是标准 flag（flag 形式的 link-arg 实测可达链接器），
+    // 而 /WHOLEARCHIVE 同时解决了"资源库里没有符号、可能被整体丢弃"的问题。
+    let Some(lib_exe) = find_tool("lib.exe") else {
+        println!("cargo:warning=找不到 lib.exe，资源未链入 exe");
+        return;
+    };
+    let res_lib = PathBuf::from(&out_dir).join("CanLapse_res.lib");
+    let lib_status = std::process::Command::new(&lib_exe)
+        .arg("/nologo")
+        .arg(format!("/out:{}", res_lib.display()))
+        .arg(&res)
+        .status();
+    match lib_status {
+        Ok(s) if s.success() && res_lib.is_file() => {
+            // 两个都要：
+            //   * link-lib 让该库**成为链接输入**（否则 /WHOLEARCHIVE:名字 找不到它）
+            //   * /WHOLEARCHIVE 强制包含全部成员 —— 资源库里没有符号，
+            //     不强制的话链接器会认为"没人引用"而整体丢弃
+            println!("cargo:rustc-link-search=native={out_dir}");
+            println!("cargo:rustc-link-lib=static=CanLapse_res");
+            println!("cargo:rustc-link-arg=/WHOLEARCHIVE:CanLapse_res.lib");
             println!(
-                "cargo:warning=已生成资源 {}({} 字节)，但尚未成功链入 exe（见 build.rs 注释）",
-                res.display(),
-                std::fs::metadata(&res).map(|m| m.len()).unwrap_or(0)
+                "cargo:warning=资源库已生成（{} 字节）并已作为链接输入请求 /WHOLEARCHIVE，\
+                 但实测**未生效**（exe 的版本信息仍为空、图标仍是默认）——\
+                 详见本函数顶部关于三种尝试的注释",
+                std::fs::metadata(&res_lib).map(|m| m.len()).unwrap_or(0)
             );
         }
-        Ok(s) => println!("cargo:warning=rc.exe 退出码 {s}，跳过图标"),
-        Err(e) => println!("cargo:warning=调用 rc.exe 失败：{e}，跳过图标"),
+        Ok(s) => println!("cargo:warning=lib.exe 退出码 {s}，资源未链入"),
+        Err(e) => println!("cargo:warning=调用 lib.exe 失败：{e}，资源未链入"),
     }
 }
 
-/// 在 Windows SDK 目录里找 x64 的 rc.exe（取版本号最大的那个）。
-fn find_rc_exe() -> Option<PathBuf> {
-    let bases = [
+/// 在 Windows SDK / MSVC 工具链目录里找工具（取版本号最大的那个）。
+fn find_tool(file: &str) -> Option<PathBuf> {
+    // SDK：bin\<ver>\x64\rc.exe
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for base in [
         r"C:\Program Files (x86)\Windows Kits\10\bin",
         r"C:\Program Files\Windows Kits\10\bin",
-    ];
-    let mut found: Vec<PathBuf> = Vec::new();
-    for base in bases {
-        let Ok(entries) = std::fs::read_dir(base) else {
-            continue;
-        };
-        for e in entries.flatten() {
-            let p = e.path().join("x64").join("rc.exe");
-            if p.is_file() {
-                found.push(p);
+    ] {
+        if let Ok(entries) = std::fs::read_dir(base) {
+            for e in entries.flatten() {
+                let d = e.path().join("x64");
+                if d.join(file).is_file() {
+                    dirs.push(d);
+                }
             }
         }
     }
-    found.sort();
-    found.pop()
+    // MSVC：<VS>\<year>\<edition>\VC\Tools\MSVC\<ver>\bin\Hostx64\x64\{rc,lib}.exe
+    for base in [
+        r"C:\Program Files\Microsoft Visual Studio",
+        r"C:\Program Files (x86)\Microsoft Visual Studio",
+    ] {
+        let Ok(years) = std::fs::read_dir(base) else {
+            continue;
+        };
+        for y in years.flatten() {
+            let Ok(editions) = std::fs::read_dir(y.path()) else {
+                continue;
+            };
+            for e in editions.flatten() {
+                let msvc = e.path().join("VC").join("Tools").join("MSVC");
+                let Ok(vers) = std::fs::read_dir(&msvc) else {
+                    continue;
+                };
+                for v in vers.flatten() {
+                    for host in ["Hostx64/x64", "Hostx86/x86"] {
+                        let d = v.path().join("bin").join(host.replace('/', "\\"));
+                        if d.join(file).is_file() {
+                            dirs.push(d);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    dirs.sort();
+    dirs.pop().map(|d| d.join(file))
 }
 
 /// 把 `CanLapse.manifest` 链接进 exe。
