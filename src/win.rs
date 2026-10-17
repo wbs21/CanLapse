@@ -251,27 +251,36 @@ fn cursor_window() -> HWND {
 ///
 /// v1.0 的 GUI 版会把"实时打印"换成屏幕高亮框；选择逻辑本身是同一套。
 pub fn pick_window_interactive() -> Option<HWND> {
-    println!("把鼠标移到目标画布窗口上，按一下【左键】确认；按【Esc】取消。");
     let me = std::process::id();
     let mut last: isize = 0;
+    // 记住"最后一个有效的非本进程窗口"。
+    // 旧实现把点击判定放在 pid/null 检查之后：只要鼠标当下落在我们自己的窗口或空处，
+    // 代码就 continue，**永远走不到检测点击那一步** —— 表现为"最小化后点哪都没反应"。
+    let mut candidate: HWND = null_mut();
+    let mut ticks = 0u32;
     loop {
         pump();
         if key_down(VK_ESCAPE) {
-            println!("\n已取消拾取。");
             return None;
         }
         let h = cursor_window();
-        if h.is_null() {
-            continue;
+        if !h.is_null() && pid_of(h) != me {
+            candidate = h;
+            if h as isize != last {
+                last = h as isize;
+                println!("  当前指向: {}", describe(h).label());
+            }
         }
-        let info = describe(h);
-        if info.pid == me {
-            // 别把自己（控制台窗口）选进来
-            continue;
-        }
-        if h as isize != last {
-            last = h as isize;
-            println!("  当前指向: {}", info.label());
+        // 诊断日志（最多 300 行）：下一次失败时可以直接看出卡在哪一步
+        if ticks < 300 {
+            writes_pick_log(&format!(
+                "t{ticks} cursor=0x{:X} pid={} cand=0x{:X} lbtn={}",
+                h as isize,
+                if h.is_null() { 0 } else { pid_of(h) },
+                candidate as isize,
+                key_down(VK_LBUTTON)
+            ));
+            ticks += 1;
         }
         if key_down(VK_LBUTTON) {
             // 等左键松开，避免把这次按下当成"开始录制"之类
@@ -279,9 +288,28 @@ pub fn pick_window_interactive() -> Option<HWND> {
                 pump();
                 std::thread::sleep(Duration::from_millis(10));
             }
-            return Some(h);
+            if !candidate.is_null() {
+                return Some(candidate);
+            }
         }
         std::thread::sleep(Duration::from_millis(60));
+    }
+}
+
+/// 把拾取过程的诊断写进 %LOCALAPPDATA%\CanLapse\pick.log（追加）。
+fn writes_pick_log(line: &str) {
+    let dir = std::env::var("LOCALAPPDATA")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        .join("CanLapse");
+    let _ = std::fs::create_dir_all(&dir);
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("pick.log"))
+    {
+        let _ = writeln!(f, "{line}");
     }
 }
 
