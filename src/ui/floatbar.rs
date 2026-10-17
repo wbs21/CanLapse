@@ -574,19 +574,6 @@ pub fn destroy(hwnd: HWND) {
     }
 }
 
-/// 悬浮条矩形（用于落点计算，避免挡住画布）
-pub fn rect_of(hwnd: HWND) -> Option<RECT> {
-    if hwnd.is_null() {
-        return None;
-    }
-    let mut rc: RECT = unsafe { std::mem::zeroed() };
-    let ok = unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut rc) };
-    if ok == 0 {
-        None
-    } else {
-        Some(rc)
-    }
-}
 
 #[cfg(test)]
 mod tests {

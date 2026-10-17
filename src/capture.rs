@@ -33,7 +33,7 @@ use windows_sys::Win32::Graphics::Gdi::{
 use windows_sys::Win32::Storage::Xps::PrintWindow;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetSystemMetrics, ShowWindow,
-    SM_CXVIRTUALSCREEN, SM_XVIRTUALSCREEN, SW_SHOWNOACTIVATE, WM_DESTROY, WM_ERASEBKGND, WM_PAINT,
+    SM_XVIRTUALSCREEN, SW_SHOWNOACTIVATE, WM_DESTROY, WM_ERASEBKGND, WM_PAINT,
     WNDCLASSW, WS_POPUP,
 };
 
@@ -253,7 +253,7 @@ impl ThumbnailCapture {
         let out = fit_size(crop, max_w);
         unsafe {
             let (host, thumb) = Self::create_host_and_register(root, crop, out)?;
-            let mut me = ThumbnailCapture {
+            let me = ThumbnailCapture {
                 root,
                 target,
                 host,

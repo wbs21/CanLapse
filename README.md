@@ -7,6 +7,8 @@
 SAI2 / CLIP STUDIO PAINT / Photoshop / Krita 均实测可迅速锁定画布窗口，
 明细见 [docs/verification-log.md](docs/verification-log.md)。
 
+> 📌 **v1.0.0 完工交接**：[完工日志.md](完工日志.md) —— 交付物、功能、验证矩阵、已知限制、清理记录与验收步骤。
+>
 > 📌 **先读这个**：[项目总结.md](项目总结.md) —— 一页纸讲清现状、架构、实测数据、坑与后续计划。
 
 ## 它怎么工作

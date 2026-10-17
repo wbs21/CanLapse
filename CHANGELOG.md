@@ -1,5 +1,8 @@
 # 变更日志
 
+> **v1.0.0 收工（2026-10-17）**：功能冻结，交付包 `dist/CanLapse-v1.0.0-win64.zip`；
+> 交付清单、验证矩阵、清理记录与验收步骤见 [`完工日志.md`](完工日志.md)。
+
 本文件记录 CanLapse 的所有重要变更。
 
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
