@@ -69,7 +69,8 @@
 |---|---|---|
 | 两个入口 | ✅ | `CanLapse.exe`（GUI，windows 子系统，**无 ConsoleWindowClass**）/ `canlapse-cli.exe`（CLI，`doctor` 全绿，无参数打印帮助）|
 | 应用清单 | ✅ | 见上；另含 Win10/11 `supportedOS`、`asInvoker` |
-| 图标 / 版本信息 | ❌ | `.ico`（7 档尺寸）与 `.rc` 就绪，`rc.exe` 手动编译出 776 字节 `.res` 正常；但**三条链接路径全部失败**：`rustc-link-arg=<res>`（未进链接命令行）、`rustc-link-arg-bins=<res>`（LNK1123）、资源库+`/WHOLEARCHIVE`（无报错但资源未进 exe）|
+| 图标 / 版本信息 | ❌ | `.ico`（7 档尺寸）与 `.rc` 就绪，`rc.exe` 编译出 776 字节 `.res` 正常。**四条路全部失败**：① `rustc-link-arg=<res>`（未进链接命令行）；② `rustc-link-arg-bins=<res>`（LNK1123）；③ 资源库+`/WHOLEARCHIVE`（无报错但资源未进 exe）；④ 构建后用 `UpdateResourceW` 注入（见下）|
+| 图标：第 ④ 条的线索 | ⚠️ | 走"构建后注入"绕开 link.exe 的**资源输入**：`rc → .res → link /dll /noentry → res.dll → LoadLibraryEx(LOAD_LIBRARY_AS_DATAFILE) + 枚举 + UpdateResourceW`。注入本身报成功（`types=1 copied=1 end=True`），但 exe 的版本信息仍空、图标仍默认。**关键线索：中间 res.dll 里只枚举出 1 种资源类型**（`.rc` 里实为 3 种：ICON / GROUP_ICON / VERSIONINFO）—— 即 `link.exe` 同样没能完整吸收这份 `.res`。对照：`lib.exe` 能正常吸收（产出 1994 字节 `.lib`）。**因此根因不在注入代码，而在 link.exe 与这份 .res 的兼容性**；下次应优先查"rc.exe 版本 → link.exe 版本"的组合（本机 rc 10.0.28000 / link MSVC 14.52 insiders），例如改用与 link.exe 同版本的 rc.exe（MSVC 自带的 rc）|
 
 ## 六、真实软件
 
