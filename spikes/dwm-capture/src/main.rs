@@ -125,8 +125,8 @@ fn block_x(tick: u32) -> i32 {
     BLOCK_X0 + (tick % BLOCK_POSITIONS) as i32 * BLOCK_STEP
 }
 
-unsafe fn paint_pattern(hdc: HDC, tick: u32) {
-    fill(hdc, 0, 0, TW, TH, BG);
+unsafe fn paint_pattern(hdc: HDC, tick: u32, w: i32, h: i32) {
+    fill(hdc, 0, 0, w, h, BG);
     // 分隔条只画在图案带以下，避免切断二进制计数条
     fill(hdc, 220, 100, 260, TH, SEP);
     // 二进制计数条
@@ -142,6 +142,23 @@ unsafe fn paint_pattern(hdc: HDC, tick: u32) {
     // 四象限
     for (l, t, r, b, c) in QUADS {
         fill(hdc, l, t, r, b, c);
+    }
+    // 右下角标记（品红）。用途：验证**整幅画面**都是 1:1，
+    // 而不只是左上角那一小块 —— 万一缩略图被压缩到左上角，
+    // 只看左上角的图案仍可能"看起来是对的"。
+    if w > 120 && h > 120 {
+        fill(hdc, w - 60, h - 60, w - 20, h - 20, [255, 0, 255]);
+    }
+}
+
+/// 检查右下角标记（用于证明整幅 1:1）
+fn corner_marker_ok(cap: &Cap, w: i32, h: i32) -> bool {
+    if w <= 120 || h <= 120 {
+        return true; // 尺寸太小不画角标，视为不适用
+    }
+    match cap.get(w - 40, h - 40) {
+        Some(p) => close_enough(p, [255, 0, 255], Q_TOL),
+        None => false,
     }
 }
 
@@ -159,7 +176,9 @@ unsafe extern "system" fn wndproc_target(
         WM_PAINT => {
             let mut ps: PAINTSTRUCT = std::mem::zeroed();
             let hdc = BeginPaint(hwnd, &mut ps);
-            paint_pattern(hdc, TICK.load(Ordering::SeqCst));
+            let mut rc: RECT = std::mem::zeroed();
+            GetClientRect(hwnd, &mut rc);
+            paint_pattern(hdc, TICK.load(Ordering::SeqCst), rc.right, rc.bottom);
             EndPaint(hwnd, &ps);
             0
         }
@@ -244,7 +263,9 @@ unsafe extern "system" fn wndproc_helper(
         WM_PAINT => {
             let mut ps: PAINTSTRUCT = std::mem::zeroed();
             let hdc = BeginPaint(hwnd, &mut ps);
-            paint_pattern(hdc, TICK.load(Ordering::SeqCst));
+            let mut rc: RECT = std::mem::zeroed();
+            GetClientRect(hwnd, &mut rc);
+            paint_pattern(hdc, TICK.load(Ordering::SeqCst), rc.right, rc.bottom);
             EndPaint(hwnd, &ps);
             0
         }
@@ -1275,6 +1296,15 @@ unsafe fn run_helper() -> i32 {
     }
     let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
     let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    // 允许用 SPIKE_HELPER_SIZE=WxH 指定对端窗口尺寸（用于 4K 等大画布验证）
+    let (win_w, win_h) = std::env::var("SPIKE_HELPER_SIZE")
+        .ok()
+        .and_then(|s| {
+            let (a, b) = s.split_once(['x', 'X'])?;
+            Some((a.trim().parse::<i32>().ok()?, b.trim().parse::<i32>().ok()?))
+        })
+        .unwrap_or((TW, TH));
+    println!("helper 窗口尺寸: {win_w}x{win_h}");
     let hwnd = CreateWindowExW(
         0,
         cls.as_ptr(),
@@ -1282,8 +1312,8 @@ unsafe fn run_helper() -> i32 {
         WS_POPUP | WS_VISIBLE,
         vx + 200,
         vy + 200,
-        TW,
-        TH,
+        win_w,
+        win_h,
         null_mut(),
         null_mut(),
         hinst,
@@ -1351,9 +1381,14 @@ unsafe fn run_cross(out_dir: &str) -> i32 {
 
     let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
     let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
-    let host = make_host(TW, TH, vx + 900, vy + 200);
+    // 宿主尺寸必须等于**源窗口客户区**尺寸，才能保证缩略图 1:1 不缩放
+    let mut cr: RECT = std::mem::zeroed();
+    GetClientRect(helper, &mut cr);
+    let (sw, sh) = (cr.right - cr.left, cr.bottom - cr.top);
+    println!("对端客户区尺寸: {sw}x{sh}（宿主按此尺寸建立以保证 1:1）");
+    let host = make_host(sw, sh, vx + 900, vy + 200);
     settle(300);
-    let thumb = register_thumb(host, helper, TW, TH);
+    let thumb = register_thumb(host, helper, sw, sh);
     println!(
         "DwmRegisterThumbnail(本进程宿主 -> 跨进程源): {:?}",
         thumb.as_ref().map_err(|e| e.clone())
@@ -1410,8 +1445,8 @@ unsafe fn run_cross(out_dir: &str) -> i32 {
     // ---- 报告 ----
     println!("\n================= 跨进程结果 =================");
     println!(
-        "{:<34} {:<10} {:>7} {:>8} {:>9} {:>6} {:>7}",
-        "方法", "状态", "预期tick", "读到位值", "象限得分", "均值", "位匹配"
+        "{:<34} {:<10} {:>7} {:>8} {:>9} {:>6} {:>7} {:>6}",
+        "方法", "状态", "预期tick", "读到位值", "象限得分", "均值", "位匹配", "角标"
     );
     for (state, exp, caps) in &passes {
         for (name, r) in caps {
@@ -1421,14 +1456,15 @@ unsafe fn run_cross(out_dir: &str) -> i32 {
                     let quad = quadrant_score(cap);
                     let bits = bit_value(cap);
                     println!(
-                        "{:<34} {:<10} {:>7} {:>8} {:>9.2} {:>6.1} {:>7}",
+                        "{:<34} {:<10} {:>7} {:>8} {:>9.2} {:>6.1} {:>7} {:>6}",
                         name,
                         state,
                         exp,
                         bits.map(|b| b.to_string()).unwrap_or_else(|| "-".into()),
                         quad,
                         st.mean,
-                        if bits == Some(*exp) { "是" } else { "否" }
+                        if bits == Some(*exp) { "是" } else { "否" },
+                        if corner_marker_ok(cap, cap.w, cap.h) { "是" } else { "否" }
                     );
                 }
                 Err(e) => println!("{:<34} {:<10} 失败: {e}", name, state),
@@ -1462,7 +1498,10 @@ unsafe fn run_cross(out_dir: &str) -> i32 {
         match p {
             Some((_, exp, caps)) => match find_cap(caps, name) {
                 Some(cap) => {
-                    if quadrant_score(cap) >= 0.9 && bit_value(cap) == Some(*exp) {
+                    if quadrant_score(cap) >= 0.9
+                        && bit_value(cap) == Some(*exp)
+                        && corner_marker_ok(cap, cap.w, cap.h)
+                    {
                         "可用"
                     } else {
                         "不可用"
