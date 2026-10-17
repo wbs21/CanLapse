@@ -25,7 +25,7 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, VK_ESCAPE, VK_F8,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EnumWindows,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EnumChildWindows, EnumWindows,
     GetAncestor, GetClassNameW, GetClientRect, GetCursorPos, GetForegroundWindow, GetParent,
     GetSystemMetrics, GetWindow, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId,
     IsIconic, IsWindow, IsWindowVisible, MSG, PM_REMOVE, PeekMessageW,
@@ -426,6 +426,21 @@ static OVERLAY_HIT: AtomicBool = AtomicBool::new(false);
 static OVERLAY_CANCEL: AtomicBool = AtomicBool::new(false);
 static OVERLAY_X: AtomicIsize = AtomicIsize::new(0);
 static OVERLAY_Y: AtomicIsize = AtomicIsize::new(0);
+/// 最后一次成功拾取的点击点（do_pick 用它判断"点到边框还是画面"）
+static LAST_X: AtomicIsize = AtomicIsize::new(0);
+static LAST_Y: AtomicIsize = AtomicIsize::new(0);
+static LAST_PT_VALID: AtomicBool = AtomicBool::new(false);
+
+/// 最后一次成功拾取的屏幕点击点
+pub fn last_click_point() -> Option<POINT> {
+    if !LAST_PT_VALID.load(Ordering::SeqCst) {
+        return None;
+    }
+    Some(POINT {
+        x: LAST_X.load(Ordering::SeqCst) as i32,
+        y: LAST_Y.load(Ordering::SeqCst) as i32,
+    })
+}
 
 unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
@@ -499,6 +514,122 @@ unsafe fn overlay_create() -> HWND {
     h
 }
 
+// ---------------------------------------------------------------------------
+// 点击目标归位（借鉴 add/chose.rs 的"候选画布"思路，但只用于归位）
+// ---------------------------------------------------------------------------
+//
+// 参考实现先把"看起来像画布"的子窗口收集成候选，再用点击点去匹配。我们只借它做**归位**，
+// 不做"自动识别画布"（需求明确不做）：
+//   1. 命中的是画布内部更深的子窗 → 上溯到最近的候选（否则可能录到一条细缝/渲染子窗）；
+//   2. 命中的是根窗口、且点击落在某候选的 6px 边框环上 → 归位到该候选
+//      （用户习惯"点画布边框"来选中，这条正对这个手势）；
+//   3. 其余保持"点哪选哪"。
+//
+// 候选条件故意从宽（可见 + ≥100×100），**不把 clip 样式当硬条件**：
+// 参考实现里那条过滤挡不住 201×955 的工具条，拿它当判据会把工具条也当画布。
+
+const CAND_MIN: i32 = 100;
+pub const BORDER_PX: i32 = 6;
+
+fn point_in_rect(pt: POINT, rc: &RECT) -> bool {
+    pt.x >= rc.left && pt.x < rc.right && pt.y >= rc.top && pt.y < rc.bottom
+}
+
+/// 点是否落在矩形边缘 `px` 像素的"环"内（含外侧 `px`，不含内部超过 `px` 的位置）
+fn point_near_edge(pt: POINT, rc: &RECT, px: i32) -> bool {
+    let outer = pt.x >= rc.left - px
+        && pt.x <= rc.right + px
+        && pt.y >= rc.top - px
+        && pt.y <= rc.bottom + px;
+    if !outer {
+        return false;
+    }
+    let inner = pt.x >= rc.left + px
+        && pt.x <= rc.right - px
+        && pt.y >= rc.top + px
+        && pt.y <= rc.bottom - px;
+    !inner
+}
+
+unsafe extern "system" fn cand_cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let out = &mut *(lparam as *mut Vec<HWND>);
+    if IsWindowVisible(hwnd) == 0 {
+        return 1;
+    }
+    let mut rc: RECT = std::mem::zeroed();
+    if GetWindowRect(hwnd, &mut rc) == 0 {
+        return 1;
+    }
+    if rc.right - rc.left < CAND_MIN || rc.bottom - rc.top < CAND_MIN {
+        return 1;
+    }
+    out.push(hwnd);
+    1
+}
+
+fn canvas_candidates(root: HWND) -> Vec<HWND> {
+    let mut out: Vec<HWND> = Vec::new();
+    unsafe { EnumChildWindows(root, Some(cand_cb), &mut out as *mut Vec<HWND> as LPARAM) };
+    out
+}
+
+fn rect_of(h: HWND) -> Option<RECT> {
+    let mut rc: RECT = unsafe { std::mem::zeroed() };
+    if unsafe { GetWindowRect(h, &mut rc) } == 0 {
+        None
+    } else {
+        Some(rc)
+    }
+}
+
+/// 点是否在窗口边框 `px` 像素内（写状态栏/日志用）
+pub fn border_hit(h: HWND, pt: POINT, px: i32) -> bool {
+    rect_of(h).map(|rc| point_near_edge(pt, &rc, px)).unwrap_or(false)
+}
+
+/// 点击归位：返回最终目标 + 一句说明（写日志/状态栏用）
+pub fn resolve_click(root: HWND, hit: HWND, pt: POINT) -> (HWND, &'static str) {
+    if hit.is_null() {
+        return (hit, "无窗口");
+    }
+    let cands = canvas_candidates(root);
+    // 1) 直接点中候选
+    if cands.iter().any(|c| *c == hit) {
+        return (hit, "直接命中（≥100×100 的子窗口）");
+    }
+    // 2) 内层子窗 → 最近的候选祖先
+    let mut a = hit;
+    for _ in 0..8 {
+        a = unsafe { GetParent(a) };
+        if a.is_null() || a == root {
+            break;
+        }
+        if cands.iter().any(|c| *c == a) {
+            return (a, "命中内层子窗，上溯到候选窗口");
+        }
+    }
+    // 3) 点到了根/空白：看是否点在候选的边框环上
+    if hit == root {
+        let mut ring: Vec<HWND> = Vec::new();
+        for c in &cands {
+            if let Some(rc) = rect_of(*c) {
+                if point_near_edge(pt, &rc, BORDER_PX) {
+                    ring.push(*c);
+                }
+            }
+        }
+        if ring.len() == 1 {
+            return (ring[0], "点到边框环，归位到候选窗口");
+        }
+        if ring.len() > 1 {
+            // 多个候选的边框都挨着点击点（例如画布和工具条只隔几像素）：**不猜**，
+            // 保持点击命中的窗口，并在日志里说明 —— 猜错会锁到工具条上。
+            return (hit, "多个候选边框相邻，保持命中窗口");
+        }
+    }
+    (hit, "保持点击命中的窗口")
+}
+
 /// 交互式拾取：光标移到目标上，**点一下**确认；Esc / 右键取消。
 ///
 /// `owner` 是发起拾取的窗口（已最小化）。它一旦回到前台就取消拾取 ——
@@ -536,37 +667,51 @@ pub fn pick_window_interactive(owner: HWND, hint: Option<HWND>) -> Option<HWND> 
         if OVERLAY_HIT.swap(false, Ordering::SeqCst) {
             let x = OVERLAY_X.load(Ordering::SeqCst) as i32;
             let y = OVERLAY_Y.load(Ordering::SeqCst) as i32;
+            let pt = POINT { x, y };
             // 覆盖层已在点击处理里隐藏，这里取该点下真正的窗口
-            let h = unsafe { WindowFromPoint(POINT { x, y }) };
-            if h.is_null() {
+            let hit = unsafe { WindowFromPoint(pt) };
+            if hit.is_null() {
                 logline!("[pick] 点击点 ({x},{y}) 下没有窗口，继续拾取");
                 unsafe {
                     ShowWindow(overlay, SW_SHOWNOACTIVATE);
                 }
-            } else if pid_of(h) == me {
+            } else if pid_of(hit) == me {
                 logline!(
                     "[pick] 点击点 ({x},{y}) 落在本程序窗口 0x{:X}，取消拾取",
-                    h as isize
+                    hit as isize
                 );
                 break;
-            } else if !looks_pickable(h) {
-                logline!(
-                    "[pick] 点击点 ({x},{y}) -> 0x{:X} | {} 被过滤（过小的控件/系统浮层），继续拾取",
-                    h as isize,
-                    describe(h).label()
-                );
-                unsafe {
-                    ShowWindow(overlay, SW_SHOWNOACTIVATE);
-                }
             } else {
-                logline!(
-                    "[pick] 点击 ({x},{y}) -> 0x{:X} | {} | 层级：{}",
-                    h as isize,
-                    describe(h).label(),
-                    ancestor_chain(h)
-                );
-                result = Some(h);
-                break;
+                // 点击归位：直接命中候选 / 内层子窗上溯 / 边框环归位
+                let root = unsafe { GetAncestor(hit, GA_ROOT) };
+                let (h, why) = resolve_click(root, hit, pt);
+                if h.is_null() {
+                    logline!("[pick] 点击 ({x},{y}) 归位后无窗口，继续拾取");
+                    unsafe {
+                        ShowWindow(overlay, SW_SHOWNOACTIVATE);
+                    }
+                } else {
+                    logline!(
+                        "[pick] 点击 ({x},{y}) 命中 0x{:X} -> 目标 0x{:X}（{}）| {} | 层级：{}",
+                        hit as isize,
+                        h as isize,
+                        why,
+                        describe(h).label(),
+                        ancestor_chain(h)
+                    );
+                    if pid_of(h) == me || !looks_pickable(h) {
+                        logline!("[pick] 目标不可用（本进程/被过滤），继续拾取");
+                        unsafe {
+                            ShowWindow(overlay, SW_SHOWNOACTIVATE);
+                        }
+                    } else {
+                        LAST_X.store(x as isize, Ordering::SeqCst);
+                        LAST_Y.store(y as isize, Ordering::SeqCst);
+                        LAST_PT_VALID.store(true, Ordering::SeqCst);
+                        result = Some(h);
+                        break;
+                    }
+                }
             }
         }
         std::thread::sleep(Duration::from_millis(60));
@@ -611,6 +756,10 @@ pub fn ancestor_chain(hwnd: HWND) -> String {
 /// 这类窗口抓帧必然失败，还会把真正的候选顶掉。所以这里主动过滤掉。
 fn looks_pickable(h: HWND) -> bool {
     if h.is_null() {
+        return false;
+    }
+    // 隐藏窗口抓不到东西（参考实现里也先做了这一步）
+    if unsafe { IsWindowVisible(h) } == 0 {
         return false;
     }
     let info = describe(h);
@@ -857,6 +1006,32 @@ pub fn cursor_window_deep() -> HWND {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 点击归位用到的几何判定（纯函数，便于回归）
+    #[test]
+    fn 点在矩形内与边框环的判定() {
+        let rc = RECT { left: 100, top: 100, right: 300, bottom: 200 };
+        // 内部
+        assert!(point_in_rect(POINT { x: 200, y: 150 }, &rc));
+        assert!(!point_near_edge(POINT { x: 200, y: 150 }, &rc, BORDER_PX));
+        // 边界上（右侧）
+        assert!(point_near_edge(POINT { x: 299, y: 150 }, &rc, BORDER_PX));
+        // 外侧 3px（在环内）
+        assert!(point_near_edge(POINT { x: 303, y: 150 }, &rc, BORDER_PX));
+        // 外侧 10px（环外）
+        assert!(!point_near_edge(POINT { x: 310, y: 150 }, &rc, BORDER_PX));
+        // 四角也算边框
+        assert!(point_near_edge(POINT { x: 100, y: 100 }, &rc, BORDER_PX));
+        // 外部远处
+        assert!(!point_in_rect(POINT { x: 10, y: 10 }, &rc));
+    }
+
+    #[test]
+    fn 可拾取尺寸下限() {
+        // 这条只验证常量没被改回 0 —— 真实窗口判定依赖系统，不在单测里造窗口
+        assert!(CAND_MIN >= 64);
+        assert!(BORDER_PX > 0 && BORDER_PX < 20);
+    }
 
     #[test]
     fn 会话名清洗非法字符() {

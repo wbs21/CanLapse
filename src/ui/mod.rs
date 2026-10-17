@@ -184,6 +184,8 @@ struct App {
     preview_err: Option<(String, std::time::Instant)>,
     /// 上一次成功抓到的预览尺寸，尺寸变化时记一条日志（换目标/改窗口大小时有用）
     preview_size: (i32, i32),
+    /// 这次拾取点到的是"边框"还是"画面"（状态栏展示，便于确认点中位置）
+    pick_where: Option<&'static str>,
 }
 
 impl App {
@@ -200,7 +202,10 @@ impl App {
             .unwrap_or_default();
         match self.pick_state {
             PickState::Empty => "尚未选择画布窗口".to_string(),
-            PickState::Ok => format!("✅ 已选中画布窗口（{picked}）"),
+            PickState::Ok => match self.pick_where {
+                Some(where_) => format!("✅ 已选中画布窗口（{picked}，点到{where_}）"),
+                None => format!("✅ 已选中画布窗口（{picked}）"),
+            },
             PickState::HasPanel => {
                 "⚠️ 检测到窗口包含工具栏，画布未浮动（点【如何定位窗口】查看做法）".to_string()
             }
@@ -462,6 +467,7 @@ impl App {
             preview_win: std::ptr::null_mut(),
             preview_err: None,
             preview_size: (0, 0),
+            pick_where: None,
         }
     }
 
@@ -854,6 +860,15 @@ impl App {
         } else {
             PickState::Ok
         };
+        // 点到的是边框还是画面（参考实现的 6px 判定，用于状态栏/日志）
+        self.pick_where = win::last_click_point().map(|pt| {
+            if win::border_hit(hwnd, pt, win::BORDER_PX) {
+                "边框"
+            } else {
+                "画面"
+            }
+        });
+        logline!("[pick] 点击位置：{:?}", self.pick_where);
         logline!(
             "[pick] 拾取完成 pick_state={:?} 预览={}x{}",
             self.pick_state,
