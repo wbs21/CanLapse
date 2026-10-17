@@ -92,7 +92,7 @@ unsafe extern "system" fn bar_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    match msg {
+    win::guard(|| match msg {
         // 整条都能拖动
         WM_NCHITTEST => HTCAPTION as LRESULT,
         WM_COMMAND => {
@@ -119,7 +119,7 @@ unsafe extern "system" fn bar_proc(
         }
         WM_DESTROY => 0,
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
-    }
+    })
 }
 
 /// 刷新条上的暂停按钮文字与"时长 | 帧计数"

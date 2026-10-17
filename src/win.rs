@@ -38,6 +38,25 @@ pub fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+/// FFI 窗口回调的兜底壳：panic 一旦跨过 `extern "system"` 边界会直接 abort 进程，
+/// 用户看到的就是"程序突然没了"。这里接住、记日志、返回 0，让进程活下去。
+pub fn guard<F: FnOnce() -> LRESULT>(f: F) -> LRESULT {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(v) => v,
+        Err(e) => {
+            let msg = if let Some(s) = e.downcast_ref::<&str>() {
+                (*s).to_string()
+            } else if let Some(s) = e.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "未知 panic".to_string()
+            };
+            logline!("[panic] 窗口回调: {msg}");
+            0
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct WindowInfo {
     pub hwnd: HWND,
@@ -443,7 +462,7 @@ pub fn last_click_point() -> Option<POINT> {
 }
 
 unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-    match msg {
+    guard(|| match msg {
         WM_LBUTTONDOWN => {
             let (vx, vy, _, _) = virtual_screen();
             let x = vx + ((lp as i32) & 0xffff);
@@ -463,7 +482,7 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             0
         }
         _ => DefWindowProcW(hwnd, msg, wp, lp),
-    }
+    })
 }
 
 /// 铺一张覆盖整个虚拟桌面的透明窗口（几乎不可见，但**参与命中测试**）

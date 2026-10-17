@@ -59,13 +59,27 @@ pub fn composition_enabled() -> bool {
     enabled != 0
 }
 
+/// 按最大宽度等比缩放输出尺寸（**不放大**）。
+///
+/// 预览只要 160×100，没必要每帧读整张画布；DWM 在合成阶段就能缩放，比先读大图再缩更省。
+fn fit_size(crop: (i32, i32, i32, i32), max_w: i32) -> (i32, i32) {
+    let (w, h) = (crop.2, crop.3);
+    if max_w <= 0 || max_w == i32::MAX || w <= max_w {
+        return (w, h);
+    }
+    let scale = max_w as f64 / w as f64;
+    let nw = max_w.max(1);
+    let nh = ((h as f64 * scale).round() as i32).clamp(1, h);
+    (nw, nh)
+}
+
 unsafe extern "system" fn host_wndproc(
     hwnd: HWND,
     msg: u32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    match msg {
+    win::guard(|| match msg {
         WM_PAINT => {
             // 宿主底色画黑。正常情况下缩略图会把它完全盖住；
             // 一旦 ThumbnailCapture 静默失效，抓到的就是纯黑 —— 由 Frame::is_blank() 告警，
@@ -83,7 +97,7 @@ unsafe extern "system" fn host_wndproc(
         WM_ERASEBKGND => 1,
         WM_DESTROY => 0,
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
-    }
+    })
 }
 
 unsafe fn ensure_host_class() {
@@ -200,6 +214,11 @@ pub struct ThumbnailCapture {
     dib: Dib,
     /// 裁剪矩形 `(x, y, w, h)`，相对 root 的客户区原点
     crop: (i32, i32, i32, i32),
+    /// 输出尺寸（宿主客户区大小）。等于 crop 尺寸时是 1:1；
+    /// 小于它时由 DWM 缩放 —— 预览用小图能省掉每帧几 MB 的拷贝（见 [`Self::new_scaled`]）。
+    out: (i32, i32),
+    /// 缩放上限（宽度）；`i32::MAX` 表示不缩放（录制用，必须 1:1）
+    max_w: i32,
 }
 
 impl ThumbnailCapture {
@@ -210,6 +229,15 @@ impl ThumbnailCapture {
     ///
     /// 宿主放在虚拟桌面之外（屏幕外），用户完全看不到它 —— 实测可行（FINDINGS 实验 1 的 M6）。
     pub fn new(target: HWND) -> Result<Self, String> {
+        Self::new_scaled(target, i32::MAX)
+    }
+
+    /// 建一个**缩放输出**的抓帧器：DWM 直接把裁剪区域缩到 `max_w` 以内再合成，
+    /// 于是 `PrintWindow` 只读一张小图。
+    ///
+    /// 用途：界面里 160×100 的实时预览，没必要每帧拷整张 1920×986（约 7.5 MB）。
+    /// 录制必须用 [`Self::new`]（1:1，像素级差分不能用缩放图）。
+    pub fn new_scaled(target: HWND, max_w: i32) -> Result<Self, String> {
         if !win::is_window_alive(target) {
             return Err("目标窗口无效（可能已关闭）".into());
         }
@@ -222,15 +250,18 @@ impl ThumbnailCapture {
         if crop.2 <= 0 || crop.3 <= 0 {
             return Err(format!("目标窗口区域尺寸异常（{}x{}）", crop.2, crop.3));
         }
+        let out = fit_size(crop, max_w);
         unsafe {
-            let (host, thumb) = Self::create_host_and_register(root, crop)?;
+            let (host, thumb) = Self::create_host_and_register(root, crop, out)?;
             let mut me = ThumbnailCapture {
                 root,
                 target,
                 host,
                 thumb,
-                dib: Dib::new(crop.2, crop.3)?,
+                dib: Dib::new(out.0, out.1)?,
                 crop,
+                out,
+                max_w,
             };
             me.apply_properties()?;
             Ok(me)
@@ -240,6 +271,7 @@ impl ThumbnailCapture {
     unsafe fn create_host_and_register(
         root: HWND,
         crop: (i32, i32, i32, i32),
+        out: (i32, i32),
     ) -> Result<(HWND, isize), String> {
         ensure_host_class();
         let cls = win::wide(HOST_CLASS);
@@ -253,8 +285,8 @@ impl ThumbnailCapture {
             WS_POPUP, // 不加 WS_VISIBLE，建完再 ShowWindow(SW_SHOWNOACTIVATE)
             off_x,
             0,
-            crop.2,
-            crop.3,
+            out.0,
+            out.1,
             null_mut(),
             null_mut(),
             win::module_handle(),
@@ -268,8 +300,8 @@ impl ThumbnailCapture {
         logline!(
             "[capture] 建宿主 0x{:X} {}x{} @x={}  (toolwindow)",
             host as isize,
-            crop.2,
-            crop.3,
+            out.0,
+            out.1,
             off_x
         );
 
@@ -297,15 +329,16 @@ impl ThumbnailCapture {
 
     unsafe fn apply_properties(&self) -> Result<(), String> {
         let (cx, cy, cw, ch) = self.crop;
+        let (ow, oh) = self.out;
         let props = DWM_THUMBNAIL_PROPERTIES {
             dwFlags: DWM_TNP_RECTDESTINATION
                 | DWM_TNP_RECTSOURCE
                 | DWM_TNP_OPACITY
                 | DWM_TNP_VISIBLE
                 | DWM_TNP_SOURCECLIENTAREAONLY,
-            // 目标矩形 = 宿主客户区；源矩形 = 目标窗口在**源客户区坐标系**里的位置。
-            // 两者尺寸相同 => 1:1 不缩放；"裁剪出子窗口那一块"完全由 rcSource 完成。
-            rcDestination: RECT { left: 0, top: 0, right: cw, bottom: ch },
+            // 目标矩形 = 宿主客户区（可能小于源矩形 => DWM 负责缩放）；
+            // 源矩形 = 目标窗口在**源客户区坐标系**里的位置。
+            rcDestination: RECT { left: 0, top: 0, right: ow, bottom: oh },
             rcSource: RECT { left: cx, top: cy, right: cx + cw, bottom: cy + ch },
             opacity: 255,
             fVisible: 1,
@@ -314,6 +347,21 @@ impl ThumbnailCapture {
         let hr = DwmUpdateThumbnailProperties(self.thumb, &props);
         if hr != 0 {
             return Err(format!("DwmUpdateThumbnailProperties 失败 hr=0x{hr:08X}"));
+        }
+        Ok(())
+    }
+
+    /// 临时关掉缩略图合成（`fVisible=0`）。
+    ///
+    /// 主窗口最小化、又没有在录制时，DWM 没必要继续为这个宿主合成画面 ——
+    /// 关掉能实打实降低后台 GPU/CPU 占用。`PrintWindow` 前必须重新打开。
+    pub fn set_visible(&self, visible: bool) -> Result<(), String> {
+        let mut props: DWM_THUMBNAIL_PROPERTIES = unsafe { std::mem::zeroed() };
+        props.dwFlags = DWM_TNP_VISIBLE;
+        props.fVisible = if visible { 1 } else { 0 };
+        let hr = unsafe { DwmUpdateThumbnailProperties(self.thumb, &props) };
+        if hr != 0 {
+            return Err(format!("DwmUpdateThumbnailProperties(visible) 失败 hr=0x{hr:08X}"));
         }
         Ok(())
     }
@@ -331,9 +379,9 @@ impl ThumbnailCapture {
         self.target
     }
 
-    /// 输出尺寸 = 裁剪矩形尺寸
+    /// 输出尺寸（宿主位图大小）。1:1 抓帧时等于裁剪尺寸；预览缩放时更小。
     pub fn size(&self) -> (i32, i32) {
-        (self.crop.2, self.crop.3)
+        self.out
     }
 
     pub fn source_alive(&self) -> bool {
@@ -354,7 +402,9 @@ impl ThumbnailCapture {
             return Err(format!("目标窗口区域尺寸异常（{}x{}）", crop.2, crop.3));
         }
         let size_changed = crop.2 != self.crop.2 || crop.3 != self.crop.3;
-        if size_changed {
+        let out = fit_size(crop, self.max_w);
+        let out_changed = out != self.out;
+        if size_changed || out_changed {
             unsafe {
                 win::pump();
                 if self.thumb != 0 {
@@ -365,10 +415,11 @@ impl ThumbnailCapture {
                     DestroyWindow(self.host);
                     self.host = null_mut();
                 }
-                let (host, thumb) = Self::create_host_and_register(self.root, crop)?;
+                let (host, thumb) = Self::create_host_and_register(self.root, crop, out)?;
                 self.host = host;
                 self.thumb = thumb;
-                self.dib = Dib::new(crop.2, crop.3)?;
+                self.out = out;
+                self.dib = Dib::new(out.0, out.1)?;
             }
         }
         self.crop = crop;
@@ -390,10 +441,20 @@ impl ThumbnailCapture {
         win::covered_ratio(self.root, self.crop)
     }
 
-    /// 抓一帧。返回的像素是**源窗口客户区**的内容（1:1）。
+    /// 抓一帧。返回的像素是**源窗口客户区**的内容（1:1 抓帧时；预览缩放时是缩放后的）。
     ///
     /// 目标窗口被其他窗口盖住、甚至被最小化时，本方法依然能取到画面（实测）。
     pub fn grab(&self) -> Result<Frame, String> {
+        let (w, h) = self.out;
+        let mut f = Frame::new(w, h, vec![0u8; (w as usize).saturating_mul(h as usize).saturating_mul(4)]);
+        self.grab_into(&mut f)?;
+        Ok(f)
+    }
+
+    /// 抓一帧到**已有缓冲区**里（录制循环用，避免每帧分配几 MB）。
+    ///
+    /// 尺寸变了会自动重建缓冲区；调用方拿到的 `frame` 始终是当前尺寸。
+    pub fn grab_into(&self, frame: &mut Frame) -> Result<(), String> {
         if !self.source_alive() {
             return Err("目标窗口已关闭".into());
         }
@@ -404,11 +465,14 @@ impl ThumbnailCapture {
         if ok == 0 {
             return Err("PrintWindow(宿主, PW_RENDERFULLCONTENT) 返回失败".into());
         }
-        Ok(Frame::new(
-            self.crop.2,
-            self.crop.3,
-            self.dib.pixels().to_vec(),
-        ))
+        let (w, h) = self.out;
+        let pixels = self.dib.pixels();
+        if frame.width != w || frame.height != h || frame.bgra.len() != pixels.len() {
+            *frame = Frame::new(w, h, pixels.to_vec());
+        } else {
+            frame.bgra.copy_from_slice(pixels);
+        }
+        Ok(())
     }
 
     /// 直接对源窗口抓一帧（`PrintWindow(源, PW_RENDERFULLCONTENT)`）。
@@ -460,5 +524,24 @@ impl Drop for ThumbnailCapture {
                 self.host = null_mut();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fit_size;
+
+    #[test]
+    fn 预览缩放按宽度等比且不放大() {
+        // 宽于上限：等比缩到 480 宽
+        assert_eq!(fit_size((0, 0, 1920, 986), 480), (480, 247));
+        // 窄于上限：保持原样
+        assert_eq!(fit_size((0, 0, 320, 240), 480), (320, 240));
+        // 不缩放
+        assert_eq!(fit_size((0, 0, 1920, 986), i32::MAX), (1920, 986));
+        // 极端宽扁不产生 0 高
+        let (w, h) = fit_size((0, 0, 4000, 10), 480);
+        assert_eq!(w, 480);
+        assert!(h >= 1);
     }
 }

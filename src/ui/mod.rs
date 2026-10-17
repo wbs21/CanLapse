@@ -87,6 +87,10 @@ const ID_PROGRESS: usize = 142;
 const ID_CANCEL: usize = 143;
 
 const TIMER_UI: usize = 1;
+/// 界面实时预览的抓帧上限宽度：160×100 的框用 480 宽足够，
+/// 比每帧拷整张画布省一两个数量级的带宽/分配。
+const PREVIEW_MAX_W: i32 = 480;
+
 const PREVIEW_W: i32 = 160;
 const PREVIEW_H: i32 = 100;
 const DEFAULT_W: i32 = 460;
@@ -186,6 +190,11 @@ struct App {
     preview_size: (i32, i32),
     /// 这次拾取点到的是"边框"还是"画面"（状态栏展示，便于确认点中位置）
     pick_where: Option<&'static str>,
+    /// 预览抓帧是否因"主窗口不可见"而暂停（对应的 DWM 缩略图已关掉合成）
+    preview_hidden: bool,
+    /// 预览抓帧耗时累计（每 20 次写一条 `[perf]`，用于验证降采样的效果）
+    preview_us: u64,
+    preview_grabs: u32,
 }
 
 impl App {
@@ -339,7 +348,7 @@ pub const WM_SETFONT_C: u32 = 0x0030;
 // 窗口过程
 // ---------------------------------------------------------------------------
 
-unsafe extern "system" fn wndproc(
+unsafe extern "system" fn main_wndproc(
     hwnd: HWND,
     msg: u32,
     wparam: WPARAM,
@@ -426,6 +435,31 @@ unsafe extern "system" fn wndproc(
     }
 }
 
+/// 把 panic 内容转成一句话（`&str` / `String` / 其它）
+fn panic_msg(e: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = e.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = e.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "未知 panic（非字符串 payload）".to_string()
+    }
+}
+
+/// 窗口过程的**兜底壳**：panic 一旦跨过 `extern "system"` 边界会直接 abort，
+/// 用户看到的就是"程序突然没了"。这里接住 panic、写日志、返回 0，进程继续活着。
+unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        main_wndproc(hwnd, msg, wparam, lparam)
+    })) {
+        Ok(v) => v,
+        Err(e) => {
+            logline!("[panic] wndproc msg=0x{msg:X}: {}", panic_msg(&e));
+            0
+        }
+    }
+}
+
 unsafe fn app_mut(hwnd: HWND) -> Option<&'static mut App> {
     let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App;
     if ptr.is_null() {
@@ -468,6 +502,9 @@ impl App {
             preview_err: None,
             preview_size: (0, 0),
             pick_where: None,
+            preview_hidden: false,
+            preview_us: 0,
+            preview_grabs: 0,
         }
     }
 
@@ -548,7 +585,8 @@ impl App {
         self.set_panel_visible();
         let s = win::wide(&format!("{}", self.out_path.display()));
         SetWindowTextW(self.ctl.edit_out, s.as_ptr());
-        self.refresh_session_list();
+        // 会话列表**懒加载**：历史面板默认折叠，启动时没必要扫几百个目录、几万个 PNG。
+        // 展开面板（ID_HDR_HIST）时才真正读盘。
         self.refresh_labels();
         self.ui_set_idle();
     }
@@ -826,7 +864,7 @@ impl App {
         );
         // 释放上一个预览抓帧器
         self.preview_cap = None;
-        match ThumbnailCapture::new(hwnd) {
+        match ThumbnailCapture::new_scaled(hwnd, PREVIEW_MAX_W) {
             Ok(cap) => {
                 let (ow, oh) = cap.size();
                 self.preview = match cap.grab() {
@@ -1025,7 +1063,7 @@ impl App {
         SetForegroundWindow(self.hwnd);
         // 恢复实时预览（录制期间抓帧归录制线程独占）
         if let Some(t) = &self.target {
-            self.preview_cap = ThumbnailCapture::new(t.hwnd).ok();
+            self.preview_cap = ThumbnailCapture::new_scaled(t.hwnd, PREVIEW_MAX_W).ok();
         }
 
         let failed = shared.as_ref().map(|s| s.error()).flatten();
@@ -1084,15 +1122,21 @@ impl App {
         let dir = session;
         std::thread::spawn(move || {
             let started = std::time::Instant::now();
-            let r = encode::encode_session(&dir, &opts, &mut |done, all| {
-                progress.store(done, Ordering::SeqCst);
-                total.store(all, Ordering::SeqCst);
-                if cancel.load(Ordering::SeqCst) {
-                    Progress::Cancel
-                } else {
-                    Progress::Continue
-                }
-            });
+            // 合成线程 panic 时 UI 会永远停在"合成中"，这里接住并转成错误
+            let r = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                encode::encode_session(&dir, &opts, &mut |done, all| {
+                    progress.store(done, Ordering::SeqCst);
+                    total.store(all, Ordering::SeqCst);
+                    if cancel.load(Ordering::SeqCst) {
+                        Progress::Cancel
+                    } else {
+                        Progress::Continue
+                    }
+                })
+            })) {
+                Ok(v) => v,
+                Err(e) => Err(format!("合成线程 panic：{}", panic_msg(&e))),
+            };
             crate::log::line(&format!(
                 "[encode] 结束（{:.1}s）: {:?}",
                 started.elapsed().as_secs_f64(),
@@ -1237,39 +1281,74 @@ impl App {
             .map(|s| s.phase().is_running())
             .unwrap_or(false);
         if !recording && self.preview_cap.is_some() {
-            // 先抓完再把结果搬出来，避免 `&self.preview_cap` 的不可变借用挡住后面的字段修改
-            let grabbed = self.preview_cap.as_ref().map(|c| c.grab());
-            if let Some(res) = grabbed {
-                match res {
-                    Ok(f) => {
-                        let sz = (f.width, f.height);
-                        if self.preview_size != (0, 0) && sz != self.preview_size {
-                            logline!(
-                                "[preview] 输出尺寸变化 {}x{} -> {}x{}",
-                                self.preview_size.0,
-                                self.preview_size.1,
-                                sz.0,
-                                sz.1
-                            );
-                        }
-                        if self.preview_err.take().is_some() {
-                            logline!("[preview] 抓帧恢复正常");
-                        }
-                        self.preview_size = sz;
-                        self.preview = Some(f);
-                        InvalidateRect(self.hwnd, &self.preview_rect, 0);
+            // 主窗口最小化 / 不可见时没人看预览：让 DWM 停掉缩略图合成并跳过抓帧。
+            // 这是"后台占用"的大头 —— 缩略图是持续合成的，不看却一直在算。
+            let hidden = unsafe {
+                windows_sys::Win32::UI::WindowsAndMessaging::IsIconic(self.hwnd) != 0
+                    || windows_sys::Win32::UI::WindowsAndMessaging::IsWindowVisible(self.hwnd) == 0
+            };
+            if hidden {
+                if !self.preview_hidden {
+                    if let Some(cap) = &self.preview_cap {
+                        let _ = cap.set_visible(false);
                     }
-                    Err(e) => {
-                        // 目标被关掉/最小化时这个错误每 500ms 重复一次：
-                        // 只在"错误内容变了"或"距上次记录 ≥10 秒"时写
-                        let now = std::time::Instant::now();
-                        let due = match &self.preview_err {
-                            None => true,
-                            Some((old, at)) => *old != e || now.duration_since(*at).as_secs() >= 10,
-                        };
-                        if due {
-                            logline!("[preview] 抓帧失败：{e}");
-                            self.preview_err = Some((e, now));
+                    self.preview_hidden = true;
+                    logline!("[preview] 主窗口不可见：暂停预览抓帧并关闭 DWM 合成");
+                }
+            } else {
+                if self.preview_hidden {
+                    if let Some(cap) = &self.preview_cap {
+                        let _ = cap.set_visible(true);
+                    }
+                    self.preview_hidden = false;
+                    self.preview_size = (0, 0); // 重新抓一帧，尺寸变化日志不作数
+                    logline!("[preview] 主窗口重新可见：恢复预览抓帧");
+                }
+                // 先抓完再把结果搬出来，避免 `&self.preview_cap` 的不可变借用挡住后面的字段修改
+                let t_grab = std::time::Instant::now();
+                let grabbed = self.preview_cap.as_ref().map(|c| c.grab());
+                self.preview_us += t_grab.elapsed().as_micros() as u64;
+                self.preview_grabs += 1;
+                if self.preview_grabs >= 20 {
+                    let avg = self.preview_us as f64 / self.preview_grabs as f64 / 1000.0;
+                    logline!("[perf] 预览抓帧 {} 次，平均 {avg:.2} ms/帧", self.preview_grabs);
+                    self.preview_us = 0;
+                    self.preview_grabs = 0;
+                }
+                if let Some(res) = grabbed {
+                    match res {
+                        Ok(f) => {
+                            let sz = (f.width, f.height);
+                            if self.preview_size != (0, 0) && sz != self.preview_size {
+                                logline!(
+                                    "[preview] 输出尺寸变化 {}x{} -> {}x{}",
+                                    self.preview_size.0,
+                                    self.preview_size.1,
+                                    sz.0,
+                                    sz.1
+                                );
+                            }
+                            if self.preview_err.take().is_some() {
+                                logline!("[preview] 抓帧恢复正常");
+                            }
+                            self.preview_size = sz;
+                            self.preview = Some(f);
+                            InvalidateRect(self.hwnd, &self.preview_rect, 0);
+                        }
+                        Err(e) => {
+                            // 目标被关掉/最小化时这个错误每 500ms 重复一次：
+                            // 只在"错误内容变了"或"距上次记录 ≥10 秒"时写
+                            let now = std::time::Instant::now();
+                            let due = match &self.preview_err {
+                                None => true,
+                                Some((old, at)) => {
+                                    *old != e || now.duration_since(*at).as_secs() >= 10
+                                }
+                            };
+                            if due {
+                                logline!("[preview] 抓帧失败：{e}");
+                                self.preview_err = Some((e, now));
+                            }
                         }
                     }
                 }
@@ -1456,7 +1535,7 @@ pub fn open_folder(dir: &std::path::Path) {
 
 const PREVIEW_CLASS: &str = "CanLapseBigPreview";
 
-unsafe extern "system" fn preview_proc(
+unsafe extern "system" fn preview_proc_inner(
     hwnd: HWND,
     msg: u32,
     wparam: WPARAM,
@@ -1516,11 +1595,24 @@ unsafe extern "system" fn preview_proc(
     }
 }
 
+unsafe extern "system" fn preview_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        preview_proc_inner(hwnd, msg, wparam, lparam)
+    })) {
+        Ok(v) => v,
+        Err(e) => {
+            logline!("[panic] preview_proc msg=0x{msg:X}: {}", panic_msg(&e));
+            0
+        }
+    }
+}
+
 /// 启动 GUI（阻塞到窗口关闭）
 pub fn run(initial_target: Option<isize>) -> i32 {
     // 运行日志：debug 构建默认写 %LOCALAPPDATA%\CanLapse\canlapse.log（GUI 没有控制台，
     // 用户测试后只能靠这个文件定位问题）；release 构建需显式设 CANLAPSE_LOG 才写。
     let _ = crate::log::init();
+    let t_start = std::time::Instant::now();
     logline!("");
     logline!(
         "==== CanLapse {} ({}) 启动 ====",
@@ -1558,6 +1650,39 @@ pub fn run(initial_target: Option<isize>) -> i32 {
             let _ = f.write_all(text.as_bytes());
         }
     }));
+    // 未处理异常（访问冲突等）兜底：至少把异常码和地址落盘，方便事后定位。
+    // 返回 CONTINUE_SEARCH —— 不吞异常，进程该退还是退，避免带病运行。
+    unsafe {
+        use windows_sys::Win32::System::Diagnostics::Debug::{
+            SetUnhandledExceptionFilter, EXCEPTION_POINTERS,
+        };
+        unsafe extern "system" fn on_fatal(info: *const EXCEPTION_POINTERS) -> i32 {
+            if !info.is_null() && !(*info).ExceptionRecord.is_null() {
+                let rec = (*info).ExceptionRecord;
+                let code = (*rec).ExceptionCode;
+                let addr = (*rec).ExceptionAddress;
+                crate::log::line(&format!(
+                    "[fatal] 未处理异常 code=0x{code:08X} addr={addr:p}"
+                ));
+                if let Ok(dir) = std::env::var("LOCALAPPDATA") {
+                    let dir = std::path::PathBuf::from(dir).join("CanLapse");
+                    let _ = std::fs::create_dir_all(&dir);
+                    let stamp = win::stamp_iso(&win::local_now());
+                    use std::io::Write;
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(dir.join("crash.log"))
+                    {
+                        let _ =
+                            writeln!(f, "[{stamp}] 未处理异常 code=0x{code:08X} addr={addr:p}");
+                    }
+                }
+            }
+            0 // EXCEPTION_CONTINUE_SEARCH
+        }
+        SetUnhandledExceptionFilter(Some(on_fatal));
+    }
     unsafe {
         let icc = INITCOMMONCONTROLSEX {
             dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
@@ -1616,12 +1741,13 @@ pub fn run(initial_target: Option<isize>) -> i32 {
         if hwnd.is_null() {
             return 2;
         }
+        logline!("[start] 窗口创建完成 {} ms", t_start.elapsed().as_millis());
         // 命令行预先指定目标（便于脚本化验证，也方便用户直接从命令行带目标启动）
         if let Some(h) = initial_target {
             if let Some(app) = app_mut(hwnd) {
                 app.target = Some(win::describe(h as HWND));
                 app.pick_state = PickState::Ok;
-                app.preview_cap = ThumbnailCapture::new(h as HWND).ok();
+                app.preview_cap = ThumbnailCapture::new_scaled(h as HWND, PREVIEW_MAX_W).ok();
                 if let Some(cap) = &app.preview_cap {
                     app.preview = cap.grab().ok();
                 }
@@ -1637,6 +1763,7 @@ pub fn run(initial_target: Option<isize>) -> i32 {
         }
         ShowWindow(hwnd, SW_SHOW);
         UpdateWindow(hwnd);
+        logline!("[start] 首帧显示 {} ms", t_start.elapsed().as_millis());
         SetTimer(hwnd, TIMER_UI, 500, None);
 
         let mut msg: MSG = std::mem::zeroed();

@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::HWND;
 
 use crate::capture::ThumbnailCapture;
+use crate::logline;
 use crate::frame::Frame;
 use crate::session::Session;
 use crate::win;
@@ -186,13 +187,31 @@ impl Shared {
 /// 启动录制线程。返回的 `JoinHandle` 只用于等待收尾，进度一律看 [`Shared`]。
 pub fn spawn(cfg: RecorderConfig, shared: Arc<Shared>) -> JoinHandle<()> {
     std::thread::spawn(move || {
-        if let Err(e) = run(&cfg, &shared) {
+        // 线程里 panic 的话 UI 只会看到"一直录制中"——必须接住并转成错误
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&cfg, &shared)));
+        let err = match outcome {
+            Ok(Ok(())) => None,
+            Ok(Err(e)) => Some(e),
+            Err(p) => Some(format!("录制线程 panic：{}", panic_text(&p))),
+        };
+        if let Some(e) = err {
+            crate::log::line(&format!("[record] 录制线程异常：{e}"));
             if let Ok(mut slot) = shared.error.lock() {
                 *slot = Some(e);
             }
             shared.phase.store(Phase::Failed.code(), Ordering::SeqCst);
         }
     })
+}
+
+fn panic_text(e: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = e.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = e.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "未知 panic".to_string()
+    }
 }
 
 fn run(cfg: &RecorderConfig, shared: &Arc<Shared>) -> Result<(), String> {
@@ -220,12 +239,22 @@ fn run(cfg: &RecorderConfig, shared: &Arc<Shared>) -> Result<(), String> {
     let start = Instant::now();
     let mut paused_total = Duration::ZERO;
     let mut paused_at: Option<Instant> = None;
-    // 差分始终用**原始捕获帧**；落盘用等比适配到基准尺寸后的图
-    let mut last_saved: Option<Frame> = None;
+    // 差分始终用**原始捕获帧**；落盘用等比适配到基准尺寸后的图。
+    // `cur` / `prev` 两块缓冲交替使用：抓帧写进 cur，保存成功后与 prev 交换 ——
+    // 这样每帧不再分配/释放 7.5 MB（4K 时是 33 MB），长时间录制内存曲线是平的。
+    let mut cur = Frame::new(
+        cw,
+        ch,
+        vec![0u8; (cw as usize).saturating_mul(ch as usize).saturating_mul(4).max(4)],
+    );
+    let mut prev: Option<Frame> = None;
     let mut base_size: Option<(i32, i32)> = None;
     let mut next_tick = Instant::now();
     let mut completed = true;
     let mut tick: u32 = 0;
+    // 抓帧耗时统计（每 40 个 tick 记一条日志，用来验证"复用缓冲"的效果）
+    let mut grab_us: u64 = 0;
+    let mut grab_n: u32 = 0;
 
     loop {
         if shared.stop.load(Ordering::SeqCst) {
@@ -268,7 +297,7 @@ fn run(cfg: &RecorderConfig, shared: &Arc<Shared>) -> Result<(), String> {
                 if base_size.is_none() {
                     sess.update_geometry(nw, nh);
                 }
-                last_saved = None; // 强制下一帧保存
+                prev = None; // 尺寸变了，上一帧作废（强制下一帧保存）
             }
             Ok(false) => {}
             Err(_) => {
@@ -276,30 +305,52 @@ fn run(cfg: &RecorderConfig, shared: &Arc<Shared>) -> Result<(), String> {
             }
         }
 
-        match cap.grab() {
-            Ok(f) => {
-                if !shared.blank_warned.load(Ordering::SeqCst) && f.is_blank() {
+        let t_grab = Instant::now();
+        let grabbed = cap.grab_into(&mut cur);
+        grab_us += t_grab.elapsed().as_micros() as u64;
+        grab_n += 1;
+        match grabbed {
+            Ok(()) => {
+                if !shared.blank_warned.load(Ordering::SeqCst) && cur.is_blank() {
                     shared.blank_warned.store(true, Ordering::SeqCst);
                 }
-                let changed = match &last_saved {
-                    Some(prev) => f.changed_ratio(prev),
+                let changed = match &prev {
+                    Some(p) => cur.changed_ratio(p),
                     None => 1.0,
                 };
                 if changed > cfg.threshold {
-                    let to_save = match base_size {
+                    let (bw, bh) = match base_size {
                         None => {
-                            base_size = Some((f.width, f.height));
-                            sess.update_geometry(f.width, f.height);
-                            shared.base_w.store(f.width, Ordering::SeqCst);
-                            shared.base_h.store(f.height, Ordering::SeqCst);
-                            f.clone()
+                            base_size = Some((cur.width, cur.height));
+                            sess.update_geometry(cur.width, cur.height);
+                            shared.base_w.store(cur.width, Ordering::SeqCst);
+                            shared.base_h.store(cur.height, Ordering::SeqCst);
+                            (cur.width, cur.height)
                         }
-                        Some((bw, bh)) => f.fit_into(bw, bh, cfg.fill_rgb),
+                        Some(sz) => sz,
                     };
-                    match sess.save_frame(&to_save) {
+                    // 尺寸一致时直接存 cur（不 clone）；不一致才做等比适配
+                    let fitted;
+                    let to_save: &Frame = if (cur.width, cur.height) == (bw, bh) {
+                        &cur
+                    } else {
+                        fitted = cur.fit_into(bw, bh, cfg.fill_rgb);
+                        &fitted
+                    };
+                    match sess.save_frame(to_save) {
                         Ok(n) => {
-                            last_saved = Some(f);
                             shared.frames.store(n, Ordering::SeqCst);
+                            // 交换缓冲：prev 拿走刚保存的帧，cur 拿旧缓冲继续写
+                            let old_prev = prev.take();
+                            let next_cur = match old_prev {
+                                Some(p) if p.width == cur.width && p.height == cur.height => p,
+                                _ => Frame::new(
+                                    cur.width,
+                                    cur.height,
+                                    vec![0u8; cur.bgra.len()],
+                                ),
+                            };
+                            prev = Some(std::mem::replace(&mut cur, next_cur));
                         }
                         Err(_) => {
                             shared.dropped.fetch_add(1, Ordering::SeqCst);
@@ -325,6 +376,20 @@ fn run(cfg: &RecorderConfig, shared: &Arc<Shared>) -> Result<(), String> {
         shared
             .elapsed_ms
             .store(elapsed.as_millis() as u64, Ordering::SeqCst);
+
+        if tick % 40 == 0 {
+            let avg = if grab_n > 0 {
+                grab_us as f64 / grab_n as f64 / 1000.0
+            } else {
+                0.0
+            };
+            logline!(
+                "[perf] 抓帧 {grab_n} 次，平均 {avg:.2} ms/帧，丢弃 {}",
+                shared.dropped.load(Ordering::SeqCst)
+            );
+            grab_us = 0;
+            grab_n = 0;
+        }
 
         next_tick += interval;
         let now = Instant::now();
