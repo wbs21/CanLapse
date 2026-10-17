@@ -53,13 +53,13 @@ impl Quality {
     /// 目标码率（bit/s）。
     ///
     /// libopenh264 **不支持 CRF**（那是 x264 的能力），所以统一按
-    /// "分辨率 × 帧率 × 每像素比特数" 估算。参考点：1080p24 在"高"档约 7.5 Mbps，
-    /// 与常见录屏工具的中高质量预设相当。
+    /// "分辨率 × 帧率 × 每像素比特数" 估算。参考点：1080p24 在"高"档约 6.0 Mbps、
+    /// "中"档约 3.0 Mbps、"低"档约 1.5 Mbps。
     pub fn bitrate_for(self, width: i32, height: i32, fps: f64) -> i64 {
         let bits_per_pixel = match self {
-            Quality::High => 0.15,
-            Quality::Medium => 0.09,
-            Quality::Low => 0.05,
+            Quality::High => 0.12,
+            Quality::Medium => 0.06,
+            Quality::Low => 0.03,
         };
         let raw = width as f64 * height as f64 * fps * bits_per_pixel;
         raw.clamp(300_000.0, 40_000_000.0) as i64
@@ -628,6 +628,10 @@ mod tests {
         assert!(hi > mid && mid > lo, "{hi} {mid} {lo}");
         // 参考点：1080p24 高质量应落在 Mbps 量级的合理区间
         assert!((4_000_000..12_000_000).contains(&hi), "hi={hi}");
+        // 三档的每像素比特数：0.12 / 0.06 / 0.03（1920x1080x24 分别 5.97 / 2.99 / 1.49 Mbps）
+        assert_eq!(hi, 5_971_968);
+        assert_eq!(mid, 2_985_984);
+        assert_eq!(lo, 1_492_992);
         // 极小分辨率有下限，避免码率低到无法编码
         assert!(Quality::Low.bitrate_for(64, 64, 5.0) >= 300_000);
     }

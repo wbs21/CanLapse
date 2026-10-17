@@ -483,7 +483,7 @@ impl App {
             fps: 2.0,
             threshold: 0.01,
             export_fps: 24.0,
-            quality: Quality::High,
+            quality: Quality::Medium,
             auto_clean: true,
             out_path: root.join("timelapse.mp4"),
             target: None,
@@ -553,7 +553,7 @@ impl App {
             let s = win::wide(q);
             SendMessageW(c.cmb_qual, 0x0143, 0, s.as_ptr() as isize);
         }
-        SendMessageW(c.cmb_qual, 0x014E, 0, 0);
+        SendMessageW(c.cmb_qual, 0x014E, 1, 0); // CB_SETCURSEL = 1（默认"中"）
         c.lbl_out = mk(h, "Static", "输出", ws, ID_LBL_OUT, f);
         c.edit_out = mk(h, "Edit", "", ws | 0x0080, ID_EDIT_OUT, f); // ES_AUTOHSCROLL
         c.btn_out = mk(h, "Button", "选择", ws, ID_BTN_OUT, f);

@@ -97,7 +97,7 @@ fn help() {
 导出选项（canlapse encode）:
   --session DIR        会话缓存目录（必填）
   --fps N              导出播放帧率，默认 10（常用 5/10/15/20/24）
-  --quality LEVEL      画质档位 high/medium/low（也接受 高/中/低），默认 high
+  --quality LEVEL      画质档位 high/medium/low（也接受 高/中/低），默认 medium
   --out FILE           输出 MP4 路径（默认 <会话目录>\timelapse.mp4）
   --frames N           只导出前 N 帧，用于预览；走与【取消合成】相同的路径
 
@@ -316,7 +316,7 @@ fn cmd_record(a: RecordArgs) -> i32 {
 fn cmd_encode(args: &[String]) -> i32 {
     let mut dir: Option<PathBuf> = None;
     let mut fps = 10.0f64;
-    let mut quality = encode::Quality::High;
+    let mut quality = encode::Quality::Medium;
     let mut out: Option<PathBuf> = None;
     let mut max_frames: Option<u32> = None;
     let mut i = 0;
