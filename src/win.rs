@@ -19,9 +19,9 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, EnumWindows, GetAncestor, GetClassNameW, GetClientRect, GetCursorPos,
-    GetParent, GetWindow, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
-    IsWindow, IsWindowVisible, MSG, PM_REMOVE, PeekMessageW, TranslateMessage, WindowFromPoint,
-    GA_ROOT, GW_OWNER,
+    GetForegroundWindow, GetParent, GetWindow, GetWindowRect, GetWindowTextW,
+    GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, MSG, PM_REMOVE, PeekMessageW,
+    TranslateMessage, WindowFromPoint, GA_ROOT, GW_OWNER,
 };
 
 pub fn wide(s: &str) -> Vec<u16> {
@@ -401,6 +401,28 @@ pub fn covered_ratio(root: HWND, crop: (i32, i32, i32, i32)) -> f32 {
     }
     let hit = cells.iter().filter(|c| **c).count();
     hit as f32 / (GRID * GRID) as f32
+}
+
+/// 取窗口所属进程 ID
+pub fn pid_of(hwnd: HWND) -> u32 {
+    let mut pid: u32 = 0;
+    unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+    pid
+}
+
+/// 当前**前台窗口**所属进程 ID（0 = 取不到）。
+///
+/// 用途（按用户要求）：录制时判断"画家现在是否还在绘画软件里"。
+/// 别的软件在前台 => 此刻绘画软件是挂起的、不会产生新笔触，不必抓帧。
+/// 注意我们自己的悬浮条带 `WS_EX_NOACTIVATE`，点它不会抢前台，所以不会误触发。
+pub fn foreground_pid() -> u32 {
+    unsafe {
+        let h = GetForegroundWindow();
+        if h.is_null() {
+            return 0;
+        }
+        pid_of(h)
+    }
 }
 
 /// 供 capture 模块建宿主窗口用

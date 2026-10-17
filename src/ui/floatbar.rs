@@ -131,8 +131,7 @@ unsafe fn refresh(hwnd: HWND) {
     let t = win::wide(if paused { "继续" } else { "暂停" });
     SetWindowTextW(pause_btn, t.as_ptr());
     // 时长 | 帧计数 | 标记数 显示在条标题上（条很窄，标题栏本来就空着）
-    // 遮挡提醒必须出现在**这里**：录制时主窗口已最小化，悬浮条是用户唯一能看到的界面。
-    let cov = shared.covered_pct();
+    // 状态提示必须出现在**这里**：录制时主窗口已最小化，悬浮条是用户唯一能看到的界面。
     let info = format!(
         "{} | {} 帧{}{}",
         recorder::format_duration(shared.elapsed_ms()),
@@ -142,10 +141,11 @@ unsafe fn refresh(hwnd: HWND) {
         } else {
             String::new()
         },
-        if cov >= 5 {
-            format!(" | ⚠ 遮挡 {cov}%")
+        // 用户规则：别的软件在前台 => 此刻没在画画 => 自动暂停抓帧（切回即继续）
+        if shared.fg_paused() {
+            " | ⏸ 其他软件在前台"
         } else {
-            String::new()
+            ""
         }
     );
     // 写进可见的 Static 控件（用户看的是这里），标题也一并更新（便于自动化识别）

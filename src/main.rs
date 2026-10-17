@@ -258,9 +258,9 @@ fn cmd_record(a: RecordArgs) -> i32 {
             } else {
                 "待定".to_string()
             };
-            let cov = shared.covered_pct();
-            let warn = if cov >= 5 {
-                format!(" | ⚠ 被自家浮动面板遮挡 {cov}%（这部分画布像素取不回来，建议移开面板）")
+            // 用户规则：其他软件在前台 => 此刻没在画画 => 自动暂停抓帧
+            let warn = if shared.fg_paused() {
+                " | ⏸ 其他软件在前台，已暂停抓帧（切回画布即继续）".to_string()
             } else {
                 String::new()
             };

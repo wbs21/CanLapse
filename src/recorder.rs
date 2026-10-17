@@ -76,6 +76,8 @@ pub struct Shared {
     base_h: AtomicI32,
     /// 画布被同属主面板遮挡的百分比（0~100），动态刷新
     covered_pct: AtomicU32,
+    /// 因为"别的软件在前台"而暂停抓帧（说明此刻没在画画）
+    fg_paused: AtomicBool,
     stop: AtomicBool,
     paused: AtomicBool,
     mark: AtomicBool,
@@ -95,6 +97,7 @@ impl Shared {
             base_w: AtomicI32::new(0),
             base_h: AtomicI32::new(0),
             covered_pct: AtomicU32::new(0),
+            fg_paused: AtomicBool::new(false),
             stop: AtomicBool::new(false),
             paused: AtomicBool::new(false),
             mark: AtomicBool::new(false),
@@ -131,6 +134,12 @@ impl Shared {
     /// [`crate::win::covered_ratio`]：被盖住的画布像素是拿不回来的，只能提醒。
     pub fn covered_pct(&self) -> u32 {
         self.covered_pct.load(Ordering::SeqCst)
+    }
+
+    /// 是否因为"别的软件在前台"而暂停抓帧。
+    /// 用户要求：别的软件在前台 => 此刻没在画画 => 不必录（切回绘画软件就继续）。
+    pub fn fg_paused(&self) -> bool {
+        self.fg_paused.load(Ordering::SeqCst)
     }
     pub fn session_dir(&self) -> Option<PathBuf> {
         self.dir.lock().ok().and_then(|d| d.clone())
@@ -183,6 +192,7 @@ pub fn spawn(cfg: RecorderConfig, shared: Arc<Shared>) -> JoinHandle<()> {
 fn run(cfg: &RecorderConfig, shared: &Arc<Shared>) -> Result<(), String> {
     let hwnd = cfg.hwnd as HWND;
     let info = win::describe(hwnd);
+    let target_pid = win::pid_of(hwnd);
     // 注意：ThumbnailCapture 在这个线程里创建，之后也只在它上面用（GDI 线程亲和性）
     let mut cap = ThumbnailCapture::new(hwnd)?;
     let (cw, ch) = cap.size();
@@ -220,7 +230,14 @@ fn run(cfg: &RecorderConfig, shared: &Arc<Shared>) -> Result<(), String> {
             break;
         }
 
-        if shared.paused.load(Ordering::SeqCst) {
+        if shared.paused.load(Ordering::SeqCst) || {
+            // 用户规则：别的软件在前台 => 说明绘画软件此刻挂起、没有新笔触，不必抓帧。
+            // 我们自己的进程不算（悬浮条是 WS_EX_NOACTIVATE，本来也不会成为前台）。
+            let fg = win::foreground_pid();
+            let other = fg != 0 && fg != target_pid && fg != std::process::id();
+            shared.fg_paused.store(other, Ordering::SeqCst);
+            other
+        } {
             if paused_at.is_none() {
                 paused_at = Some(Instant::now());
                 shared.phase.store(Phase::Paused.code(), Ordering::SeqCst);
