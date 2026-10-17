@@ -18,10 +18,9 @@ use std::thread::JoinHandle;
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, DrawEdge, EndPaint,
-    GetStockObject, InvalidateRect, ReleaseDC, SelectObject, SetBkMode, StretchDIBits, UpdateWindow,
-    BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BDR_SUNKENOUTER, BF_RECT, DEFAULT_GUI_FONT, DIB_RGB_COLORS,
-    HGDIOBJ, PAINTSTRUCT, RGBQUAD, SRCCOPY,
+    BeginPaint, DrawEdge, EndPaint, GetStockObject, InvalidateRect, SelectObject, SetBkMode,
+    StretchDIBits, UpdateWindow, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BDR_SUNKENOUTER, BF_RECT,
+    DEFAULT_GUI_FONT, DIB_RGB_COLORS, HGDIOBJ, PAINTSTRUCT, RGBQUAD, SRCCOPY,
 };
 use windows_sys::Win32::UI::Controls::{
     InitCommonControlsEx, INITCOMMONCONTROLSEX, ICC_BAR_CLASSES, ICC_PROGRESS_CLASS,
@@ -29,13 +28,13 @@ use windows_sys::Win32::UI::Controls::{
 };
 use windows_sys::Win32::UI::Controls::Dialogs::{GetSaveFileNameW, OPENFILENAMEW};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetMessageW,
-    GetWindowLongPtrW, IsWindow, MessageBoxW, MoveWindow, PostQuitMessage, RegisterClassW,
-    SendMessageW, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW,
-    ShowWindow, TranslateMessage, GWLP_USERDATA, MB_ICONINFORMATION, MB_OK, MSG, SW_MINIMIZE,
-    SW_RESTORE, SW_SHOW, SWP_NOZORDER, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_GETMINMAXINFO,
-    WM_HSCROLL, WM_PAINT, WM_SIZE, WM_TIMER, WNDCLASSW, WS_CAPTION, WS_CHILD, WS_MINIMIZEBOX,
-    WS_OVERLAPPED, WS_SYSMENU, WS_THICKFRAME, WS_VISIBLE,
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClientRect, GetMessageW, GetWindowLongPtrW,
+    MessageBoxW, MoveWindow, PostQuitMessage, RegisterClassW, SendMessageW, SetForegroundWindow,
+    SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, TranslateMessage,
+    GWLP_USERDATA, MB_ICONINFORMATION, MB_OK, MSG, SW_MINIMIZE, SW_RESTORE, SW_SHOW, SWP_NOZORDER,
+    WM_COMMAND, WM_CREATE, WM_DESTROY, WM_GETMINMAXINFO, WM_HSCROLL, WM_PAINT, WM_SIZE, WM_TIMER,
+    WNDCLASSW, WS_CAPTION, WS_CHILD, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU, WS_THICKFRAME,
+    WS_VISIBLE,
 };
 
 use crate::capture::ThumbnailCapture;
@@ -51,7 +50,6 @@ use crate::win;
 // ---------------------------------------------------------------------------
 
 const ID_PICK: usize = 100;
-const ID_PREVIEW: usize = 101;
 const ID_HELP: usize = 102;
 const ID_STATUS: usize = 103;
 const ID_HDR_REC: usize = 110;
@@ -60,8 +58,8 @@ const ID_CMB_RECFPS: usize = 112;
 const ID_LBL_THR: usize = 113;
 const ID_CMB_SENS: usize = 114;
 const ID_HINT_SENS: usize = 115;
+const ID_BTN_CLEAN: usize = 116;
 const ID_HDR_EXP: usize = 120;
-const ID_TIP: usize = 121;
 const ID_CHK_CLEAN: usize = 122;
 const ID_LBL_OUT: usize = 127;
 const ID_EDIT_OUT: usize = 128;
@@ -72,7 +70,6 @@ const ID_REEXPORT: usize = 132;
 const ID_OPEN_DIR: usize = 133;
 const ID_DELETE: usize = 134;
 const ID_RECORD: usize = 140;
-const ID_STATE: usize = 141;
 const ID_PROGRESS: usize = 142;
 const ID_CANCEL: usize = 143;
 
@@ -160,7 +157,6 @@ struct EncState {
 struct Ctl {
     title: HWND,
     btn_pick: HWND,
-    btn_preview: HWND,
     btn_help: HWND,
     status: HWND,
     hdr_rec: HWND,
@@ -170,7 +166,6 @@ struct Ctl {
     cmb_sens: HWND,
     hint_sens: HWND,
     hdr_exp: HWND,
-    tip: HWND,
     chk_clean: HWND,
     lbl_out: HWND,
     edit_out: HWND,
@@ -181,9 +176,9 @@ struct Ctl {
     btn_open: HWND,
     btn_delete: HWND,
     btn_record: HWND,
-    state: HWND,
     progress: HWND,
     btn_cancel: HWND,
+    btn_clean: HWND,
 }
 
 struct App {
@@ -209,7 +204,6 @@ struct App {
     bar: HWND,
     enc: Option<EncState>,
     relayouting: bool,
-    preview_win: HWND,
     /// 预览抓帧失败的上一次记录：`(错误串, 时间)` —— 目标窗口关闭/最小化时
     /// 这个错误会每 500ms 重复一次，只在"错误变了或过了 10 秒"时写日志，避免刷屏。
     preview_err: Option<(String, std::time::Instant)>,
@@ -269,12 +263,11 @@ fn compute_layout(app: &App, cw: i32) -> (Vec<(HWND, RECT, bool)>, RECT, i32) {
     push(c.title, rect(m, y, inner, 20), true);
     y += 24;
 
-    // 拾取模块按钮组
+    // 拾取模块按钮组（按用户要求去掉【预览窗口】按钮，两按钮均分）
     let gap = 6;
-    let bw = (inner - gap * 2) / 3;
+    let bw = (inner - gap) / 2;
     push(c.btn_pick, rect(m, y, bw, 26), true);
-    push(c.btn_preview, rect(m + bw + gap, y, bw, 26), true);
-    push(c.btn_help, rect(m + (bw + gap) * 2, y, inner - (bw + gap) * 2, 26), true);
+    push(c.btn_help, rect(m + bw + gap, y, inner - bw - gap, 26), true);
     y += 32;
 
     // 预览缩略图（固定 160×100，规格值）+ 右侧的【开始录制】
@@ -297,15 +290,17 @@ fn compute_layout(app: &App, cw: i32) -> (Vec<(HWND, RECT, bool)>, RECT, i32) {
     y += 28;
     push(c.lbl_thr, rect(m + 8, y, 120, 22), true);
     push(c.cmb_sens, rect(m + 132, y, 80, 22), true);
-    y += 26;
-    push(c.hint_sens, rect(m + 8, y, inner - 16, 16), true);
-    y += 22;
+    // 说明紧跟在选择框后面（按用户要求，不再单独占一行）
+    push(
+        c.hint_sens,
+        rect(m + 132 + 80 + 8, y, inner - 132 - 80 - 8, 22),
+        true,
+    );
+    y += 28;
 
     // 导出视频参数（不折叠，直接显示）。播放帧率（固定 30fps）与画质（固定中）
-    // 不再提供选择，按用户要求从界面移除。
+    // 不再提供选择，按用户要求从界面移除；缓存提示也去掉，改为最下方的按钮。
     push(c.hdr_exp, rect(m, y, inner, 22), false);
-    push(c.tip, rect(m + 8, y, inner - 16, 32), true);
-    y += 34;
     push(c.chk_clean, rect(m + 8, y, inner - 16, 20), true);
     y += 24;
     push(c.lbl_out, rect(m + 8, y, 40, 20), true);
@@ -324,10 +319,10 @@ fn compute_layout(app: &App, cw: i32) -> (Vec<(HWND, RECT, bool)>, RECT, i32) {
     let by = y.max(0) + 2;
     push(c.progress, rect(m, by, inner - 76, 20), true);
     push(c.btn_cancel, rect(cw - m - 64, by, 64, 24), true);
-    // 状态栏：贴窗口最底部、整宽（最后一行）
-    let status_h = 20;
-    let need = by + 26 + status_h;
-    push(c.state, rect(0, need - status_h, cw, status_h), true);
+    // 最下方：清理缓存按钮（替换原来的状态栏；点击打开缓存文件夹）
+    let cy = by + 26;
+    push(c.btn_clean, rect(m + 8, cy, inner - 16, 24), true);
+    let need = cy + 30;
 
     (out, prev, need)
 }
@@ -514,7 +509,6 @@ impl App {
             bar: std::ptr::null_mut(),
             enc: None,
             relayouting: false,
-            preview_win: std::ptr::null_mut(),
             preview_err: None,
             preview_size: (0, 0),
             pick_where: None,
@@ -531,7 +525,6 @@ impl App {
         let mut c = Ctl::default();
         c.title = mk(h, "Static", "CanLapse · 画布缩时录屏", ws, 0, f);
         c.btn_pick = mk(h, "Button", "🎯 拾取窗口", ws, ID_PICK, f);
-        c.btn_preview = mk(h, "Button", "🔍 预览窗口", ws, ID_PREVIEW, f);
         c.btn_help = mk(h, "Button", "❓ 如何定位窗口", ws, ID_HELP, f);
         c.status = mk(h, "Static", "", ws, ID_STATUS, f);
 
@@ -550,17 +543,9 @@ impl App {
             SendMessageW(c.cmb_sens, 0x0143, 0, s.as_ptr() as isize);
         }
         SendMessageW(c.cmb_sens, 0x014E, SENS_DEFAULT, 0); // CB_SETCURSEL = 3（第 4 档 = 0.01）
-        c.hint_sens = mk(h, "Static", "画布越大，需要越精细", ws, ID_HINT_SENS, f);
+        c.hint_sens = mk(h, "Static", "画布越大越精细", ws, ID_HINT_SENS, f);
 
         c.hdr_exp = mk(h, "Button", "▶ 导出视频参数", ws, ID_HDR_EXP, f);
-        c.tip = mk(
-            h,
-            "Static",
-            "💡提示：如果取消勾选「合成成功自动清理缓存」，帧图片会保留在缓存目录，占用磁盘空间，请记得定期手动删除缓存。",
-            ws,
-            ID_TIP,
-            f,
-        );
         c.chk_clean = mk(h, "Button", "合成成功自动清理缓存", ws | 0x0000_0003, ID_CHK_CLEAN, f);
         SendMessageW(c.chk_clean, 0x00F1, 1, 0); // BM_SETCHECK = BST_CHECKED
         c.lbl_out = mk(h, "Static", "输出", ws, ID_LBL_OUT, f);
@@ -573,7 +558,6 @@ impl App {
         c.btn_open = mk(h, "Button", "打开文件夹", ws, ID_OPEN_DIR, f);
         c.btn_delete = mk(h, "Button", "删除", ws, ID_DELETE, f);
 
-        c.state = mk(h, "Static", "", ws, ID_STATE, f);
         // 【开始录制】用 Static 而非常规按钮：带视觉主题的按钮会忽略 WM_CTLCOLORBTN，
         // 而静态控件认 WM_CTLCOLORSTATIC，才能可靠地画成绿底白字。
         // SS_CENTER(0x1) | SS_NOTIFY(0x100) | SS_CENTERIMAGE(0x200)
@@ -587,6 +571,7 @@ impl App {
         );
         c.progress = mk(h, "msctls_progress32", "", ws, ID_PROGRESS, f);
         c.btn_cancel = mk(h, "Button", "取消合成", ws, ID_CANCEL, f);
+        c.btn_clean = mk(h, "Button", "请及时清理缓存", ws, ID_BTN_CLEAN, f);
         SendMessageW(c.progress, PBM_SETRANGE32, 0, 100);
         self.ctl = c;
 
@@ -608,7 +593,7 @@ impl App {
         for h in [c.lbl_fps, c.cmb_recfps, c.lbl_thr, c.cmb_sens, c.hint_sens] {
             show(h, self.rec_open);
         }
-        for h in [c.tip, c.chk_clean, c.lbl_out, c.edit_out, c.btn_out] {
+        for h in [c.chk_clean, c.lbl_out, c.edit_out, c.btn_out] {
             show(h, self.exp_open);
         }
         for h in [c.list, c.btn_reexport, c.btn_open, c.btn_delete] {
@@ -727,7 +712,12 @@ impl App {
             match id {
                 ID_PICK => self.do_pick(),
                 ID_HELP => self.show_help(),
-                ID_PREVIEW => self.show_big_preview(),
+                ID_BTN_CLEAN => {
+                    // 打开缓存根目录，让用户自己清理（替代原来的"提示"文字）
+                    let root = default_cache_root();
+                    let _ = std::fs::create_dir_all(&root);
+                    open_folder(&root);
+                }
                 ID_HDR_REC => {
                     self.rec_open = !self.rec_open;
                     self.update_headers();
@@ -816,7 +806,7 @@ impl App {
         logline!("[pick] 主窗口已最小化，进入拾取");
         // 说明清楚：拾取时 CanLapse 已最小化到任务栏（点不到），唯一该点的是画布边框。
         let t = win::wide("请点击画布边框（CanLapse 已最小化到任务栏；Esc 取消）");
-        SetWindowTextW(self.ctl.state, t.as_ptr());
+        SetWindowTextW(self.ctl.status, t.as_ptr());
         UpdateWindow(self.hwnd);
 
         let hint = win::pick_hint_create("请点击画布边框");
@@ -837,7 +827,7 @@ impl App {
             logline!("[pick] 拾取取消（Esc / 主窗口被恢复 / 点在本程序窗口上）");
             self.refresh_labels();
             let t = win::wide("已取消拾取，请重新点【拾取窗口】");
-            SetWindowTextW(self.ctl.state, t.as_ptr());
+            SetWindowTextW(self.ctl.status, t.as_ptr());
             return;
         };
         // ⚠️ 这里**不要**把目标"统一解析到顶层窗口"。
@@ -879,7 +869,7 @@ impl App {
                 logline!("[pick] 建抓帧器失败：{e}");
                 self.preview = None;
                 let t = win::wide(&format!("无法抓取该窗口：{e}　请重新拾取"));
-                SetWindowTextW(self.ctl.state, t.as_ptr());
+                SetWindowTextW(self.ctl.status, t.as_ptr());
                 InvalidateRect(self.hwnd, &self.preview_rect, 0);
                 return;
             }
@@ -924,50 +914,11 @@ impl App {
              Photoshop：拖拽画布标签向外拉出，脱离主框架\n\
              CSP / 优动漫 PAINT：拖拽画布标签分离，或 视图 → 新建视图\n\
              Krita：窗口 → 新建窗口\n\n\
-             💡提示：拾取后查看预览窗口，如果画面包含工具栏 / 图层面板，说明画布没有浮动。\n\n\
+             💡提示：拾取后看左上角的预览缩略图，如果画面包含工具栏 / 图层面板，说明画布没有浮动。\n\n\
              ℹ️ 关于遮挡：绘画软件**自己的**浮动面板（SAI2 的「颜色」等）若压在画布上，\n\
              会照原样录进画面 —— 这是正常的，**不做裁切、也不提示**。\n\
              而当你切到**其他软件**时，说明此刻没有在画画，录制会**自动暂停**，切回画布即继续。",
         );
-    }
-
-    unsafe fn show_big_preview(&mut self) {
-        let Some(frame) = &self.preview else {
-            message(self.hwnd, "预览", "还没有拾取窗口，先点【🎯 拾取窗口】。");
-            return;
-        };
-        // 弹出一个可缩放的大图窗口，等比铺满客户区
-        let (w, h) = (frame.width, frame.height);
-        let scale = 2.0f64.min(900.0 / w as f64).max(0.2);
-        let (ww, wh) = ((w as f64 * scale) as i32 + 20, (h as f64 * scale) as i32 + 50);
-        if !self.preview_win.is_null() && IsWindow(self.preview_win) != 0 {
-            DestroyWindow(self.preview_win);
-        }
-        let c = cls(PREVIEW_CLASS);
-        let t = win::wide("预览窗口（等比缩放）");
-        let hwnd = CreateWindowExW(
-            0,
-            c.as_ptr(),
-            t.as_ptr(),
-            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE | WS_THICKFRAME,
-            200,
-            150,
-            ww,
-            wh,
-            self.hwnd,
-            std::ptr::null_mut(),
-            win::module_handle(),
-            std::ptr::null(),
-        );
-        if !hwnd.is_null() {
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, self as *mut App as isize);
-            ShowWindow(hwnd, SW_SHOW);
-            UpdateWindow(hwnd);
-            // 必须主动提到前台：否则会创建在绘画软件**后面**，用户以为"预览打不开"
-            // （实测踩过：截图抓到的是压在上面的别的窗口）
-            SetForegroundWindow(hwnd);
-        }
-        self.preview_win = hwnd;
     }
 
     unsafe fn choose_output(&mut self) {
@@ -1148,7 +1099,7 @@ impl App {
             finished.store(true, Ordering::SeqCst);
         });
         let t = win::wide("正在准备合成…");
-        SetWindowTextW(self.ctl.state, t.as_ptr());
+        SetWindowTextW(self.ctl.status, t.as_ptr());
         self.ui_set_encoding();
         SetTimer(self.hwnd, TIMER_UI, 200, None);
     }
@@ -1225,7 +1176,7 @@ impl App {
                 "视频合成中… 已处理：{} / {} 帧",
                 done, total
             ));
-            SetWindowTextW(self.ctl.state, t.as_ptr());
+            SetWindowTextW(self.ctl.status, t.as_ptr());
             if e.finished.load(Ordering::SeqCst) {
                 let outcome = e.outcome.lock().ok().and_then(|mut o| o.take());
                 let out = e.out.clone();
@@ -1357,7 +1308,8 @@ impl App {
         ShowWindow(self.ctl.btn_record, SW_SHOW);
         ShowWindow(self.ctl.progress, 0);
         ShowWindow(self.ctl.btn_cancel, 0);
-        SetWindowTextW(self.ctl.state, [0u16].as_ptr());
+        // 恢复"已选中画布窗口…"这类常态信息（底部状态栏已移除，信息显示在这一行）
+        self.refresh_labels();
     }
 
     unsafe fn ui_set_recording(&self) {
@@ -1365,7 +1317,7 @@ impl App {
         ShowWindow(self.ctl.progress, 0);
         ShowWindow(self.ctl.btn_cancel, 0);
         let t = win::wide("录制中…主窗口已最小化，请使用悬浮操作条（暂停 / 标记 / 停止）");
-        SetWindowTextW(self.ctl.state, t.as_ptr());
+        SetWindowTextW(self.ctl.status, t.as_ptr());
     }
 
     unsafe fn ui_set_encoding(&self) {
@@ -1540,79 +1492,6 @@ pub fn open_folder(dir: &std::path::Path) {
         .spawn();
 }
 
-const PREVIEW_CLASS: &str = "CanLapseBigPreview";
-
-unsafe extern "system" fn preview_proc_inner(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
-    match msg {
-        WM_PAINT => {
-            let app = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App;
-            let mut ps: PAINTSTRUCT = std::mem::zeroed();
-            let hdc = BeginPaint(hwnd, &mut ps);
-            if !app.is_null() {
-                if let Some(frame) = &(*app).preview {
-                    let mut cr: RECT = std::mem::zeroed();
-                    GetClientRect(hwnd, &mut cr);
-                    let (cw, ch) = (cr.right, cr.bottom);
-                    let scale = f64::min(cw as f64 / frame.width as f64, ch as f64 / frame.height as f64);
-                    let dw = (frame.width as f64 * scale) as i32;
-                    let dh = (frame.height as f64 * scale) as i32;
-                    let bmi = BITMAPINFO {
-                        bmiHeader: BITMAPINFOHEADER {
-                            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                            biWidth: frame.width,
-                            biHeight: -frame.height,
-                            biPlanes: 1,
-                            biBitCount: 32,
-                            biCompression: BI_RGB,
-                            biSizeImage: 0,
-                            biXPelsPerMeter: 0,
-                            biYPelsPerMeter: 0,
-                            biClrUsed: 0,
-                            biClrImportant: 0,
-                        },
-                        bmiColors: [RGBQUAD { rgbBlue: 0, rgbGreen: 0, rgbRed: 0, rgbReserved: 0 }],
-                    };
-                    StretchDIBits(
-                        hdc,
-                        (cw - dw) / 2,
-                        (ch - dh) / 2,
-                        dw,
-                        dh,
-                        0,
-                        0,
-                        frame.width,
-                        frame.height,
-                        frame.bgra.as_ptr() as *const _,
-                        &bmi,
-                        DIB_RGB_COLORS,
-                        SRCCOPY,
-                    );
-                }
-            }
-            EndPaint(hwnd, &ps);
-            0
-        }
-        WM_DESTROY => 0,
-        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
-    }
-}
-
-unsafe extern "system" fn preview_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        preview_proc_inner(hwnd, msg, wparam, lparam)
-    })) {
-        Ok(v) => v,
-        Err(e) => {
-            logline!("[panic] preview_proc msg=0x{msg:X}: {}", panic_msg(&e));
-            0
-        }
-    }
-}
 
 /// 启动 GUI（阻塞到窗口关闭）
 pub fn run(initial_target: Option<isize>) -> i32 {
@@ -1716,14 +1595,11 @@ pub fn run(initial_target: Option<isize>) -> i32 {
             windows_sys::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
         );
 
-        // 注册主窗口类与预览窗口类
-        for (name, proc_) in [
-            (
-                MAIN_CLASS,
-                wndproc as unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
-            ),
-            (PREVIEW_CLASS, preview_proc),
-        ] {
+        // 注册主窗口类（大预览窗口已按用户要求移除）
+        for (name, proc_) in [(
+            MAIN_CLASS,
+            wndproc as unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
+        )] {
             let c = cls(name);
             let brush = windows_sys::Win32::Graphics::Gdi::CreateSolidBrush(0x00F0_F0F0);
             let wc = WNDCLASSW {
