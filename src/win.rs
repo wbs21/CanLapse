@@ -19,8 +19,9 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, EnumWindows, GetAncestor, GetClassNameW, GetClientRect, GetCursorPos,
-    GetParent, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow,
-    IsWindowVisible, MSG, PM_REMOVE, PeekMessageW, TranslateMessage, WindowFromPoint, GA_ROOT,
+    GetParent, GetWindow, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
+    IsWindow, IsWindowVisible, MSG, PM_REMOVE, PeekMessageW, TranslateMessage, WindowFromPoint,
+    GA_ROOT, GW_OWNER,
 };
 
 pub fn wide(s: &str) -> Vec<u16> {
@@ -324,6 +325,84 @@ pub fn sanitize_name(name: &str) -> String {
     }
 }
 
+/// 统计画布区域被"**同属主**的其他窗口"遮住的比例（0.0~1.0）。
+///
+/// 为什么需要它 —— 这是实测得出的重要事实：
+/// * DWM 缩略图会把**被该窗口拥有（owned）的窗口一起渲染**。SAI2 的浮动面板
+///   （「颜色」等）的 `GW_OWNER` 就是主窗口，所以它们**会出现在画布里**；
+///   而别的软件的窗口不属于这个属主组，因此不会串进来 ——
+///   用户观察到的"自家面板能录进、别家窗口录不进"正是这个原因。
+/// * 被面板盖住的那部分画布像素，应用**根本没有绘制到任何地方**，
+///   所以没有任何抓帧方式能把它拿回来。产品能做的是**如实提醒用户移开面板**，
+///   而不是假装能录到。
+///
+/// `crop` 是相对 `root` 客户区原点的矩形 `(x, y, w, h)`。
+pub fn covered_ratio(root: HWND, crop: (i32, i32, i32, i32)) -> f32 {
+    let (cx, cy, cw, ch) = crop;
+    if cw <= 0 || ch <= 0 {
+        return 0.0;
+    }
+    // 用一个粗网格做并集，避免多块面板互相重叠时把面积重复计算
+    const GRID: i32 = 64;
+    let mut cells = vec![false; (GRID * GRID) as usize];
+    unsafe {
+        let mut owned: Vec<RECT> = Vec::new();
+        let root_for_cb = root;
+        unsafe extern "system" fn cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
+            let out = &mut *(lparam as *mut (HWND, Vec<RECT>));
+            let (root, list) = out;
+            if IsWindowVisible(hwnd) == 0 || IsIconic(hwnd) != 0 {
+                return 1;
+            }
+            // 只看"被 root 拥有"的顶层窗口（GetWindow(GW_OWNER)）
+            let owner = GetWindow(hwnd, GW_OWNER);
+            if owner != *root {
+                return 1;
+            }
+            let mut rc: RECT = std::mem::zeroed();
+            if GetWindowRect(hwnd, &mut rc) == 0 {
+                return 1;
+            }
+            // 转成 root 客户区坐标
+            let mut tl = POINT { x: rc.left, y: rc.top };
+            let mut br = POINT { x: rc.right, y: rc.bottom };
+            windows_sys::Win32::Graphics::Gdi::ScreenToClient(*root, &mut tl);
+            windows_sys::Win32::Graphics::Gdi::ScreenToClient(*root, &mut br);
+            list.push(RECT { left: tl.x, top: tl.y, right: br.x, bottom: br.y });
+            1
+        }
+        let mut state = (root_for_cb, owned);
+        EnumWindows(
+            Some(cb),
+            &mut state as *mut (HWND, Vec<RECT>) as LPARAM,
+        );
+        owned = state.1;
+
+        for rc in &owned {
+            // 与裁剪矩形求交
+            let l = rc.left.max(cx);
+            let t = rc.top.max(cy);
+            let r = rc.right.min(cx + cw);
+            let b = rc.bottom.min(cy + ch);
+            if r <= l || b <= t {
+                continue;
+            }
+            // 映射到网格
+            let gx0 = ((l - cx) as i64 * GRID as i64 / cw as i64).clamp(0, GRID as i64 - 1) as i32;
+            let gx1 = ((r - cx) as i64 * GRID as i64 / cw as i64).clamp(0, GRID as i64) as i32;
+            let gy0 = ((t - cy) as i64 * GRID as i64 / ch as i64).clamp(0, GRID as i64 - 1) as i32;
+            let gy1 = ((b - cy) as i64 * GRID as i64 / ch as i64).clamp(0, GRID as i64) as i32;
+            for gy in gy0..gy1 {
+                for gx in gx0..gx1 {
+                    cells[(gy * GRID + gx) as usize] = true;
+                }
+            }
+        }
+    }
+    let hit = cells.iter().filter(|c| **c).count();
+    hit as f32 / (GRID * GRID) as f32
+}
+
 /// 供 capture 模块建宿主窗口用
 pub fn module_handle() -> *mut c_void {
     unsafe { GetModuleHandleW(null()) }
@@ -423,6 +502,68 @@ mod tests {
     fn 空名字有兜底() {
         assert_eq!(sanitize_name("   "), "未命名");
         assert_eq!(sanitize_name("..."), "未命名");
+    }
+
+    /// 「画布被自家面板遮挡」的检测：属主窗口覆盖面积比例。
+    /// 实测背景：DWM 缩略图会连同**被拥有（owned）的窗口**一起渲染，
+    /// 所以 SAI2 的浮动面板会出现在画布里；被盖住的像素应用根本没画，抓不回来 ——
+    /// 产品能做的是如实提醒，这个函数就是提醒的依据。
+    #[test]
+    fn 属主窗口遮挡比例可计算() {
+        unsafe {
+            use windows_sys::Win32::UI::WindowsAndMessaging::{
+                CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, SetWindowPos,
+                SWP_NOACTIVATE, SWP_NOZORDER, WNDCLASSW, WS_CHILD, WS_POPUP, WS_VISIBLE,
+            };
+            let hinst = module_handle();
+            let mk = |n: &str| -> Vec<u16> {
+                let w = wide(n);
+                let wc = WNDCLASSW {
+                    style: 0,
+                    lpfnWndProc: Some(DefWindowProcW),
+                    cbClsExtra: 0,
+                    cbWndExtra: 0,
+                    hInstance: hinst,
+                    hIcon: null_mut(),
+                    hCursor: null_mut(),
+                    hbrBackground: null_mut(),
+                    lpszMenuName: null(),
+                    lpszClassName: w.as_ptr(),
+                };
+                RegisterClassW(&wc);
+                w
+            };
+            let pc = mk("CanLapseCovRoot");
+            let root = CreateWindowExW(
+                0, pc.as_ptr(), wide("root").as_ptr(), WS_POPUP | WS_VISIBLE,
+                100, 100, 800, 600, null_mut(), null_mut(), hinst, null(),
+            );
+            let cc = mk("CanLapseCovChild");
+            let child = CreateWindowExW(
+                0, cc.as_ptr(), wide("child").as_ptr(), WS_CHILD | WS_VISIBLE,
+                50, 60, 400, 400, root, null_mut(), hinst, null(),
+            );
+            // 被 root 拥有的弹窗，盖在 child 左上 100x200 处
+            let oc = mk("CanLapseCovOwned");
+            let owned = CreateWindowExW(
+                0, oc.as_ptr(), wide("owned").as_ptr(), WS_POPUP | WS_VISIBLE,
+                150, 160, 100, 200, root, null_mut(), hinst, null(),
+            );
+            SetWindowPos(
+                owned, null_mut(), 150, 160, 100, 200,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+            let crop = crop_rect_in_root(child, root).unwrap();
+            let ratio = covered_ratio(root, crop);
+            // 100x200 / (400x400) = 12.5%
+            assert!(
+                (ratio - 0.125).abs() < 0.02,
+                "遮挡比例应约 12.5%，实测 {ratio}"
+            );
+            DestroyWindow(owned);
+            DestroyWindow(child);
+            DestroyWindow(root);
+        }
     }
 
     /// 需求「跟随窗口缩放」的几何验证：裁剪矩形必须随子窗口移动/缩放而变。
