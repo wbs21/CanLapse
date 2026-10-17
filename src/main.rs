@@ -9,14 +9,14 @@ mod capture;
 mod encode;
 mod frame;
 mod png_io;
+mod recorder;
 mod session;
+mod ui;
 mod win;
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use capture::ThumbnailCapture;
-use frame::Frame;
 use session::Session;
 
 fn cache_root() -> PathBuf {
@@ -70,6 +70,8 @@ fn help() {
         r#"CanLapse —— 画布窗口缩时录屏工具（{version}）
 
 用法:
+  canlapse                                         启动图形界面（等同双击 exe）
+  canlapse gui [--hwnd 0x… | --title 子串]         启动图形界面并预先指定目标窗口
   canlapse list                                    列出可见顶层窗口（挑目标用）
   canlapse pick                                    鼠标拾取画布窗口并打印结果
   canlapse record [目标] [选项]                     开始录制（抓帧到缓存目录）
@@ -201,29 +203,11 @@ fn cmd_record(a: RecordArgs) -> i32 {
     };
     println!("目标: {}", info.label());
 
-    let mut cap = match ThumbnailCapture::new(info.hwnd) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("建立抓帧失败: {e}");
-            return 2;
-        }
-    };
-    let (cw, ch) = cap.size();
-    println!("抓帧就绪: {cw}x{ch}（1:1，宿主窗口在屏幕外，不影响你操作）");
-
     let root = a.out.clone().unwrap_or_else(cache_root);
     let name = a
         .name
         .clone()
         .unwrap_or_else(|| if info.process.is_empty() { "画布".into() } else { info.process.clone() });
-    let mut sess = match Session::create(&root, &name, &info, cw, ch, a.fps, a.threshold) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("{e}");
-            return 2;
-        }
-    };
-    println!("会话目录: {}", sess.dir().display());
     println!(
         "录制参数: 帧密度 {}/s，差异阈值 {:.3}。按 Esc 停止{}。",
         a.fps,
@@ -238,188 +222,88 @@ fn cmd_record(a: RecordArgs) -> i32 {
          录制中尽量不要缩小画布窗口（画布变小、后续帧会被拉伸放大，画面会糊；变大则会被缩小）。"
     );
 
-    let interval = Duration::from_secs_f64(1.0 / a.fps);
+    // 抓帧/差分/分辨率统一都在录制线程里做（GDI 有线程亲和性，且不能阻塞 UI）。
+    // 这里只负责：把按键转成线程指令 + 打印进度。
+    let cfg = recorder::RecorderConfig {
+        hwnd: info.hwnd as isize,
+        root,
+        name,
+        fps: a.fps,
+        threshold: a.threshold,
+        fill_rgb: [0, 0, 0],
+    };
+    let shared = recorder::Shared::new();
+    let worker = recorder::spawn(cfg, shared.clone());
     let start = Instant::now();
-    let mut last_saved: Option<Frame> = None;
-    // 分辨率统一：**第一张保存的帧**决定视频分辨率（base_size），
-    // 之后所有帧都等比缩放 + 居中 + 黑边填充到这个尺寸再落盘。
-    // 注意差分始终用**原始捕获帧**，不能用填充后的图（黑边会干扰差分、放大误触发）。
-    let mut base_size: Option<(i32, i32)> = None;
-    let mut dropped: u32 = 0;
-    let mut skipped: u32 = 0; // 因"画面没变"而没存帧的采样次数
-    let mut blank_warned = false;
-    let mut completed = true;
-    let mut next_tick = Instant::now();
+    let mut seen_markers = 0u32;
+    let mut stop_sent = false;
 
     loop {
-        if !cap.source_alive() {
-            println!("\n画布窗口已关闭，结束录制。");
-            completed = false;
-            break;
-        }
-        if win::escape_pressed() {
+        win::pump();
+        if !stop_sent && win::escape_pressed() {
             println!("\n收到 Esc，结束录制。");
-            break;
+            shared.request_stop();
+            stop_sent = true;
         }
-        // 🏷 标记（规格里的悬浮条按钮；命令行阶段用 F8）
         if win::marker_key_pressed() {
-            let ms = start.elapsed().as_millis() as u64;
-            sess.add_marker(None, ms);
-            println!(
-                "\n已打标记 #{}：第 {} 帧处，{:.1} 秒",
-                sess.marker_count(),
-                sess.frame_count(),
-                ms as f64 / 1000.0
-            );
+            shared.request_mark();
         }
-
-        // 目标窗口尺寸变化（用户拖动了画布窗口边缘等）
-        match cap.sync_source_size() {
-            Ok(true) => {
-                let (nw, nh) = cap.size();
-                match base_size {
-                    Some((bw, bh)) => println!(
-                        "\n目标客户区尺寸变为 {nw}x{nh}，已重建抓帧；后续帧会等比适配到基准 {bw}x{bh}。"
-                    ),
-                    None => {
-                        // 基准还没确定：此时会话元信息跟随当前窗口
-                        sess.update_geometry(nw, nh);
-                        println!("\n目标客户区尺寸变为 {nw}x{nh}，已重建抓帧。");
-                    }
-                }
-                last_saved = None; // 强制下一帧保存
-            }
-            Ok(false) => {}
-            Err(e) => {
-                dropped += 1;
-                if dropped <= 3 {
-                    eprintln!("同步尺寸失败（跳过本次采样）: {e}");
-                }
-            }
-        }
-
-        match cap.grab() {
-            Ok(f) => {
-                if !blank_warned && f.is_blank() {
-                    eprintln!(
-                        "⚠ 抓到的画面是纯色。可能是缩略图失效（试试重新拾取窗口），\
-                         也可能是画布当前确实是空白。"
-                    );
-                    blank_warned = true;
-                }
-                let changed = match &last_saved {
-                    Some(prev) => f.changed_ratio(prev),
-                    None => 1.0, // 第一帧总是存
-                };
-                if changed > a.threshold {
-                    // 第一张保存帧确定基准分辨率；之后的帧统一适配到它
-                    let to_save = match base_size {
-                        None => {
-                            base_size = Some((f.width, f.height));
-                            sess.update_geometry(f.width, f.height);
-                            println!(
-                                "\n基准分辨率已确定：{}×{}（第一张保存的画面决定视频分辨率，之后所有帧都会等比适配到它）",
-                                f.width, f.height
-                            );
-                            f.clone()
-                        }
-                        Some((bw, bh)) => f.fit_into(bw, bh, [0, 0, 0]),
-                    };
-                    match sess.save_frame(&to_save) {
-                        Ok(n) => {
-                            // 差分用的始终是**原始捕获帧**，不是填充后的图
-                            last_saved = Some(f);
-                            if !a.quiet {
-                                let base = match base_size {
-                                    Some((bw, bh)) => format!("{bw}×{bh}"),
-                                    None => "-".to_string(),
-                                };
-                                print!(
-                                    "\r已录制 {n} 帧 | 基准 {base} | 变化 {:.1}% | 丢弃 {dropped} | 跳过 {skipped}   ",
-                                    changed * 100.0
-                                );
-                                use std::io::Write;
-                                let _ = std::io::stdout().flush();
-                            }
-                        }
-                        Err(e) => {
-                            dropped += 1;
-                            if dropped <= 3 {
-                                eprintln!("保存帧失败（跳过该帧，继续录制）: {e}");
-                            }
-                        }
-                    }
-                } else {
-                    skipped += 1;
-                }
-            }
-            Err(e) => {
-                // 需求：单帧失败只跳过，不中断、不崩溃
-                dropped += 1;
-                if dropped <= 3 || dropped % 100 == 0 {
-                    eprintln!("抓帧失败（第 {dropped} 次，已跳过）: {e}");
-                }
-            }
-        }
-
-        // ---- 等待下一个采样点 ----
-        // 关键：把等待切成 20ms 的小片来轮询按键。
-        // 如果直接 sleep 整个采样间隔（低帧密度下可达 1 秒），用户短按 Esc/F8 会**被整个漏掉**。
-        next_tick += interval;
-        let now = Instant::now();
-        let mut stop_requested = false;
-        if next_tick > now {
-            while Instant::now() < next_tick {
-                win::pump();
-                if win::escape_pressed() {
-                    stop_requested = true;
-                    break;
-                }
-                if win::marker_key_pressed() {
-                    let ms = start.elapsed().as_millis() as u64;
-                    sess.add_marker(None, ms);
-                    println!(
-                        "\n已打标记 #{}：第 {} 帧处，{:.1} 秒",
-                        sess.marker_count(),
-                        sess.frame_count(),
-                        ms as f64 / 1000.0
-                    );
-                }
-                let left = next_tick.saturating_duration_since(Instant::now());
-                std::thread::sleep(left.min(Duration::from_millis(20)));
-            }
-        } else {
-            next_tick = now;
-        }
-        if stop_requested {
-            println!("\n收到 Esc，结束录制。");
+        let phase = shared.phase();
+        if phase == recorder::Phase::Finished || phase == recorder::Phase::Failed {
             break;
         }
-
+        if shared.markers() != seen_markers {
+            seen_markers = shared.markers();
+            println!("\n已打标记 #{seen_markers}（第 {} 帧处）", shared.frames());
+        }
+        if !a.quiet && phase.is_running() {
+            let (bw, bh) = shared.base_size();
+            let base = if bw > 0 {
+                format!("{bw}x{bh}")
+            } else {
+                "待定".to_string()
+            };
+            print!(
+                "\r已录制 {} 帧 | 基准 {base} | 丢弃 {} | {}   ",
+                shared.frames(),
+                shared.dropped(),
+                recorder::format_duration(shared.elapsed_ms())
+            );
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+        }
         if let Some(d) = a.duration {
             if d > 0.0 && start.elapsed().as_secs_f64() >= d {
                 println!("\n达到指定时长 {d} 秒，结束录制。");
-                break;
+                shared.request_stop();
             }
         }
+        std::thread::sleep(Duration::from_millis(100));
     }
+    let _ = worker.join();
 
-    let elapsed_ms = start.elapsed().as_millis() as u64;
-    if let Err(e) = sess.finish(dropped, elapsed_ms, completed) {
-        eprintln!("{e}");
+    if let Some(e) = shared.error() {
+        eprintln!("录制失败: {e}");
         return 2;
     }
     println!(
-        "\n录制结束：{} 帧，{} 个标记，丢弃 {}，耗时 {:.1} 秒\n会话目录: {}",
-        sess.frame_count(),
-        sess.marker_count(),
-        dropped,
-        elapsed_ms as f64 / 1000.0,
-        sess.dir().display()
+        "\n录制结束：{} 帧，{} 个标记，丢弃 {}，耗时 {}",
+        shared.frames(),
+        shared.markers(),
+        shared.dropped(),
+        recorder::format_duration(shared.elapsed_ms())
     );
-    println!("下一步（接入编码器后即可用）：canlapse encode --session \"{}\" --fps 10", sess.dir().display());
+    if let Some(dir) = shared.session_dir() {
+        println!("会话目录: {}", dir.display());
+        println!(
+            "下一步：canlapse encode --session \"{}\" --fps 10",
+            dir.display()
+        );
+    }
     0
 }
+
+
 
 fn cmd_encode(args: &[String]) -> i32 {
     let mut dir: Option<PathBuf> = None;
@@ -588,13 +472,34 @@ fn cmd_doctor() -> i32 {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        help();
-        std::process::exit(0);
+        // 没有参数 = 双击启动：直接进 GUI（产品形态）
+        std::process::exit(ui::run(None));
     }
     let cmd = args[1].as_str();
     let rest: Vec<String> = args[2..].to_vec();
 
     let code = match cmd {
+        "gui" => {
+            let mut target: Option<isize> = None;
+            let mut i = 0;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--hwnd" => {
+                        if let Some(v) = next_value(&rest, &mut i) {
+                            target = parse_hex_hwnd(&v);
+                        }
+                    }
+                    "--title" => {
+                        if let Some(v) = next_value(&rest, &mut i) {
+                            target = win::find_window(&v).map(|w| w.hwnd as isize);
+                        }
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            ui::run(target)
+        }
         "list" | "--list" => cmd_list(),
         "pick" | "--pick" => cmd_pick(),
         "sessions" => cmd_sessions(&cache_root()),

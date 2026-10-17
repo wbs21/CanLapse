@@ -61,7 +61,8 @@ use windows_sys::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EnumWindows, GetClassNameW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EnumChildWindows,
+    EnumWindows, GetClassNameW,
     GetClientRect, GetSystemMetrics, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId,
     IsIconic, IsWindow, IsWindowVisible, MSG, PM_REMOVE, PW_RENDERFULLCONTENT, PeekMessageW, PostMessageW,
     RegisterClassW, SetForegroundWindow, SetTimer, SetWindowPos, SetWindowTextW, ShowWindow,
@@ -1652,6 +1653,56 @@ unsafe fn run_foreign(hwnd: HWND, out_dir: &str) -> i32 {
     0
 }
 
+/// `--tree <子串>`：递归列出匹配到的顶层窗口的**全部后代窗口**。
+/// 用途：SAI2 这类软件把画布做成子窗口，必须先看清层级才能决定抓谁。
+unsafe fn cmd_tree(spec: &str) -> i32 {
+    let Some(top) = find_by_title(spec) else {
+        eprintln!("没找到标题/类名包含 \"{spec}\" 的顶层窗口；用 --list 看看有哪些");
+        return 2;
+    };
+    let t = text_of_w(top, GetWindowTextW);
+    let c = text_of_w(top, GetClassNameW);
+    let mut rpid: u32 = 0;
+    GetWindowThreadProcessId(top, &mut rpid);
+    println!(
+        "顶层窗口 0x{:X}  进程={}  类名={}  标题=\"{}\"",
+        top as isize,
+        proc_name(rpid),
+        c,
+        t
+    );
+
+    unsafe extern "system" fn cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let top = lparam as HWND;
+        let title = text_of_w(hwnd, GetWindowTextW);
+        let class = text_of_w(hwnd, GetClassNameW);
+        let mut wr: RECT = std::mem::zeroed();
+        GetWindowRect(hwnd, &mut wr);
+        // 子窗口相对**顶层窗口客户区原点**的偏移：裁剪抓帧结果时要用
+        let mut pt = windows_sys::Win32::Foundation::POINT { x: wr.left, y: wr.top };
+        windows_sys::Win32::Graphics::Gdi::ScreenToClient(top, &mut pt);
+        let w = wr.right - wr.left;
+        let h = wr.bottom - wr.top;
+        let vis = IsWindowVisible(hwnd) != 0;
+        let iconic = IsIconic(hwnd) != 0;
+        println!(
+            "  0x{:<9X} {:<28} {:>10}  相对顶层客户区=({},{})  可见={} {}  \"{}\"",
+            hwnd as isize,
+            class,
+            format!("{w}x{h}"),
+            pt.x,
+            pt.y,
+            vis,
+            if iconic { "最小化" } else { "" },
+            title
+        );
+        1
+    }
+    EnumChildWindows(top, Some(cb), top as LPARAM);
+    println!("（以上为该顶层窗口的全部后代窗口）");
+    0
+}
+
 // ============================================================================
 
 fn main() {
@@ -1664,8 +1715,15 @@ fn main() {
     let mut mode_helper = false;
     let mut mode_cross = false;
     let mut mode_foreign = false;
+    let mut mode_tree: Option<String> = None;
     while i < args.len() {
         match args[i].as_str() {
+            "--tree" => {
+                i += 1;
+                if i < args.len() {
+                    mode_tree = Some(args[i].clone());
+                }
+            }
             "--out" => {
                 i += 1;
                 if i < args.len() {
@@ -1699,6 +1757,8 @@ fn main() {
             run_helper()
         } else if mode_cross {
             run_cross(&out_dir)
+        } else if let Some(t) = &mode_tree {
+            cmd_tree(t)
         } else if mode_list {
             cmd_list()
         } else if mode_foreign {
