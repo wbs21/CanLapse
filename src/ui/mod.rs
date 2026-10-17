@@ -740,7 +740,10 @@ impl App {
         // 置顶保证提示始终可见；半透明让我们不完全挡住下面的目标，方便点它的标题栏。
         // GWL_EXSTYLE = -20，WS_EX_LAYERED = 0x00080000，LWA_ALPHA = 0x2
         let ex = GetWindowLongPtrW(self.hwnd, -20) as i64;
-        SetWindowLongPtrW(self.hwnd, -20, (ex | 0x0008_0000) as isize);
+        // 同时加 WS_EX_LAYERED(0x80000) 与 WS_EX_TRANSPARENT(0x20)：
+        // 后者让**鼠标穿透**，否则我们这块置顶面板会把点击全吃掉，
+        // 而拾取逻辑又忽略"自己进程的窗口" -> 点了也永远没有候选（实测踩过）。
+        SetWindowLongPtrW(self.hwnd, -20, (ex | 0x0008_0000 | 0x0000_0020) as isize);
         windows_sys::Win32::UI::WindowsAndMessaging::SetLayeredWindowAttributes(
             self.hwnd, 0, 190, 0x0000_0002,
         );
@@ -766,7 +769,8 @@ impl App {
         // SWP_NOMOVE|NOSIZE
         SetWindowPos(self.hwnd, std::ptr::null_mut(), 0, 0, 0, 0, 0x0002 | 0x0001);
         let ex2 = GetWindowLongPtrW(self.hwnd, -20) as i64;
-        SetWindowLongPtrW(self.hwnd, -20, (ex2 & !0x0008_0000) as isize); // 去掉 WS_EX_LAYERED
+        // 去掉 LAYERED 与 TRANSPARENT，恢复正常可点击
+        SetWindowLongPtrW(self.hwnd, -20, (ex2 & !(0x0008_0000 | 0x0000_0020)) as isize);
         ShowWindow(self.hwnd, SW_RESTORE);
         SetForegroundWindow(self.hwnd);
         InvalidateRect(self.hwnd, std::ptr::null(), 1);
