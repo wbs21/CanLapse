@@ -110,6 +110,10 @@ struct EncState {
     outcome: Arc<Mutex<Option<Result<EncodeOutcome, String>>>>,
     out: PathBuf,
     session: PathBuf,
+    /// 合成成功后是否清理该会话缓存。
+    /// **重新导出时必须为 false** —— 实测踩过：重新导出的输出默认落在会话目录里，
+    /// 清缓存会把刚导出的视频一起删掉，表现为"重新导出没产出文件"。
+    clean_after: bool,
 }
 
 #[derive(Default)]
@@ -866,11 +870,13 @@ impl App {
             message(self.hwnd, "录制结束", "这次没有保存到任何帧（画面可能始终没有变化）。");
             return;
         }
-        // 规格：停止录制 → 进入视频合成流程
-        self.start_encoding(dir, self.out_path.clone());
+        // 规格：停止录制 → 进入视频合成流程（这条路径才适用"合成成功自动清理缓存"）
+        let out = self.out_path.clone();
+        let clean = self.auto_clean;
+        self.start_encoding(dir, out, clean);
     }
 
-    unsafe fn start_encoding(&mut self, session: PathBuf, out: PathBuf) {
+    unsafe fn start_encoding(&mut self, session: PathBuf, out: PathBuf, clean_after: bool) {
         let progress = Arc::new(AtomicU32::new(0));
         let total = Arc::new(AtomicU32::new(0));
         let cancel = Arc::new(AtomicBool::new(false));
@@ -884,6 +890,7 @@ impl App {
             outcome: outcome.clone(),
             out: out.clone(),
             session: session.clone(),
+            clean_after,
         };
         self.enc = Some(st);
         let opts = EncodeOptions {
@@ -919,8 +926,15 @@ impl App {
             return;
         };
         let dir = s.dir.clone();
-        let out = dir.join("timelapse.mp4");
-        self.start_encoding(dir, out);
+        // 输出放在会话目录**外面**，并带帧率后缀，避免与"重新导出/清缓存"互相踩：
+        // 旧写法 out = dir/timelapse.mp4 + 自动清理 = 刚导出的视频被自己删掉。
+        let stem = s.name.clone();
+        let out = dir
+            .parent()
+            .map(|p| p.join(format!("{stem}_{}fps.mp4", self.export_fps as i32)))
+            .unwrap_or_else(|| dir.join("timelapse.mp4"));
+        // 重新导出面向的是"已有缓存"，不应该清理它
+        self.start_encoding(dir, out, false);
     }
 
     unsafe fn delete_selected(&mut self) {
@@ -983,6 +997,7 @@ impl App {
                 let outcome = e.outcome.lock().ok().and_then(|mut o| o.take());
                 let out = e.out.clone();
                 let session = e.session.clone();
+                let clean_after = e.clean_after;
                 self.enc = None;
                 SendMessageW(self.ctl.progress, PBM_SETPOS, 0, 0);
                 self.ui_set_idle();
@@ -997,7 +1012,7 @@ impl App {
                             s.seconds,
                             out.display()
                         );
-                        if self.auto_clean {
+                        if clean_after {
                             // 规格：合成成功自动清理缓存（默认勾选）
                             if Session::delete(&session).is_ok() {
                                 self.refresh_session_list();
