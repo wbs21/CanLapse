@@ -2,7 +2,8 @@
 
 use std::ffi::c_void;
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::Once;
 use std::time::Duration;
 
 use crate::logline;
@@ -10,7 +11,11 @@ use crate::logline;
 use windows_sys::core::BOOL;
 use windows_sys::Win32::Foundation::{CloseHandle, HWND, LPARAM, LRESULT, POINT, RECT, SYSTEMTIME, WPARAM};
 // 注意：ClientToScreen 在 Graphics::Gdi 下，不在 WindowsAndMessaging（实测踩过）。
-use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
+use windows_sys::Win32::Graphics::Gdi::{
+    BeginPaint, ClientToScreen, CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint,
+    FillRect, FrameRect, SelectObject, SetBkMode, SetTextColor, DEFAULT_CHARSET, HGDIOBJ,
+    PAINTSTRUCT,
+};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::SystemInformation::GetLocalTime;
 use windows_sys::Win32::System::Threading::{
@@ -20,11 +25,13 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, VK_ESCAPE, VK_F8, VK_LBUTTON,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DispatchMessageW, EnumWindows, GetAncestor, GetClassNameW, GetClientRect,
-    GetCursorPos, GetForegroundWindow, GetParent, GetWindow, GetWindowRect, GetWindowTextW,
-    GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, MSG, MSLLHOOKSTRUCT, PM_REMOVE,
-    PeekMessageW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WindowFromPoint,
-    GA_ROOT, GW_OWNER, HHOOK, WH_MOUSE_LL, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    CallNextHookEx, CreateWindowExW, DefWindowProcW, DispatchMessageW, EnumWindows,
+    GetAncestor, GetClassNameW, GetClientRect, GetCursorPos, GetForegroundWindow, GetParent,
+    GetSystemMetrics, GetWindow, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId,
+    IsIconic, IsWindow, IsWindowVisible, MSG, MSLLHOOKSTRUCT, PM_REMOVE, PeekMessageW,
+    RegisterClassW, SetLayeredWindowAttributes, SetWindowPos, SetWindowsHookExW, ShowWindow,
+    TranslateMessage, UnhookWindowsHookEx, WindowFromPoint, GA_ROOT, GW_OWNER, HHOOK,
+    SW_SHOWNOACTIVATE, WH_MOUSE_LL, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_PAINT, WNDCLASSW, WS_POPUP,
 };
 
 pub fn wide(s: &str) -> Vec<u16> {
@@ -227,59 +234,125 @@ fn key_down(vk: u16) -> bool {
     unsafe { (GetAsyncKeyState(vk as i32) as u16) & 0x8000 != 0 }
 }
 
-/// 拾取时跟随鼠标的提示条（Win32 tooltip）。
+/// 拾取时跟随鼠标的提示条 —— **自绘的置顶小窗**。
 ///
-/// 为什么用 tooltip 而不是自建窗口：tooltip 天生**鼠标穿透、不抢焦点**，
-/// 不会挡住用户要点的那条边框 —— 自建窗口必须自己加 WS_EX_TRANSPARENT，容易漏。
-pub fn pick_hint_create(owner: HWND, text: &str) -> HWND {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, SendMessageW, WS_POPUP,
-    };
-    // 自己按 ABI 定义 TOOLINFOW，避免去猜它落在哪个模块
-    #[repr(C)]
-    struct ToolInfo {
-        cb_size: u32,
-        flags: u32,
-        hwnd: HWND,
-        id: usize,
-        rect: RECT,
-        inst: isize,
-        text: *mut u16,
-        lparam: isize,
-        reserved: *mut core::ffi::c_void,
+/// 为什么不用 Win32 tooltip：实测在本场景它**根本显示不出来**
+/// （owner 已最小化 + TTF_TRACK + 进程无焦点；截图确认光标旁什么都没有）。
+/// 用户看不到"要点画布"，就转而去点任务栏把主窗口叫回来，拾取随即被取消 ——
+/// 日志里两次拾取都是这么结束的。自绘窗口多写几十行，但置顶/半透明/鼠标穿透/不抢焦点
+/// 全部可控。
+const HINT_CLASS: &str = "CanLapsePickHint";
+static HINT_REG: Once = Once::new();
+const HINT_W: i32 = 340;
+const HINT_H: i32 = 46;
+
+unsafe extern "system" fn hint_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    match msg {
+        WM_PAINT => {
+            let mut ps: PAINTSTRUCT = std::mem::zeroed();
+            let hdc = BeginPaint(hwnd, &mut ps);
+            let mut rc: RECT = std::mem::zeroed();
+            GetClientRect(hwnd, &mut rc);
+            let bg = CreateSolidBrush(0x0026_1F1F);
+            FillRect(hdc, &rc, bg);
+            DeleteObject(bg as HGDIOBJ);
+            let border = CreateSolidBrush(0x0060_6060);
+            FrameRect(hdc, &rc, border);
+            DeleteObject(border as HGDIOBJ);
+            let mut buf = [0u16; 256];
+            let n = GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32);
+            if n > 0 {
+                let face = wide("Microsoft YaHei UI");
+                let font = CreateFontW(
+                    -15, 0, 0, 0, 500, 0, 0, 0, DEFAULT_CHARSET as u32, 0, 0, 0, 0, face.as_ptr(),
+                );
+                let old = SelectObject(hdc, font as HGDIOBJ);
+                SetBkMode(hdc, 1); // TRANSPARENT
+                SetTextColor(hdc, 0x00F0_F0F0);
+                let mut trc =
+                    RECT { left: 10, top: 6, right: rc.right - 10, bottom: rc.bottom - 4 };
+                // DT_CENTER | DT_VCENTER | DT_SINGLELINE
+                DrawTextW(hdc, buf.as_ptr(), n, &mut trc, 0x0000_0001 | 0x0000_0004 | 0x0000_0020);
+                SelectObject(hdc, old);
+                DeleteObject(font as HGDIOBJ);
+            }
+            EndPaint(hwnd, &mut ps);
+            0
+        }
+        _ => DefWindowProcW(hwnd, msg, wp, lp),
     }
+}
+
+/// 提示条相对光标的落点，贴到屏幕边缘时翻到另一侧
+fn hint_pos(cx: i32, cy: i32) -> (i32, i32) {
+    let (vx, vy, vw, vh) = virtual_screen();
+    let mut x = cx + 18;
+    let mut y = cy + 24;
+    if x + HINT_W > vx + vw {
+        x = cx - HINT_W - 12;
+    }
+    if y + HINT_H > vy + vh {
+        y = cy - HINT_H - 12;
+    }
+    (x.max(vx), y.max(vy))
+}
+
+fn virtual_screen() -> (i32, i32, i32, i32) {
     unsafe {
-        let cls = wide("tooltips_class32");
-        // ex: LAYERED(0x80000) | TOPMOST(0x8) | TOOLWINDOW(0x80) | TRANSPARENT(0x20)
+        (
+            GetSystemMetrics(76), // SM_XVIRTUALSCREEN
+            GetSystemMetrics(77), // SM_YVIRTUALSCREEN
+            GetSystemMetrics(78), // SM_CXVIRTUALSCREEN
+            GetSystemMetrics(79), // SM_CYVIRTUALSCREEN
+        )
+    }
+}
+
+pub fn pick_hint_create(owner: HWND, text: &str) -> HWND {
+    HINT_REG.call_once(|| unsafe {
+        let c = wide(HINT_CLASS);
+        let wc = WNDCLASSW {
+            style: 0,
+            lpfnWndProc: Some(hint_proc),
+            cbClsExtra: 0,
+            cbWndExtra: 0,
+            hInstance: module_handle(),
+            hIcon: null_mut(),
+            hCursor: null_mut(),
+            hbrBackground: null_mut(),
+            lpszMenuName: null(),
+            lpszClassName: c.as_ptr(),
+        };
+        RegisterClassW(&wc);
+    });
+    let c = wide(HINT_CLASS);
+    let t = wide(text);
+    unsafe {
+        // LAYERED | TOPMOST | TOOLWINDOW | TRANSPARENT | NOACTIVATE
         let tip = CreateWindowExW(
-            0x0008_0000 | 0x0000_0008 | 0x0000_0080 | 0x0000_0020,
-            cls.as_ptr(),
-            null(),
-            WS_POPUP | 0x0000_0003, // TTS_ALWAYSTIP|TTS_NOPREFIX
+            0x0008_0000 | 0x0000_0008 | 0x0000_0080 | 0x0000_0020 | 0x0800_0000,
+            c.as_ptr(),
+            t.as_ptr(),
+            WS_POPUP,
             0,
             0,
-            0,
-            0,
-            owner,
+            HINT_W,
+            HINT_H,
+            // ⚠️ 不能挂 owner：owner 最小化时 Windows 会把 owned 窗口一起隐藏
+            null_mut(),
             null_mut(),
             module_handle(),
             null(),
         );
         if tip.is_null() {
+            logline!("[pick] 提示条创建失败");
             return tip;
         }
-        let mut t: Vec<u16> = text.encode_utf16().collect();
-        t.push(0);
-        let mut ti: ToolInfo = std::mem::zeroed();
-        ti.cb_size = std::mem::size_of::<ToolInfo>() as u32;
-        ti.flags = 0x0020 | 0x0080; // TTF_TRACK | TTF_ABSOLUTE
-        ti.hwnd = owner;
-        ti.id = 1;
-        ti.text = t.as_mut_ptr();
-        SendMessageW(tip, 0x0432, 0, &ti as *const ToolInfo as isize); // TTM_ADDTOOLW
-        SendMessageW(tip, 0x0411, 1, &ti as *const ToolInfo as isize); // TTM_TRACKACTIVATE
+        SetLayeredWindowAttributes(tip, 0, 240, 0x2);
+        ShowWindow(tip, SW_SHOWNOACTIVATE);
         let p = cursor_position();
-        SendMessageW(tip, 0x0412, 0, pack_xy(p.0 + 18, p.1 + 22)); // TTM_TRACKPOSITION
+        let (x, y) = hint_pos(p.0, p.1);
+        SetWindowPos(tip, (-1isize) as HWND, x, y, 0, 0, 0x0001 | 0x0010);
         tip
     }
 }
@@ -290,13 +363,9 @@ pub fn pick_hint_follow(tip: HWND) {
         return;
     }
     let p = cursor_position();
+    let (x, y) = hint_pos(p.0, p.1);
     unsafe {
-        windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW(
-            tip,
-            0x0412,
-            0,
-            pack_xy(p.0 + 18, p.1 + 22),
-        );
+        SetWindowPos(tip, (-1isize) as HWND, x, y, 0, 0, 0x0001 | 0x0010);
     }
 }
 
@@ -307,10 +376,6 @@ pub fn pick_hint_destroy(tip: HWND) {
     unsafe {
         windows_sys::Win32::UI::WindowsAndMessaging::DestroyWindow(tip);
     }
-}
-
-fn pack_xy(x: i32, y: i32) -> isize {
-    ((y as isize) << 16) | (x as isize & 0xffff)
 }
 
 fn cursor_position() -> (i32, i32) {
@@ -353,7 +418,6 @@ fn cursor_window() -> HWND {
 // 我们只从坐标算出窗口，目标软件什么也收不到。
 // 顺带解决了"快速点击落在两次 60ms 轮询之间被漏掉"的问题。
 
-use std::sync::atomic::AtomicIsize;
 
 static CLICK_HWND: AtomicIsize = AtomicIsize::new(0);
 static CLICK_HIT: AtomicBool = AtomicBool::new(false);
