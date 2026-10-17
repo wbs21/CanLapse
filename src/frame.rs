@@ -35,37 +35,29 @@ impl Frame {
         Some([self.bgra[i + 2], self.bgra[i + 1], self.bgra[i]])
     }
 
-    /// 与另一帧相比，**变化像素的个数**。
-    ///
-    /// 这是差分判定的主单位：它只和"画了多少"有关，**与画布尺寸无关** ——
-    /// 同样一笔在 1080p 和 4K 上数出来一样多，阈值就不必随分辨率调整。
-    /// 尺寸不同视为"整幅都变了"，返回整幅像素数。
-    pub fn changed_pixels(&self, other: &Frame) -> u32 {
+    /// 与另一帧相比，变化像素所占比例（0.0 ~ 1.0）。
+    /// 尺寸不同视为"整幅都变了"，返回 1.0。
+    pub fn changed_ratio(&self, other: &Frame) -> f32 {
         if self.width != other.width || self.height != other.height {
-            return (self.width.max(0) as u32).saturating_mul(self.height.max(0) as u32);
+            return 1.0;
         }
-        let mut changed: u32 = 0;
+        let mut changed: usize = 0;
+        let mut total: usize = 0;
         let mut i = 0usize;
         while i + 3 < self.bgra.len() {
+            total += 1;
             let d = (self.bgra[i] as i32 - other.bgra[i] as i32).abs()
                 + (self.bgra[i + 1] as i32 - other.bgra[i + 1] as i32).abs()
                 + (self.bgra[i + 2] as i32 - other.bgra[i + 2] as i32).abs();
             if d > PIXEL_CHANGED_DELTA {
-                changed = changed.saturating_add(1);
+                changed += 1;
             }
             i += 4;
         }
-        changed
-    }
-
-    /// 与另一帧相比，变化像素所占比例（0.0 ~ 1.0）。
-    /// 尺寸不同视为"整幅都变了"，返回 1.0。
-    pub fn changed_ratio(&self, other: &Frame) -> f32 {
-        let total = (self.width.max(0) as u32).saturating_mul(self.height.max(0) as u32);
         if total == 0 {
             return 0.0;
         }
-        self.changed_pixels(other) as f32 / total as f32
+        changed as f32 / total as f32
     }
 
     /// 画面是否几乎全黑/恒定 —— 用于抓帧自检告警（见 ADR 0002 的"依赖实现行为"风险）。
@@ -251,31 +243,6 @@ mod tests {
         let a = solid(8, 8, [0, 0, 0]);
         let b = solid(4, 4, [0, 0, 0]);
         assert_eq!(a.changed_ratio(&b), 1.0);
-        // 像素单位下"整幅变化"= 整幅像素数
-        assert_eq!(a.changed_pixels(&b), 64);
-    }
-
-    #[test]
-    fn 变化像素数与画布尺寸无关() {
-        // 同样的改动量（36 个像素），在大/小画布上数出来一样多
-        let small = solid(10, 10, [0, 0, 0]); // 100 px
-        let large = solid(200, 200, [0, 0, 0]); // 40000 px
-        let mut vs = small.bgra.clone();
-        let mut vl = large.bgra.clone();
-        for i in 0..36 {
-            for v in [&mut vs, &mut vl] {
-                v[i * 4] = 255;
-                v[i * 4 + 1] = 255;
-                v[i * 4 + 2] = 255;
-            }
-        }
-        let bs = Frame::new(10, 10, vs);
-        let bl = Frame::new(200, 200, vl);
-        assert_eq!(small.changed_pixels(&bs), 36);
-        assert_eq!(large.changed_pixels(&bl), 36);
-        // 但比例差很多（正是"按比例"要随画布调整的原因）
-        assert!((small.changed_ratio(&bs) - 0.36).abs() < 1e-6);
-        assert!((large.changed_ratio(&bl) - 0.0009).abs() < 1e-6);
     }
 
     #[test]
