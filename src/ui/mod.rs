@@ -221,10 +221,11 @@ fn compute_layout(app: &App, cw: i32) -> (Vec<(HWND, RECT, bool)>, RECT, i32) {
     y += 32;
 
     // 预览缩略图（固定 160×100，规格值）+ 右侧的【开始录制】
+    // 尺寸与顶部三个按钮一致（同宽同高），并且**右对齐**到内容右边界
     let prev = rect(m, y, PREVIEW_W, PREVIEW_H);
     push(
         c.btn_record,
-        rect(m + PREVIEW_W + 14, y + PREVIEW_H / 2 - 14, 130, 28),
+        rect(cw - m - bw, y + PREVIEW_H / 2 - 13, bw, 26),
         true,
     );
     y += PREVIEW_H + 6;
@@ -590,6 +591,14 @@ impl App {
             }
         }
         self.preview_rect = prev;
+        // 【开始录制】小圆角：它是 Static（矩形），用窗口区域裁成圆角，
+        // 免得再去走 BS_OWNERDRAW 那条会崩的自绘路线。
+        {
+            let bw = (cw - 20 - 12) / 3;
+            use windows_sys::Win32::Graphics::Gdi::{CreateRoundRectRgn, SetWindowRgn};
+            let rgn = CreateRoundRectRgn(0, 0, bw + 1, 27, 8, 8);
+            SetWindowRgn(self.ctl.btn_record, rgn, 1);
+        }
         self.set_panel_visible();
 
         // 内容装不下就把窗口长高（规格给了最小尺寸，说明窗口可变）
