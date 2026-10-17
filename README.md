@@ -2,7 +2,7 @@
 
 > 面向手绘创作者（SAI2 > Photoshop > CLIP STUDIO PAINT > Krita）的 **Windows 画布窗口缩时录屏工具**。
 
-当前状态：**v1.0 功能完整、四款软件实测通过** —— 拾取窗口 → 差分 → PNG 缓存 → 合成 MP4 全链路可用；
+当前状态：**v1.0 功能完整、四款软件实测通过** —— 拾取窗口 → 差分 → 帧缓存（JPEG/PNG）→ 合成 MP4 全链路可用；
 单页 GUI（460×455）、悬浮操作条、历史会话面板与两个弹窗均已完成。
 SAI2 / CLIP STUDIO PAINT / Photoshop / Krita 均实测可迅速锁定画布窗口，
 明细见 [docs/verification-log.md](docs/verification-log.md)。
@@ -10,7 +10,7 @@ SAI2 / CLIP STUDIO PAINT / Photoshop / Krita 均实测可迅速锁定画布窗�
 ## 它怎么工作
 
 1. 用户用鼠标**拾取画布窗口**（HWND），不做自动识别；
-2. 通过 **DWM 窗口缩略图**持续取该窗口的画面；画面差分后按需把 PNG 存进会话缓存目录
+2. 通过 **DWM 窗口缩略图**持续取该窗口的画面；画面差分后按需把帧存进会话缓存目录（有内容存 JPEG q85，近空白存 PNG）
    —— 静止画面不存帧，这就是"缩时"的来源；
 3. 录制结束后用**自编译的最小 OpenH264 编码器**批量合成 MP4；
 4. 录制参数与导出参数**相互独立**（帧密度 1~8fps 决定录制，播放帧率 5/10/15/20/24fps 决定导出）。
@@ -26,7 +26,7 @@ SAI2 / CLIP STUDIO PAINT / Photoshop / Krita 均实测可迅速锁定画布窗�
 | 抓帧（DWM 缩略图宿主 + `PrintWindow`） | ✅ 端到端跑通 | [FINDINGS](spikes/dwm-capture/FINDINGS.md) |
 | 帧差分（静止画面不存帧） | ✅ 已实测 | 4fps×6s：变化目标存 24 帧，静止目标存 1 帧 |
 | 分辨率统一（等比+居中+黑边） | ✅ 已实测 | 录制中途 480×320→640×400，32 帧全为 480×320，后段 480×300 居中+上下各 10 行黑边 |
-| 会话缓存 `frame_xxxx.png` + `markers.json` | ✅ 有单测覆盖 | `cargo test`（24 项全过） |
+| 会话缓存 `frame_xxxx.jpg` / `.png` + `markers.json` | ✅ 有单测覆盖 | `cargo test`（29 项全过） |
 | 录制容错（目标窗口消失 / 单帧失败跳过） | ✅ 已实测 | 目标关闭后自动停止并写 `completed:false` |
 | 视频合成（H.264 MP4） | ✅ 已接入并端到端实测 | 24 帧 → 480×320 / 2.4s，`ffprobe -count_frames` = 24 |
 | 取消合成（部分文件仍可播放） | ✅ 已实测 | `--frames 8` → 8 帧 / 0.8s，解码退出码 0 |
@@ -100,7 +100,7 @@ cargo test --offline                                              # 单元测试
 
 ```
 CanLapse/
-├─ src/                 产品代码（抓帧 / 差分 / 会话 / PNG / 编码 / 原生 Win32 GUI）
+├─ src/                 产品代码（抓帧 / 差分 / 会话 / 图像编解码 / 编码 / 原生 Win32 GUI）
 ├─ tools/               构建与打包脚本（build.ps1 一键构建；embed-resources.ps1 资源注入）
 ├─ docs/
 │  ├─ requirements.md   v1.0 需求基线

@@ -23,7 +23,7 @@ use std::ptr;
 use ffi::off::*;
 use ffi::*;
 
-use crate::png_io;
+use crate::img_io;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Quality {
@@ -169,10 +169,19 @@ fn collect_frames(dir: &Path) -> Result<Vec<PathBuf>, String> {
     let mut indexed: Vec<(u32, PathBuf)> = Vec::new();
     for e in entries.flatten() {
         let name = e.file_name().to_string_lossy().to_string();
-        if !name.starts_with("frame_") || !name.ends_with(".png") {
+        let lower = name.to_ascii_lowercase();
+        if !lower.starts_with("frame_") {
             continue;
         }
-        let digits = &name["frame_".len()..name.len() - ".png".len()];
+        // 帧可能是 PNG（空白帧/旧会话）或 JPEG（q85），两种都要收
+        let stem_len = if lower.ends_with(".png") || lower.ends_with(".jpg") {
+            name.len() - 4
+        } else if lower.ends_with(".jpeg") {
+            name.len() - 5
+        } else {
+            continue;
+        };
+        let digits = &name["frame_".len()..stem_len];
         let idx = match digits.parse::<u32>() {
             Ok(v) => v,
             Err(_) => continue,
@@ -527,7 +536,7 @@ pub fn encode_session(
         ));
     }
 
-    let (first_w, first_h, _) = png_io::read_png_rgba(&frames[0])?;
+    let (first_w, first_h, _) = img_io::read_image_rgba(&frames[0])?;
     let (first_w, first_h) = (first_w as i32, first_h as i32);
     let enc_w = first_w & !1;
     let enc_h = first_h & !1;
@@ -552,7 +561,7 @@ pub fn encode_session(
         let mut muxer = unsafe { Muxer::open(&opts.output, enc_w, enc_h, opts.fps, bitrate)? };
 
         for (i, path) in frames.iter().enumerate() {
-            let (fw, fh, rgba) = png_io::read_png_rgba(path)
+            let (fw, fh, rgba) = img_io::read_image_rgba(path)
                 .map_err(|e| format!("读取第 {i} 帧失败（{}）: {e}", path.display()))?;
             let (fw, fh) = (fw as i32, fh as i32);
             if fw != first_w || fh != first_h {

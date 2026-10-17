@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::frame::Frame;
-use crate::png_io;
+use crate::img_io;
 use crate::win;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -116,8 +116,19 @@ impl Session {
     /// 存一帧，返回保存后的帧总数。
     /// 单帧失败由调用方决定怎么处理（需求：跳过该帧、不中断录制）。
     pub fn save_frame(&mut self, frame: &Frame) -> Result<u32, String> {
-        let path = self.dir.join(format!("frame_{:04}.png", self.meta.frames));
-        png_io::write_png(&path, frame).map_err(|e| format!("写入 {} 失败: {e}", path.display()))?;
+        let n = self.meta.frames;
+        // 近空白帧用 PNG（几 KB；JPEG 反而更大），有内容的帧用 JPEG q85（约为 PNG 的 1/5）
+        let (path, use_png) = if frame.is_blank() {
+            (self.dir.join(format!("frame_{n:04}.png")), true)
+        } else {
+            (self.dir.join(format!("frame_{n:04}.jpg")), false)
+        };
+        if use_png {
+            img_io::write_png(&path, frame)
+                .map_err(|e| format!("写入 {} 失败: {e}", path.display()))?;
+        } else {
+            img_io::write_jpeg(&path, frame)?;
+        }
         self.meta.frames += 1;
         Ok(self.meta.frames)
     }
@@ -208,8 +219,8 @@ fn count_frames(dir: &Path) -> u32 {
     entries
         .flatten()
         .filter(|e| {
-            let n = e.file_name().to_string_lossy().to_string();
-            n.starts_with("frame_") && n.ends_with(".png")
+            let n = e.file_name().to_string_lossy().to_ascii_lowercase();
+            n.starts_with("frame_") && (n.ends_with(".png") || n.ends_with(".jpg") || n.ends_with(".jpeg"))
         })
         .count() as u32
 }
@@ -229,7 +240,7 @@ fn read_markers_meta(dir: &Path) -> (Option<String>, Option<String>) {
 mod tests {
     use super::*;
     use crate::frame::Frame;
-    use crate::png_io;
+    use crate::img_io;
     use windows_sys::Win32::Foundation::RECT;
 
     fn tmp_root(tag: &str) -> PathBuf {
@@ -300,7 +311,7 @@ mod tests {
         // 帧文件确实是可读的 PNG，且尺寸正确
         let png = s.dir().join("frame_0000.png");
         assert!(png.exists());
-        let (w, h, _) = png_io::read_png_rgba(&png).unwrap();
+        let (w, h, _) = img_io::read_png_rgba(&png).unwrap();
         assert_eq!((w, h), (4, 4));
 
         // 历史缓存会话列表（规格里的「会话名称｜帧数量」）

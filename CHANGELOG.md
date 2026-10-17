@@ -55,6 +55,17 @@
 
 ### 变更
 
+- **帧缓存改为 JPEG q85（近空白帧仍用 PNG）**
+  - 有内容的帧存 `frame_xxxx.jpg`（q85），近空白帧存 `frame_xxxx.png` —— 后者 JPEG 反而更大
+    （约 10 KB vs 5 KB）；读取按扩展名分派，**旧的全 PNG 会话照常可读**（实测重导出字节数不变）。
+  - 实测（1920×1009 画作）：PNG RGB 942 KB → JPEG q85 约 230 KB（约 1/4），编码 68 ms → 约 10 ms；
+    偏平坦的界面内容例外：JPEG 可能比 PNG 大（137 KB vs 96 KB），这类内容不是产品目标场景。
+  - 3fps×1 小时（10,800 帧）缓存：1080p 画作约 1.9–2.3 GB（PNG 时代约 10 GB）。
+  - 依赖：新增 `image`（`default-features = false, features = ["jpeg"]`）用于 JPEG 编解码；
+    `src/png_io.rs` 更名为 `src/img_io.rs`。
+  - ⚠️ 与 `docs/requirements.md`「保存 frame_xxxx.png」的偏差：缓存格式改为有损 JPEG，
+    需求基线未改，特此记录；若要回到无损，把 `Session::save_frame` 的分支改回 `write_png` 即可。
+
 - **单实例 + 拾取提示精简**
   - 命名互斥体（`Local\CanLapse.SingleInstance`）保证同时只跑一个 GUI；第二个进程
     **激活已有窗口后直接退出**（实测 46 ms 退出，且被最小化的窗口会被叫回前台）。

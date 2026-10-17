@@ -13,7 +13,7 @@ pub mod capture;
 pub mod encode;
 pub mod frame;
 pub mod log;
-pub mod png_io;
+pub mod img_io;
 pub mod recorder;
 pub mod session;
 pub mod ui;
