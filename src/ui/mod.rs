@@ -511,7 +511,7 @@ impl App {
         let f = self.font;
         let ws = WS_CHILD | WS_VISIBLE;
         let mut c = Ctl::default();
-        c.title = mk(h, "Static", "CanLapse · 画布缩时录屏", ws, 0, f);
+        c.title = mk(h, "Static", &format!("{} · 画布缩时录屏", app_title()), ws, 0, f);
         c.btn_pick = mk(h, "Button", "🎯 拾取窗口", ws, ID_PICK, f);
         c.btn_help = mk(h, "Button", "❓ 如何定位窗口", ws, ID_HELP, f);
         c.status = mk(h, "Static", "", ws, ID_STATUS, f);
@@ -1454,13 +1454,18 @@ fn looks_like_panel(info: &win::WindowInfo) -> bool {
     main_frame || ratio > 3.2 || ratio < 0.35
 }
 
+/// 窗口标题 / 界面标题统一用这个名字（带版本号）
+fn app_title() -> String {
+    format!("CanLapse v{}", env!("CARGO_PKG_VERSION"))
+}
+
 /// 把已经在运行的 CanLapse 主窗口叫到前台（第二个实例只做这件事）
 unsafe fn activate_existing() -> bool {
     let c = cls(MAIN_CLASS);
     // 先按类名找；个别系统上 FindWindow 的 title=NULL 不匹配，再退回按标题找
     let mut h = windows_sys::Win32::UI::WindowsAndMessaging::FindWindowW(c.as_ptr(), std::ptr::null());
     if h.is_null() {
-        let t = win::wide("CanLapse");
+        let t = win::wide(&app_title());
         h = windows_sys::Win32::UI::WindowsAndMessaging::FindWindowW(c.as_ptr(), t.as_ptr());
     }
     if h.is_null() {
@@ -1627,7 +1632,8 @@ pub fn run(initial_target: Option<isize>) -> i32 {
         }
 
         let c = cls(MAIN_CLASS);
-        let t = win::wide("CanLapse");
+        // 窗口标题带版本号（v1.0.0 增补需求）
+        let t = win::wide(&app_title());
         let hwnd = CreateWindowExW(
             0,
             c.as_ptr(),
