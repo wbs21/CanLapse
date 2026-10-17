@@ -740,10 +740,9 @@ impl App {
         // 置顶保证提示始终可见；半透明让我们不完全挡住下面的目标，方便点它的标题栏。
         // GWL_EXSTYLE = -20，WS_EX_LAYERED = 0x00080000，LWA_ALPHA = 0x2
         let ex = GetWindowLongPtrW(self.hwnd, -20) as i64;
-        // 同时加 WS_EX_LAYERED(0x80000) 与 WS_EX_TRANSPARENT(0x20)：
-        // 后者让**鼠标穿透**，否则我们这块置顶面板会把点击全吃掉，
-        // 而拾取逻辑又忽略"自己进程的窗口" -> 点了也永远没有候选（实测踩过）。
-        SetWindowLongPtrW(self.hwnd, -20, (ex | 0x0008_0000 | 0x0000_0020) as isize);
+        // 按用户要求：**不再半透明、不再鼠标穿透**，改为拾取时最小化。
+        // 这里只把扩展样式保持原样（清掉 LAYERED/TRANSPARENT 位以防残留）。
+        SetWindowLongPtrW(self.hwnd, -20, (ex & !(0x0008_0000 | 0x0000_0020)) as isize);
         windows_sys::Win32::UI::WindowsAndMessaging::SetLayeredWindowAttributes(
             self.hwnd, 0, 190, 0x0000_0002,
         );
@@ -757,6 +756,8 @@ impl App {
             0,
             0x0002 | 0x0001 | 0x0010,
         );
+        // 拾取期间最小化主窗口（用户要求），让开目标；拾取结束再恢复。
+        ShowWindow(self.hwnd, SW_MINIMIZE);
         let t = win::wide("请在目标窗口的上边框（标题栏）上点一下左键；按 Esc 取消");
         SetWindowTextW(self.ctl.state, t.as_ptr());
         UpdateWindow(self.hwnd);
