@@ -31,8 +31,7 @@ if ($SkipInject) {
 }
 
 $exeDir = if ($Profile -eq 'release') { 'target\release' } else { 'target\debug' }
-& pwsh -NoProfile -File (Join-Path $PSScriptRoot 'embed-resources.ps1') `
-    -Exe @("$exeDir\CanLapse.exe", "$exeDir\canlapse-cli.exe")
+& pwsh -NoProfile -File (Join-Path $PSScriptRoot 'embed-resources.ps1') -Dir $exeDir
 if ($LASTEXITCODE -ne 0) { throw '资源注入失败' }
 
 Write-Host '完成：已构建并注入图标 / 版本信息'

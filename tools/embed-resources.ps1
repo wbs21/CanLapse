@@ -6,7 +6,10 @@
 # 背景见 tools\ResInject.cs 与 CanLapse.rc 的注释：链接期方案在本项目行不通，
 # 因此改为构建后注入；.rc 必须是 UTF-16LE 且不能有 #pragma code_page。
 param(
-    [string[]]$Exe = @('target\debug\CanLapse.exe', 'target\debug\canlapse-cli.exe')
+    # 产物目录（相对项目根）。**不要改成 [string[]]$Exe**：
+    # `pwsh -File script.ps1 -Exe @(a,b)` 会把数组压成单个值，
+    # 结果只处理第一个文件（实测踩过：canlapse-cli.exe 的图标静默丢失）。
+    [string]$Dir = 'target\debug'
 )
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
@@ -39,9 +42,15 @@ if ($LASTEXITCODE -ne 0) { throw "link.exe 失败（退出码 $LASTEXITCODE）" 
 
 Add-Type -Path (Join-Path $PSScriptRoot 'ResInject.cs')
 
-foreach ($e in $Exe) {
-    $path = if ([System.IO.Path]::IsPathRooted($e)) { $e } else { Join-Path $root $e }
+$targets = @(
+    (Join-Path $root (Join-Path $Dir 'CanLapse.exe')),
+    (Join-Path $root (Join-Path $Dir 'canlapse-cli.exe'))
+)
+$done = 0
+foreach ($path in $targets) {
     if (-not (Test-Path $path)) { Write-Warning "跳过（不存在）: $path"; continue }
     $result = [ResInject]::Inject("$tmp\res.dll", $path)
     Write-Host ("注入 {0}: {1}" -f (Split-Path $path -Leaf), $result)
+    $done++
 }
+if ($done -eq 0) { throw "没有任何 exe 被注入（检查 -Dir 是否正确：$Dir）" }
