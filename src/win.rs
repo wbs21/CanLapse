@@ -22,16 +22,16 @@ use windows_sys::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, VK_ESCAPE, VK_F8, VK_LBUTTON,
+    GetAsyncKeyState, VK_ESCAPE, VK_F8,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, CreateWindowExW, DefWindowProcW, DispatchMessageW, EnumWindows,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EnumWindows,
     GetAncestor, GetClassNameW, GetClientRect, GetCursorPos, GetForegroundWindow, GetParent,
     GetSystemMetrics, GetWindow, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId,
-    IsIconic, IsWindow, IsWindowVisible, MSG, MSLLHOOKSTRUCT, PM_REMOVE, PeekMessageW,
-    RegisterClassW, SetLayeredWindowAttributes, SetWindowPos, SetWindowsHookExW, ShowWindow,
-    TranslateMessage, UnhookWindowsHookEx, WindowFromPoint, GA_ROOT, GW_OWNER, HHOOK,
-    SW_SHOWNOACTIVATE, WH_MOUSE_LL, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_PAINT, WNDCLASSW, WS_POPUP,
+    IsIconic, IsWindow, IsWindowVisible, MSG, PM_REMOVE, PeekMessageW,
+    RegisterClassW, SetLayeredWindowAttributes, SetWindowPos, ShowWindow,
+    TranslateMessage, WindowFromPoint, GA_ROOT, GW_OWNER,
+    SW_HIDE, SW_SHOWNOACTIVATE, WM_LBUTTONDOWN, WM_PAINT, WM_RBUTTONDOWN, WNDCLASSW, WS_POPUP,
 };
 
 pub fn wide(s: &str) -> Vec<u16> {
@@ -243,7 +243,7 @@ fn key_down(vk: u16) -> bool {
 /// 全部可控。
 const HINT_CLASS: &str = "CanLapsePickHint";
 static HINT_REG: Once = Once::new();
-const HINT_W: i32 = 340;
+const HINT_W: i32 = 460;
 const HINT_H: i32 = 46;
 
 unsafe extern "system" fn hint_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -308,7 +308,7 @@ fn virtual_screen() -> (i32, i32, i32, i32) {
     }
 }
 
-pub fn pick_hint_create(owner: HWND, text: &str) -> HWND {
+pub fn pick_hint_create(text: &str) -> HWND {
     HINT_REG.call_once(|| unsafe {
         let c = wide(HINT_CLASS);
         let wc = WNDCLASSW {
@@ -410,185 +410,171 @@ fn cursor_window() -> HWND {
 }
 
 // ---------------------------------------------------------------------------
-// 拾取用的低级鼠标钩子（WH_MOUSE_LL）
+// 拾取点击捕获：全屏透明覆盖层
 // ---------------------------------------------------------------------------
 //
-// 为什么需要它：拾取要求用户"点一下画布"，但这一下如果原样传给绘画软件，
-// 笔刷会在画布上留下一个点（真实 SAI2 上会）。用低级钩子**吞掉**这次点击：
-// 我们只从坐标算出窗口，目标软件什么也收不到。
-// 顺带解决了"快速点击落在两次 60ms 轮询之间被漏掉"的问题。
+// 为什么弃用 WH_MOUSE_LL：实测在本程序里钩子**安装成功**、但一个点击都收不到
+// （用户点画布边框无数次，日志里零条 [hook]；GetAsyncKeyState 也读不到按下）。
+// 低级钩子是否投递取决于安装线程的消息泵时序，不可依赖。
+//
+// 覆盖层是确定性的：拾取时铺一张覆盖整个虚拟桌面的窗口，点击必然落在它身上；
+// 我们记录坐标、立刻隐藏自己，再用 WindowFromPoint 取该点下的真实窗口 ——
+// 目标软件一次点击都收不到（不会在画布上画点），也不依赖钩子或按键轮询。
+const OVERLAY_CLASS: &str = "CanLapsePickOverlay";
+static OVERLAY_REG: Once = Once::new();
+static OVERLAY_HIT: AtomicBool = AtomicBool::new(false);
+static OVERLAY_CANCEL: AtomicBool = AtomicBool::new(false);
+static OVERLAY_X: AtomicIsize = AtomicIsize::new(0);
+static OVERLAY_Y: AtomicIsize = AtomicIsize::new(0);
 
-
-static CLICK_HWND: AtomicIsize = AtomicIsize::new(0);
-static CLICK_HIT: AtomicBool = AtomicBool::new(false);
-
-unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if code >= 0 {
-        match wparam as u32 {
-            WM_LBUTTONDOWN => {
-                let info = &*(lparam as *const MSLLHOOKSTRUCT);
-                CLICK_HWND.store(WindowFromPoint(info.pt) as isize, Ordering::SeqCst);
-                CLICK_HIT.store(true, Ordering::SeqCst);
-                return 1; // 吞掉：不传给目标软件
-            }
-            WM_LBUTTONUP => {
-                return 1; // 与 down 成对吞掉，免得目标软件收到"半截"点击
-            }
-            _ => {}
+unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    match msg {
+        WM_LBUTTONDOWN => {
+            let (vx, vy, _, _) = virtual_screen();
+            let x = vx + ((lp as i32) & 0xffff);
+            let y = vy + (((lp as isize) >> 16) as i32);
+            OVERLAY_X.store(x as isize, Ordering::SeqCst);
+            OVERLAY_Y.store(y as isize, Ordering::SeqCst);
+            OVERLAY_HIT.store(true, Ordering::SeqCst);
+            // 先隐藏自己，下面才可能 WindowFromPoint 到真正的窗口
+            ShowWindow(hwnd, SW_HIDE);
+            logline!("[pick] 覆盖层收到左键 ({x},{y})");
+            0
         }
+        WM_RBUTTONDOWN => {
+            OVERLAY_CANCEL.store(true, Ordering::SeqCst);
+            ShowWindow(hwnd, SW_HIDE);
+            logline!("[pick] 覆盖层收到右键：取消拾取");
+            0
+        }
+        _ => DefWindowProcW(hwnd, msg, wp, lp),
     }
-    CallNextHookEx(null_mut(), code, wparam, lparam)
 }
 
-/// 低级鼠标钩子的 RAII 句柄：离开作用域自动卸载。
-struct MouseHook(HHOOK);
-
-impl MouseHook {
-    fn install() -> Option<Self> {
-        let hk = unsafe {
-            SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), module_handle() as _, 0)
+/// 铺一张覆盖整个虚拟桌面的透明窗口（几乎不可见，但**参与命中测试**）
+unsafe fn overlay_create() -> HWND {
+    OVERLAY_REG.call_once(|| {
+        let c = wide(OVERLAY_CLASS);
+        let wc = WNDCLASSW {
+            style: 0,
+            lpfnWndProc: Some(overlay_proc),
+            cbClsExtra: 0,
+            cbWndExtra: 0,
+            hInstance: module_handle(),
+            hIcon: null_mut(),
+            hCursor: null_mut(),
+            hbrBackground: null_mut(),
+            lpszMenuName: null(),
+            lpszClassName: c.as_ptr(),
         };
-        if hk.is_null() {
-            logline!("[pick] 低级鼠标钩子安装失败，退回轮询点击（点击可能会落到目标软件里）");
-            None
-        } else {
-            logline!("[pick] 低级鼠标钩子已安装（拾取点击会被拦截，不会画到画布上）");
-            Some(Self(hk))
-        }
+        RegisterClassW(&wc);
+    });
+    let (vx, vy, vw, vh) = virtual_screen();
+    let c = wide(OVERLAY_CLASS);
+    // TOPMOST | TOOLWINDOW | LAYERED | NOACTIVATE
+    // ⚠️ 不能加 WS_EX_TRANSPARENT，那会让点击穿透到目标软件
+    let h = CreateWindowExW(
+        0x0000_0008 | 0x0000_0080 | 0x0008_0000 | 0x0800_0000,
+        c.as_ptr(),
+        null(),
+        WS_POPUP,
+        vx,
+        vy,
+        vw,
+        vh,
+        null_mut(),
+        null_mut(),
+        module_handle(),
+        null(),
+    );
+    if h.is_null() {
+        logline!("[pick] 覆盖层创建失败，无法捕获点击");
+        return h;
     }
+    // 20/255 的均匀透明度：几乎看不见，但整块窗口仍然可命中
+    SetLayeredWindowAttributes(h, 0, 20, 0x2);
+    ShowWindow(h, SW_SHOWNOACTIVATE);
+    SetWindowPos(h, (-1isize) as HWND, vx, vy, vw, vh, 0x0010);
+    logline!("[pick] 覆盖层已铺开 {vw}x{vh} @({vx},{vy})");
+    h
 }
 
-impl Drop for MouseHook {
-    fn drop(&mut self) {
-        unsafe {
-            UnhookWindowsHookEx(self.0);
-        }
-    }
-}
-
-/// 交互式拾取：光标移到目标上，**点一下**确认，Esc 取消。
+/// 交互式拾取：光标移到目标上，**点一下**确认；Esc / 右键取消。
 ///
-/// `owner` 是发起拾取的窗口（会先最小化）。它一旦回到前台就**取消拾取** ——
-/// 实测日志里出现过：拾取期间主窗口被恢复（Alt+Tab/任务栏/宏键盘），用户点来点去
-/// 全点在自己窗口上，被当成"无效目标"吞掉，看起来就是"点了没反应"。
-///
-/// 点击有两条路径：
-/// 1. **首选**：低级鼠标钩子 —— 点击被吞掉，不会画到画布上，也不会漏掉快速点击；
-/// 2. 兜底（钩子装不上时）：60ms 轮询 `GetAsyncKeyState`，同时看"按住"和"按下过"边沿。
+/// `owner` 是发起拾取的窗口（已最小化）。它一旦回到前台就取消拾取 ——
+/// Alt+Tab 等操作会把窗口叫回来，那时用户显然不是想继续拾取。
 pub fn pick_window_interactive(owner: HWND, hint: Option<HWND>) -> Option<HWND> {
     let me = std::process::id();
-    let mut last: isize = 0;
-    // 记住"最后一个有效的非本进程窗口"。
-    // 旧实现把点击判定放在 pid/null 检查之后：只要鼠标当下落在我们自己的窗口或空处，
-    // 代码就 continue，**永远走不到检测点击那一步** —— 表现为"最小化后点哪都没反应"。
-    let mut candidate: HWND = null_mut();
-    let hook = MouseHook::install();
-    // 清掉"点【拾取窗口】按钮"那一下留下的边沿
-    unsafe {
-        GetAsyncKeyState(VK_LBUTTON as i32);
+    OVERLAY_HIT.store(false, Ordering::SeqCst);
+    OVERLAY_CANCEL.store(false, Ordering::SeqCst);
+    let overlay = unsafe { overlay_create() };
+    if overlay.is_null() {
+        return None;
     }
-    logline!("[pick] 进入拾取循环（Esc 取消）");
     let mut ticks = 0u32;
+    let mut result: Option<HWND> = None;
+    logline!("[pick] 进入拾取（覆盖层捕获点击；Esc / 右键取消）");
     loop {
         pump();
         ticks += 1;
+        // 提示条必须一直在覆盖层之上
+        if let Some(tip) = hint {
+            pick_hint_follow(tip);
+        }
         if key_down(VK_ESCAPE) {
             logline!("[pick] Esc 取消");
-            return None;
+            break;
         }
-        // 最小化有极短的过渡期，前 10 轮（约 0.6s）不判"被恢复"，避免误取消
+        // 最小化有极短的过渡期，前 10 轮（约 0.6s）不判"被恢复"
         if ticks > 10 && !owner.is_null() && unsafe { IsIconic(owner) } == 0 {
             logline!("[pick] 主窗口回到了前台，取消拾取（请重新点【拾取窗口】）");
-            return None;
+            break;
         }
-        // 首选路径：钩子已经截获了这次点击
-        if hook.is_some() && CLICK_HIT.swap(false, Ordering::SeqCst) {
-            let h = CLICK_HWND.load(Ordering::SeqCst) as HWND;
-            if h.is_null() || pid_of(h) == me {
-                // 点到自己的窗口：用户显然想操作本程序，取消拾取把控制权还给他
+        if OVERLAY_CANCEL.swap(false, Ordering::SeqCst) {
+            break;
+        }
+        if OVERLAY_HIT.swap(false, Ordering::SeqCst) {
+            let x = OVERLAY_X.load(Ordering::SeqCst) as i32;
+            let y = OVERLAY_Y.load(Ordering::SeqCst) as i32;
+            // 覆盖层已在点击处理里隐藏，这里取该点下真正的窗口
+            let h = unsafe { WindowFromPoint(POINT { x, y }) };
+            if h.is_null() {
+                logline!("[pick] 点击点 ({x},{y}) 下没有窗口，继续拾取");
+                unsafe {
+                    ShowWindow(overlay, SW_SHOWNOACTIVATE);
+                }
+            } else if pid_of(h) == me {
                 logline!(
-                    "[pick] 点击落在本程序窗口（0x{:X}），取消拾取",
+                    "[pick] 点击点 ({x},{y}) 落在本程序窗口 0x{:X}，取消拾取",
                     h as isize
                 );
-                return None;
-            }
-            if looks_pickable(h) {
+                break;
+            } else if !looks_pickable(h) {
                 logline!(
-                    "[pick] 左键点击（已拦截）-> 0x{:X} | {} | 层级：{}",
+                    "[pick] 点击点 ({x},{y}) -> 0x{:X} | {} 被过滤（过小的控件/系统浮层），继续拾取",
+                    h as isize,
+                    describe(h).label()
+                );
+                unsafe {
+                    ShowWindow(overlay, SW_SHOWNOACTIVATE);
+                }
+            } else {
+                logline!(
+                    "[pick] 点击 ({x},{y}) -> 0x{:X} | {} | 层级：{}",
                     h as isize,
                     describe(h).label(),
                     ancestor_chain(h)
                 );
-                // 等松开，确保 up 也被吞掉，目标软件不会收到"半截"点击
-                while key_down(VK_LBUTTON) {
-                    pump();
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                return Some(h);
-            }
-            logline!(
-                "[pick] 点击被拦截，但目标不可用：0x{:X}（pid={}）",
-                h as isize,
-                pid_of(h)
-            );
-        }
-        // 兜底路径：没有钩子时轮询
-        if hook.is_none() {
-            let (btn_down, btn_edge) = left_button_state();
-            if btn_down || btn_edge {
-                while key_down(VK_LBUTTON) {
-                    pump();
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                if !candidate.is_null() {
-                    logline!(
-                        "[pick] 左键确认（轮询）-> 0x{:X} | {} | 层级：{}",
-                        candidate as isize,
-                        describe(candidate).label(),
-                        ancestor_chain(candidate)
-                    );
-                    return Some(candidate);
-                }
-                logline!("[pick] 左键点击但无可用候选（光标窗口 0x{:X}）", cursor_window() as isize);
-            }
-        }
-        let h = cursor_window();
-        if let Some(tip) = hint {
-            pick_hint_follow(tip);
-        }
-        let pickable = !h.is_null() && pid_of(h) != me && looks_pickable(h);
-        if pickable {
-            candidate = h;
-        }
-        if h as isize != last {
-            last = h as isize;
-            if h.is_null() {
-                logline!("[pick] 光标下没有窗口");
-            } else {
-                let info = describe(h);
-                logline!(
-                    "[pick] 光标 0x{:X} | {} | 客户区 {}x{} | pid={} | 可拾取={} | 本进程={}",
-                    h as isize,
-                    info.label(),
-                    info.client.right - info.client.left,
-                    info.client.bottom - info.client.top,
-                    info.pid,
-                    pickable,
-                    info.pid == me
-                );
+                result = Some(h);
+                break;
             }
         }
         std::thread::sleep(Duration::from_millis(60));
     }
-}
-
-
-/// 左键状态：`(当前是否按住, 自上次调用以来是否按下过)`。
-///
-/// 低位是"按下过"的边沿锁存，读取即清除 —— 每轮循环只能读一次，否则会丢事件。
-fn left_button_state() -> (bool, bool) {
-    let st = unsafe { GetAsyncKeyState(VK_LBUTTON as i32) as u16 };
-    (st & 0x8000 != 0, st & 0x0001 != 0)
+    unsafe {
+        DestroyWindow(overlay);
+    }
+    result
 }
 
 /// 从 `hwnd` 往上到顶层（含）的窗口链，用于诊断"这一下点到了哪一层"。

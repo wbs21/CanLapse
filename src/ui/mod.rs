@@ -777,11 +777,12 @@ impl App {
         // 拾取期间最小化主窗口（用户要求），让开目标；拾取结束再恢复。
         ShowWindow(self.hwnd, SW_MINIMIZE);
         logline!("[pick] 主窗口已最小化，进入拾取");
-        let t = win::wide("请点一下画布画面（不要点 CanLapse 自己的窗口）；按 Esc 取消");
+        // 说明清楚：拾取时 CanLapse 已最小化到任务栏（点不到），唯一该点的是画布。
+        let t = win::wide("CanLapse 已最小化到任务栏；请点击画布画面（按 Esc 取消）");
         SetWindowTextW(self.ctl.state, t.as_ptr());
         UpdateWindow(self.hwnd);
 
-        let hint = win::pick_hint_create(self.hwnd, "点画布画面（不是 CanLapse 窗口）");
+        let hint = win::pick_hint_create("CanLapse 已最小化到任务栏 · 请点画布画面确认（Esc 取消）");
         let picked = win::pick_window_interactive(self.hwnd, Some(hint));
         win::pick_hint_destroy(hint);
 
