@@ -7,6 +7,8 @@
 SAI2 / CLIP STUDIO PAINT / Photoshop / Krita 均实测可迅速锁定画布窗口，
 明细见 [docs/verification-log.md](docs/verification-log.md)。
 
+> 📌 **先读这个**：[项目总结.md](项目总结.md) —— 一页纸讲清现状、架构、实测数据、坑与后续计划。
+
 ## 它怎么工作
 
 1. 用户用鼠标**拾取画布窗口**（HWND），不做自动识别；
