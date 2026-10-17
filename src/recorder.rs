@@ -54,6 +54,28 @@ impl Phase {
     }
 }
 
+/// 差异阈值的单位。
+///
+/// 主单位是**像素个数**：它和画布尺寸无关，"每画 N 个像素存一帧"在 1080p 与 4K 上是同一个
+/// 尺度（按比例算的 1% 在大画布上会迟钝得多）。
+/// 保留 `Ratio` 只是为了兼容旧的命令行参数（`--threshold 0.01`）。
+#[derive(Clone, Copy, Debug)]
+pub enum Threshold {
+    Pixels(u32),
+    Ratio(f32),
+}
+
+impl Threshold {
+    /// 换算成像素数（`Ratio` 需要知道当前抓帧尺寸）
+    pub fn resolve(self, width: i32, height: i32) -> u32 {
+        let total = (width.max(1) as f64) * (height.max(1) as f64);
+        match self {
+            Threshold::Pixels(n) => n,
+            Threshold::Ratio(r) => (r.max(0.0) as f64 * total).round() as u32,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct RecorderConfig {
     pub hwnd: isize,
@@ -61,8 +83,8 @@ pub struct RecorderConfig {
     pub name: String,
     /// 帧密度（快照采样频率）1~8
     pub fps: f64,
-    /// 像素差异阈值 0.00~0.05
-    pub threshold: f32,
+    /// 像素差异阈值：变化像素数达到该值才存一帧
+    pub threshold: Threshold,
     /// 分辨率统一时的填充色（默认黑边）
     pub fill_rgb: [u8; 3],
     /// 是否启用"其他软件在前台就暂停抓帧"。
@@ -221,6 +243,7 @@ fn run(cfg: &RecorderConfig, shared: &Arc<Shared>) -> Result<(), String> {
     // 注意：ThumbnailCapture 在这个线程里创建，之后也只在它上面用（GDI 线程亲和性）
     let mut cap = ThumbnailCapture::new(hwnd)?;
     let (cw, ch) = cap.size();
+    let threshold_px = cfg.threshold.resolve(cw, ch).max(1);
     let mut sess = Session::create(
         &cfg.root,
         &cfg.name,
@@ -228,7 +251,7 @@ fn run(cfg: &RecorderConfig, shared: &Arc<Shared>) -> Result<(), String> {
         cw,
         ch,
         cfg.fps,
-        cfg.threshold,
+        threshold_px,
     )?;
     if let Ok(mut d) = shared.dir.lock() {
         *d = Some(sess.dir().to_path_buf());
@@ -315,10 +338,10 @@ fn run(cfg: &RecorderConfig, shared: &Arc<Shared>) -> Result<(), String> {
                     shared.blank_warned.store(true, Ordering::SeqCst);
                 }
                 let changed = match &prev {
-                    Some(p) => cur.changed_ratio(p),
-                    None => 1.0,
+                    Some(p) => cur.changed_pixels(p),
+                    None => u32::MAX,
                 };
-                if changed > cfg.threshold {
+                if changed >= threshold_px {
                     let (bw, bh) = match base_size {
                         None => {
                             base_size = Some((cur.width, cur.height));

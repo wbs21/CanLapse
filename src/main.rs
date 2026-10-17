@@ -29,6 +29,7 @@ struct RecordArgs {
     out: Option<PathBuf>,
     name: Option<String>,
     fps: f64,
+    /// 差异阈值：>=1 按"变化像素数"，<1 按比例（旧用法）
     threshold: f32,
     duration: Option<f64>,
     quiet: bool,
@@ -45,7 +46,7 @@ impl Default for RecordArgs {
             out: None,
             name: None,
             fps: 2.0,        // 需求：帧密度 1~8 fps
-            threshold: 0.01, // 需求：像素差异阈值 0.00~0.05
+            threshold: 8000.0, // 变化像素数（>=1）或比例（<1）
             duration: None,
             quiet: false,
             no_fg_pause: false,
@@ -87,7 +88,7 @@ fn help() {
   --out DIR            缓存根目录（默认 %LOCALAPPDATA%\CanLapse\cache，或环境变量 CANLAPSE_CACHE）
   --name NAME          会话名（默认取目标进程名），目录名形如 2026-02-14_13-20-51_NAME
   --fps N              帧密度 1~8（默认 2）
-  --threshold F        像素差异阈值 0.00~0.05（默认 0.01）
+  --threshold N        变化阈值：像素数（默认 8000）；<1 按比例（0.01 = 1%）
   --duration SEC       录制时长上限，0 或省略表示手动停止（Esc 或关闭画布窗口）
   --quiet              少打印
   --no-fg-pause        关闭"其他软件在前台就暂停抓帧"。
@@ -193,8 +194,8 @@ fn cmd_record(a: RecordArgs) -> i32 {
         eprintln!("帧密度必须在 1~8 之间（收到 {}）", a.fps);
         return 2;
     }
-    if !(0.0..=0.05).contains(&a.threshold) {
-        eprintln!("像素差异阈值必须在 0.00~0.05 之间（收到 {}）", a.threshold);
+    if a.threshold < 0.0 || a.threshold > 1_000_000.0 {
+        eprintln!("像素差异阈值必须 >= 0（>=1 按像素数，<1 按比例；收到 {}）", a.threshold);
         return 2;
     }
 
@@ -210,9 +211,9 @@ fn cmd_record(a: RecordArgs) -> i32 {
         .clone()
         .unwrap_or_else(|| if info.process.is_empty() { "画布".into() } else { info.process.clone() });
     println!(
-        "录制参数: 帧密度 {}/s，差异阈值 {:.3}。按 Esc 停止{}。",
+        "录制参数: 帧密度 {}/s，差异阈值 {}。按 Esc 停止{}。",
         a.fps,
-        a.threshold,
+        if a.threshold >= 1.0 { format!("{} 像素", a.threshold as u32) } else { format!("{:.1}%", a.threshold * 100.0) },
         match a.duration {
             Some(d) => format!("，或 {d} 秒后自动停止"),
             None => String::new(),
@@ -230,7 +231,11 @@ fn cmd_record(a: RecordArgs) -> i32 {
         root,
         name,
         fps: a.fps,
-        threshold: a.threshold,
+        threshold: if a.threshold >= 1.0 {
+            recorder::Threshold::Pixels(a.threshold as u32)
+        } else {
+            recorder::Threshold::Ratio(a.threshold)
+        },
         fill_rgb: [0, 0, 0],
         fg_pause: !a.no_fg_pause,
     };

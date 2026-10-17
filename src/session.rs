@@ -36,13 +36,22 @@ pub struct SessionMeta {
     pub height: i32,
     /// 录制帧密度（快照采样频率），与导出播放帧率无关
     pub record_fps: f64,
-    /// 像素差异阈值
+    /// 像素差异阈值（旧字段，比例 0~1，仅用于兼容旧会话）
+    #[serde(default)]
     pub threshold: f32,
+    /// 像素差异阈值（新：变化像素个数，与画布尺寸无关）
+    #[serde(default = "default_threshold_px")]
+    pub threshold_px: u32,
     pub frames: u32,
     pub dropped: u32,
     pub duration_ms: u64,
     /// 录制是否正常结束（false = 目标窗口关闭等异常终止）
     pub completed: bool,
+}
+
+/// 旧版 markers.json 没有 `threshold_px` 字段时的默认值（≈ 旧默认 1% × 800×1000 画布）
+fn default_threshold_px() -> u32 {
+    8000
 }
 
 #[derive(Serialize, Deserialize)]
@@ -74,7 +83,7 @@ impl Session {
         width: i32,
         height: i32,
         record_fps: f64,
-        threshold: f32,
+        threshold_px: u32,
     ) -> Result<Session, String> {
         let clean = win::sanitize_name(name);
         let stamp = win::stamp_folder(&win::local_now());
@@ -96,7 +105,8 @@ impl Session {
             width,
             height,
             record_fps,
-            threshold,
+            threshold: threshold_px as f32 / ((width.max(1) as f32) * (height.max(1) as f32)),
+            threshold_px,
             frames: 0,
             dropped: 0,
             duration_ms: 0,
@@ -272,7 +282,7 @@ mod tests {
     fn 会话存帧写标记并可被列出与删除() {
         let root = tmp_root("session");
         let info = fake_info();
-        let mut s = Session::create(&root, "测试会话", &info, 4, 4, 2.0, 0.01).unwrap();
+        let mut s = Session::create(&root, "测试会话", &info, 4, 4, 2.0, 8000).unwrap();
         assert!(s
             .dir()
             .file_name()
@@ -296,7 +306,7 @@ mod tests {
         assert_eq!(parsed.session.duration_ms, 3000);
         assert!(parsed.session.completed);
         assert_eq!(parsed.session.record_fps, 2.0);
-        assert_eq!(parsed.session.threshold, 0.01);
+        assert_eq!(parsed.session.threshold_px, 8000);
         assert_eq!((parsed.session.width, parsed.session.height), (4, 4));
         assert_eq!(parsed.session.source_process, "test.exe");
 
@@ -331,8 +341,8 @@ mod tests {
     fn 同一秒内重名会话不会互相覆盖() {
         let root = tmp_root("dup");
         let info = fake_info();
-        let a = Session::create(&root, "同名", &info, 4, 4, 2.0, 0.01).unwrap();
-        let b = Session::create(&root, "同名", &info, 4, 4, 2.0, 0.01).unwrap();
+        let a = Session::create(&root, "同名", &info, 4, 4, 2.0, 8000).unwrap();
+        let b = Session::create(&root, "同名", &info, 4, 4, 2.0, 8000).unwrap();
         assert_ne!(a.dir(), b.dir());
         assert_eq!(Session::list(&root).len(), 2);
         let _ = fs::remove_dir_all(&root);

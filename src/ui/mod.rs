@@ -102,6 +102,19 @@ fn cls(s: &str) -> Vec<u16> {
     win::wide(s)
 }
 
+/// 千分位（8000 -> "8,000"），滑块的像素阈值读数用
+fn group_thousands(n: u32) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, ch) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 enum PickState {
     Empty,
@@ -165,7 +178,8 @@ struct App {
     exp_open: bool,
     hist_open: bool,
     fps: f64,
-    threshold: f32,
+    /// 像素差异阈值：变化像素数达到该值才存一帧（与画布尺寸无关）
+    threshold_px: u32,
     export_fps: f64,
     quality: Quality,
     auto_clean: bool,
@@ -481,7 +495,7 @@ impl App {
             exp_open: true, // 按要求：导出参数不再折叠，直接显示
             hist_open: false,
             fps: 2.0,
-            threshold: 0.01,
+            threshold_px: 8000,
             export_fps: 24.0,
             quality: Quality::Medium,
             auto_clean: true,
@@ -526,8 +540,8 @@ impl App {
         c.sld_thr = mk(h, "msctls_trackbar32", "", ws | TBS_HORZ | TBS_NOTICKS, ID_SLD_THR, f);
         SendMessageW(c.sld_fps, TBM_SETRANGE, 1, pack(1, 8));
         SendMessageW(c.sld_fps, TBM_SETPOS, 1, 2);
-        SendMessageW(c.sld_thr, TBM_SETRANGE, 1, pack(0, 50));
-        SendMessageW(c.sld_thr, TBM_SETPOS, 1, 10);
+        SendMessageW(c.sld_thr, TBM_SETRANGE, 1, pack(0, 100));
+        SendMessageW(c.sld_thr, TBM_SETPOS, 1, 16); // 16 -> 8000 像素（默认）
 
         c.hdr_exp = mk(h, "Button", "▶ 导出视频参数", ws, ID_HDR_EXP, f);
         c.tip = mk(
@@ -614,7 +628,7 @@ impl App {
         let c = &self.ctl;
         let t = win::wide(&format!("帧密度：{} fps", self.fps));
         SetWindowTextW(c.lbl_fps, t.as_ptr());
-        let t = win::wide(&format!("像素差异阈值：{:.3}", self.threshold));
+        let t = win::wide(&format!("变化阈值：{} 像素", group_thousands(self.threshold_px)));
         SetWindowTextW(c.lbl_thr, t.as_ptr());
         let t = win::wide(&self.status_text());
         SetWindowTextW(c.status, t.as_ptr());
@@ -629,7 +643,7 @@ impl App {
         let f = SendMessageW(c.sld_fps, TBM_GETPOS_C, 0, 0) as i32;
         let t = SendMessageW(c.sld_thr, TBM_GETPOS_C, 0, 0) as i32;
         self.fps = (f.clamp(1, 8)) as f64;
-        self.threshold = (t.clamp(0, 50)) as f32 / 1000.0;
+        self.threshold_px = (t.clamp(0, 100) as u32) * 500;
         self.refresh_labels();
     }
 
@@ -1017,11 +1031,11 @@ impl App {
         }
         self.preview_cap = None; // 录制期间由录制线程独占抓帧
         logline!(
-            "[record] 开始录制 target=0x{:X} | {} | fps={} threshold={}",
+            "[record] 开始录制 target=0x{:X} | {} | fps={} threshold={}px",
             target.hwnd as isize,
             target.label(),
             self.fps,
-            self.threshold
+            self.threshold_px
         );
         let cfg = RecorderConfig {
             hwnd: target.hwnd as isize,
@@ -1032,7 +1046,7 @@ impl App {
                 target.process.clone()
             },
             fps: self.fps,
-            threshold: self.threshold,
+            threshold: recorder::Threshold::Pixels(self.threshold_px),
             fill_rgb: [0, 0, 0],
             // GUI 流程启用"其他软件在前台就暂停"（用户点完录制会点进画布）
             fg_pause: true,
