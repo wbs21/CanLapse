@@ -492,7 +492,8 @@ impl App {
             fps: REC_FPS_OPTIONS[REC_FPS_DEFAULT].1,
             threshold: SENS_LEVELS[SENS_DEFAULT],
             auto_clean: true,
-            out_path: root.join("timelapse.mp4"),
+            // 默认导出到"程序所在目录\output"（不再放在缓存目录里）
+            out_path: default_output_dir().join("timelapse.mp4"),
             target: None,
             preview: None,
             preview_rect: rect(0, 0, 0, 0),
@@ -1448,6 +1449,37 @@ fn default_cache_root() -> PathBuf {
     }
     let base = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".to_string());
     PathBuf::from(base).join("CanLapse").join("cache")
+}
+
+/// 默认导出目录：**程序所在目录下的 output\\**（v1.0.0 增补需求）。
+///
+/// 放在 exe 旁边方便用户直接找到成片；如果程序装在 Program Files 这类不可写目录，
+/// 自动退回 `%LOCALAPPDATA%\CanLapse\output`，并仍会把目录建出来。
+pub fn default_output_dir() -> PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let out = dir.join("output");
+            if std::fs::create_dir_all(&out).is_ok() && dir_writable(&out) {
+                return out;
+            }
+        }
+    }
+    let base = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".to_string());
+    let out = PathBuf::from(base).join("CanLapse").join("output");
+    let _ = std::fs::create_dir_all(&out);
+    out
+}
+
+/// 目录是否可写（写一个探针文件再删掉）
+fn dir_writable(dir: &std::path::Path) -> bool {
+    let probe = dir.join(".canlapse-write-test");
+    match std::fs::write(&probe, b"1") {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 /// 粗略判断"画布可能没浮动"：客户区里出现明显偏窄或偏宽的比例，

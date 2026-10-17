@@ -58,6 +58,13 @@
 
 ### 变更
 
+- **默认导出目录改到「程序所在目录\output」**（v1.0.0 收工后增补）
+  - 启动时自动创建 `<exe 目录>\output`，输出框默认 `<exe 目录>\output\timelapse.mp4`；
+  - 若程序目录不可写（例如装在 Program Files），自动退回 `%LOCALAPPDATA%\CanLapse\output`
+    并仍会建目录；
+  - 默认文件名仍是 `timelapse.mp4`（同目录重复导出会覆盖，可在输出框改成别的名字）。
+
+
 - **录制控制条默认吸附屏幕右上角，只能沿上边缘左右拖动**
   - 创建时按主显示器工作区定位到右上角（右/上各留 10px，避开任务栏）；
   - 去掉原来的 HTCAPTION 整窗拖动：`WM_NCHITTEST` 一律返回 HTCLIENT，按下空白处自己起拖动，
