@@ -821,12 +821,12 @@ impl App {
         // 拾取期间最小化主窗口（用户要求），让开目标；拾取结束再恢复。
         ShowWindow(self.hwnd, SW_MINIMIZE);
         logline!("[pick] 主窗口已最小化，进入拾取");
-        // 说明清楚：拾取时 CanLapse 已最小化到任务栏（点不到），唯一该点的是画布。
-        let t = win::wide("CanLapse 已最小化到任务栏；请点击画布画面（按 Esc 取消）");
+        // 说明清楚：拾取时 CanLapse 已最小化到任务栏（点不到），唯一该点的是画布边框。
+        let t = win::wide("请点击画布边框（CanLapse 已最小化到任务栏；Esc 取消）");
         SetWindowTextW(self.ctl.state, t.as_ptr());
         UpdateWindow(self.hwnd);
 
-        let hint = win::pick_hint_create("CanLapse 已最小化到任务栏 · 请点画布画面确认（Esc 取消）");
+        let hint = win::pick_hint_create("请点击画布边框");
         let picked = win::pick_window_interactive(self.hwnd, Some(hint));
         win::pick_hint_destroy(hint);
 
@@ -1512,6 +1512,23 @@ fn looks_like_panel(info: &win::WindowInfo) -> bool {
     main_frame || ratio > 3.2 || ratio < 0.35
 }
 
+/// 把已经在运行的 CanLapse 主窗口叫到前台（第二个实例只做这件事）
+unsafe fn activate_existing() -> bool {
+    let c = cls(MAIN_CLASS);
+    // 先按类名找；个别系统上 FindWindow 的 title=NULL 不匹配，再退回按标题找
+    let mut h = windows_sys::Win32::UI::WindowsAndMessaging::FindWindowW(c.as_ptr(), std::ptr::null());
+    if h.is_null() {
+        let t = win::wide("CanLapse");
+        h = windows_sys::Win32::UI::WindowsAndMessaging::FindWindowW(c.as_ptr(), t.as_ptr());
+    }
+    if h.is_null() {
+        return false;
+    }
+    ShowWindow(h, SW_RESTORE);
+    SetForegroundWindow(h);
+    true
+}
+
 unsafe fn message(owner: HWND, title: &str, text: &str) {
     let t = win::wide(title);
     let b = win::wide(text);
@@ -1630,8 +1647,23 @@ pub fn run(initial_target: Option<isize>) -> i32 {
         unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetSystemMetrics(0) },  // SM_CXSCREEN
         unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetSystemMetrics(1) },  // SM_CYSCREEN
     );
+    // 单实例：第二个进程只负责把已有窗口叫到前台，然后退出。
+    // 放这里（而不是 bin 入口）是因为 `CanLapse.exe` 和 `canlapse-cli gui` 都走 ui::run。
+    if !win::single_instance_acquire() {
+        logline!("[start] 已有实例在运行，激活它并退出");
+        let ok = unsafe { activate_existing() };
+        if !ok {
+            unsafe {
+                message(
+                    std::ptr::null_mut(),
+                    "CanLapse",
+                    "CanLapse 已经在运行（可能被最小化到任务栏）。",
+                );
+            }
+        }
+        return 0;
+    }
     // 崩溃现场落盘：GUI 是 windows 子系统，stderr 默认不可见，panic 信息会完全丢失。
-    // 装了钩子后，一旦崩溃可查看 %LOCALAPPDATA%\CanLapse\crash.log（追加写入）。
     std::panic::set_hook(Box::new(|info| {
         let dir = std::env::var("LOCALAPPDATA")
             .map(std::path::PathBuf::from)

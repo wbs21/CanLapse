@@ -9,7 +9,9 @@ use std::time::Duration;
 use crate::logline;
 
 use windows_sys::core::BOOL;
-use windows_sys::Win32::Foundation::{CloseHandle, HWND, LPARAM, LRESULT, POINT, RECT, SYSTEMTIME, WPARAM};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, SYSTEMTIME, WPARAM,
+};
 // 注意：ClientToScreen 在 Graphics::Gdi 下，不在 WindowsAndMessaging（实测踩过）。
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, ClientToScreen, CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint,
@@ -19,7 +21,7 @@ use windows_sys::Win32::Graphics::Gdi::{
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::SystemInformation::GetLocalTime;
 use windows_sys::Win32::System::Threading::{
-    OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+    CreateMutexW, OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, VK_ESCAPE, VK_F8,
@@ -262,8 +264,8 @@ fn key_down(vk: u16) -> bool {
 /// 全部可控。
 const HINT_CLASS: &str = "CanLapsePickHint";
 static HINT_REG: Once = Once::new();
-const HINT_W: i32 = 460;
-const HINT_H: i32 = 46;
+const HINT_W: i32 = 240;
+const HINT_H: i32 = 40;
 
 unsafe extern "system" fn hint_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
@@ -940,6 +942,33 @@ pub fn foreground_pid() -> u32 {
 /// 供 capture 模块建宿主窗口用
 pub fn module_handle() -> *mut c_void {
     unsafe { GetModuleHandleW(null()) }
+}
+
+// ---------------------------------------------------------------------------
+// 单实例
+// ---------------------------------------------------------------------------
+//
+// 用**命名互斥体**（`Local\` 前缀 = 当前登录会话）：进程退出或崩溃时内核自动释放。
+// 刻意不用"锁文件"方案 —— 崩溃后会留下假锁，用户再也打不开程序（这类坑很常见）。
+
+static INSTANCE_MUTEX: std::sync::OnceLock<isize> = std::sync::OnceLock::new();
+
+/// 尝试取得单实例锁：`true` = 本进程是唯一实例；`false` = 已有实例在跑。
+pub fn single_instance_acquire() -> bool {
+    let name = wide("Local\\CanLapse.SingleInstance");
+    let h = unsafe { CreateMutexW(std::ptr::null(), 1, name.as_ptr()) };
+    if h.is_null() {
+        // 创建失败（权限/资源极少见）时不要让用户完全打不开程序，放行并记日志
+        logline!(
+            "[start] 单实例互斥体创建失败（err={}），继续启动",
+            unsafe { GetLastError() }
+        );
+        return true;
+    }
+    let already = unsafe { GetLastError() } == 183; // ERROR_ALREADY_EXISTS
+    // 句柄保持到进程结束（不要 CloseHandle，否则锁会提前释放）
+    let _ = INSTANCE_MUTEX.set(h as isize);
+    !already
 }
 
 // ---------------------------------------------------------------------------
