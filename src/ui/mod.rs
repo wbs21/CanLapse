@@ -555,6 +555,10 @@ impl App {
 
     unsafe fn sync_sliders(&mut self) {
         let c = &self.ctl;
+        // 保险：控件句柄异常时直接返回，不要让读位置引发崩溃
+        if c.sld_fps.is_null() || c.sld_thr.is_null() {
+            return;
+        }
         let f = SendMessageW(c.sld_fps, TBM_GETPOS_C, 0, 0) as i32;
         let t = SendMessageW(c.sld_thr, TBM_GETPOS_C, 0, 0) as i32;
         self.fps = (f.clamp(1, 8)) as f64;
@@ -1282,6 +1286,25 @@ unsafe extern "system" fn preview_proc(
 
 /// 启动 GUI（阻塞到窗口关闭）
 pub fn run(initial_target: Option<isize>) -> i32 {
+    // 崩溃现场落盘：GUI 是 windows 子系统，stderr 默认不可见，panic 信息会完全丢失。
+    // 装了钩子后，一旦崩溃可查看 %LOCALAPPDATA%\CanLapse\crash.log（追加写入）。
+    std::panic::set_hook(Box::new(|info| {
+        let dir = std::env::var("LOCALAPPDATA")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+            .join("CanLapse");
+        let _ = std::fs::create_dir_all(&dir);
+        let stamp = win::stamp_iso(&win::local_now());
+        let text = format!("[{stamp}] {info}\n");
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("crash.log"))
+        {
+            let _ = f.write_all(text.as_bytes());
+        }
+    }));
     unsafe {
         let icc = INITCOMMONCONTROLSEX {
             dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
