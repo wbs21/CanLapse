@@ -70,6 +70,7 @@ static STATES: Mutex<Option<HashMap<isize, State>>> = Mutex::new(None);
 static FONT: OnceLock<isize> = OnceLock::new();
 static BG_BRUSH: OnceLock<isize> = OnceLock::new();
 static SMALL_FONT: OnceLock<isize> = OnceLock::new();
+static HEADING: OnceLock<isize> = OnceLock::new();
 
 fn with_state<R>(f: impl FnOnce(&mut HashMap<isize, State>) -> R) -> R {
     let mut guard = STATES.lock().unwrap();
@@ -94,6 +95,21 @@ pub fn font() -> HGDIOBJ {
 pub fn bg_brush() -> HBRUSH {
     let b = *BG_BRUSH.get_or_init(|| unsafe { CreateSolidBrush(BG) as isize });
     b as HBRUSH
+}
+
+/// 15px 标题字体：合成遮罩的"视频合成中"用
+pub fn heading_font() -> HGDIOBJ {
+    let f = *HEADING.get_or_init(|| unsafe {
+        let face = win::wide("Microsoft YaHei UI");
+        let v = CreateFontW(-15, 0, 0, 0, FW_NORMAL as i32, 0, 0, 0, 1, 0, 0, 0, 0, face.as_ptr())
+            as isize;
+        if v == 0 {
+            font() as isize
+        } else {
+            v
+        }
+    });
+    f as HGDIOBJ
 }
 
 /// 9px 小字体：窄按钮放不下时自动降一档

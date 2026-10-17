@@ -159,6 +159,11 @@ impl Shared {
     pub fn request_stop(&self) {
         self.stop.store(true, Ordering::SeqCst);
     }
+
+    /// 用户已经点了停止（录制线程可能还在跑最后一帧）
+    pub fn stop_requested(&self) -> bool {
+        self.stop.load(Ordering::SeqCst)
+    }
     /// 切换暂停，返回切换后的暂停状态
     pub fn toggle_pause(&self) -> bool {
         let now = !self.paused.load(Ordering::SeqCst);
