@@ -1,0 +1,19 @@
+{
+  "session": {
+    "version": 1,
+    "name": "改尺寸",
+    "created": "2026-10-17T09:07:06.223",
+    "source_title": "CanLapseResizeTest",
+    "source_class": "WindowsForms10.Window.8.app.0.2b7a1f2_r3_ad1",
+    "source_process": "pwsh.exe",
+    "width": 624,
+    "height": 381,
+    "record_fps": 2.0,
+    "threshold": 0.002,
+    "frames": 49,
+    "dropped": 0,
+    "duration_ms": 24500,
+    "completed": true
+  },
+  "markers": []
+}
