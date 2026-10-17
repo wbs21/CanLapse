@@ -2,8 +2,10 @@
 
 > 面向手绘创作者（SAI2 > Photoshop > CLIP STUDIO PAINT > Krita）的 **Windows 画布窗口缩时录屏工具**。
 
-当前状态：**垂直切片已闭环** —— 拾取窗口 → 差分 → PNG 缓存 → 合成 MP4 已端到端实测出片；
-GUI（460×380 单页 + 悬浮操作条）尚未开始。
+当前状态：**v1.0 功能完整、真机验证通过** —— 拾取窗口 → 差分 → PNG 缓存 → 合成 MP4 全链路可用；
+单页 GUI（460×455）、悬浮操作条、历史会话面板与两个弹窗均已完成，并在真实绘画软件
+（SAI2 / Krita / CSP）上实测。尚未覆盖的只剩 Photoshop（本机未安装）与 4K 画布的产品路径复测，
+明细见 [docs/verification-log.md](docs/verification-log.md)。
 
 ## 它怎么工作
 
@@ -13,8 +15,9 @@ GUI（460×380 单页 + 悬浮操作条）尚未开始。
 3. 录制结束后用**自编译的最小 OpenH264 编码器**批量合成 MP4；
 4. 录制参数与导出参数**相互独立**（帧密度 1~8fps 决定录制，播放帧率 5/10/15/20/24fps 决定导出）。
 
-设计约束（v1.0）：**单页面小巧主窗口 460×380，无独立设置面板**；录制时主窗口最小化，
-只保留悬浮操作条；**无自动画布识别**。完整需求见 [docs/requirements.md](docs/requirements.md)。
+设计约束（v1.0）：**单页面小巧主窗口（规格 460×380，实际 460×455，高度不够会压掉内容）**，
+无独立设置面板；录制时主窗口最小化，只保留悬浮操作条；**无自动画布识别**。
+完整需求见 [docs/requirements.md](docs/requirements.md)。
 
 ## 当前进度
 
@@ -23,13 +26,14 @@ GUI（460×380 单页 + 悬浮操作条）尚未开始。
 | 抓帧（DWM 缩略图宿主 + `PrintWindow`） | ✅ 端到端跑通 | [FINDINGS](spikes/dwm-capture/FINDINGS.md) |
 | 帧差分（静止画面不存帧） | ✅ 已实测 | 4fps×6s：变化目标存 24 帧，静止目标存 1 帧 |
 | 分辨率统一（等比+居中+黑边） | ✅ 已实测 | 录制中途 480×320→640×400，32 帧全为 480×320，后段 480×300 居中+上下各 10 行黑边 |
-| 会话缓存 `frame_xxxx.png` + `markers.json` | ✅ 有单测覆盖 | `cargo test`（11 项全过） |
+| 会话缓存 `frame_xxxx.png` + `markers.json` | ✅ 有单测覆盖 | `cargo test`（24 项全过） |
 | 录制容错（目标窗口消失 / 单帧失败跳过） | ✅ 已实测 | 目标关闭后自动停止并写 `completed:false` |
 | 视频合成（H.264 MP4） | ✅ 已接入并端到端实测 | 24 帧 → 480×320 / 2.4s，`ffprobe -count_frames` = 24 |
 | 取消合成（部分文件仍可播放） | ✅ 已实测 | `--frames 8` → 8 帧 / 0.8s，解码退出码 0 |
-| 单页 GUI 460×380 + 悬浮操作条 | ❌ 未开始 | — |
-| 历史会话面板（重新导出/打开/删除） | 🟡 数据层已有，UI 未做 | `canlapse sessions` |
-| 帮助弹窗 / 预览大图 | ❌ 未开始 | — |
+| 单页 GUI + 悬浮操作条 | ✅ 全流程实测 | 460×455；暂停/标记/停止、进度条、取消合成逐项点过 |
+| 历史会话面板（重新导出/删除） | ✅ 已实测 | 名称+帧数列表；重新导出产出 `<名称>_<帧率>fps.mp4` |
+| 帮助弹窗 / 预览大图 | ✅ 已实测 | 大图弹窗修正"创建在绘画软件后面" |
+| 打包（图标 / 版本信息 / 清单） | ✅ 已实测 | `tools\build.ps1` 构建后注入；版本信息读出 `1.0.0.0` |
 
 编码走**导入库静态链接**：`build.rs` 会按 `CANLAPSE_FFMPEG_MIN`（默认 `D:\CapLite\ffmpeg-min`）
 输出链接参数，并把 6 个运行时 DLL（5 个 `av*` + `libwinpthread-1.dll`）自动复制到
@@ -47,6 +51,8 @@ GUI（460×380 单页 + 悬浮操作条）尚未开始。
 | 技术栈 | Rust（`x86_64-pc-windows-msvc`）+ `windows-sys`，不用第三方 UI 框架 | [ADR 0002](docs/decisions/0002-rust-and-dwm-thumbnail-capture.md) |
 | 抓帧 | **DWM 缩略图宿主 + `PrintWindow(宿主, PW_RENDERFULLCONTENT)`** | 同上 |
 | 编码 | 手写 FFI 直链自编译最小 ffmpeg（libopenh264），编码 crate 零依赖 | [ADR 0003](docs/decisions/0003-video-encoding-ffmpeg-min-openh264.md) |
+| UI | 原生 Win32（对比 egui 后选定；GUI 进程 25 MB vs 175 MB） | [ADR 0004](docs/decisions/0004-ui-stack-comparison.md) |
+| Qt 类软件 | 无画布子窗口（alien widgets）→ 只能录整个窗口，建议 Canvas-only 模式 | [ADR 0005](docs/decisions/0005-qt-apps-no-canvas-child.md) |
 
 抓帧这一项是产品的技术核心，已用原型严格实测（跨进程 + 遮挡 + 最小化三态，逐像素自证）：
 
@@ -56,9 +62,14 @@ GUI（460×380 单页 + 悬浮操作条）尚未开始。
   直接 `PrintWindow` 源窗口（在 Chromium 上直接返回失败，应用相关性太强）；
 * 额外收益：抓到的**只有目标窗口自身的内容**，压在它上面的其他窗口不会进入画面。
 
-## 用法（命令行切片）
+## 用法
 
 ```powershell
+# 推荐：一键构建（cargo build + 构建后注入图标/版本信息）
+pwsh -File tools\build.ps1                  # debug
+pwsh -File tools\build.ps1 -Profile release # release
+
+# ⚠️ 直接 cargo build 不会注入图标与版本信息（资源是构建后注入的，见下文）
 cargo build --offline
 
 .\target\debug\CanLapse.exe                                       # 图形界面（双击这个；无控制台）
@@ -73,16 +84,18 @@ cargo test --offline                                              # 单元测试
 ```
 
 缓存默认在 `%LOCALAPPDATA%\CanLapse\cache`，可用 `--out` 或环境变量 `CANLAPSE_CACHE` 覆盖。
+拾取流程的排查日志默认**不写文件**；需要时设 `CANLAPSE_LOG=<路径>` 再启动即可。
 
 ## 目录结构
 
 ```
 CanLapse/
-├─ src/                 产品代码（抓帧/差分/会话/PNG 已实现；encode 待接入；GUI 待做）
-├─ tests/               预留
+├─ src/                 产品代码（抓帧 / 差分 / 会话 / PNG / 编码 / 原生 Win32 GUI）
+├─ tools/               构建与打包脚本（build.ps1 一键构建；embed-resources.ps1 资源注入）
 ├─ docs/
 │  ├─ requirements.md   v1.0 需求基线
-│  └─ decisions/        架构决策记录（ADR 0001~0003）
+│  ├─ verification-log.md 验证台账（只记跑出来的事实）
+│  └─ decisions/        架构决策记录（ADR 0001~0005）
 ├─ spikes/              技术验证原型（保留作为依据，不属于产品代码）
 │  ├─ dwm-capture/      DWM 抓帧可行性原型 + FINDINGS.md + 实测截图
 │  └─ encode-mp4/       离线 H.264/MP4 编码原型 + FINDINGS.md + out.mp4
@@ -96,11 +109,11 @@ CanLapse/
    发布前必须处理。详见 [ADR 0003](docs/decisions/0003-video-encoding-ffmpeg-min-openh264.md)。
 2. **DLL 部署**：`avcodec-63.dll` 依赖 `libwinpthread-1.dll`，而 `ffmpeg-min\bin` 里没有它；
    发错版本会以 `0xC0000139` 启动失败。
-3. **超大画布未验证**：抓帧实测最大 1302×887；4K 画布下的宿主尺寸与是否 1:1 缩放需补测。
+3. **超大画布未验证**：抓帧实测最大 3604×1061；4K 画布下的宿主尺寸与是否 1:1 缩放需补测。
 4. **依赖实现行为**：`缩略图 + PW_RENDERFULLCONTENT` 没有微软的明确文档承诺，
    代码里已有纯色画面告警作为兜底。
-5. **目标应用差异**：SAI2 / Photoshop / CSP 本机未安装，尚未验证；
-   Krita 因本机环境限制（其资源数据库写入被沙箱拦截，启动即崩）未能完成主窗口验证。
+5. **目标应用差异**：SAI2 / Krita / CSP 已真机验证（Qt 类软件只能录整个窗口，见 ADR 0005）；
+   **Photoshop 本机未安装，尚未验证**。
 
 ## 许可
 

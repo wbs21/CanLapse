@@ -12,24 +12,38 @@
 - **产品代码（垂直切片：拾取 → 差分 → PNG 缓存 → 合成 MP4）**
   - `src/capture.rs`：DWM 缩略图宿主 + `PrintWindow(PW_RENDERFULLCONTENT)` 抓帧，
     含目标尺寸变化时的自动重建、纯色画面告警兜底、以及诊断用的对照实现。
-  - `src/frame.rs`：BGRA 帧与帧间差分（变化像素比例，供阈值判定），含 6 项单测。
+  - `src/frame.rs`：BGRA 帧与帧间差分（变化像素比例，供阈值判定），含 12 项单测。
   - `src/session.rs`：`{时间}_{会话名称}` 会话目录、`frame_xxxx.png`、`markers.json`
     （帧序号/时钟时间/耗时/备注 + 会话元信息），含历史会话列表与删除，含 2 项单测。
   - `src/png_io.rs`：PNG 读写。
-  - `src/win.rs`：窗口枚举、进程名、鼠标拾取、消息泵、本地时间，含 3 项单测。
-  - `src/main.rs`：命令行切片（`list` / `pick` / `record` / `sessions` / `encode` / `doctor`）。
+  - `src/win.rs`：窗口枚举、进程名、鼠标拾取、消息泵、本地时间，含 5 项单测。
+  - `src/main.rs`：命令行切片（`list` / `pick` / `record` / `sessions` / `encode` / `doctor` / `gui`）。
   - `src/encode.rs` + `src/encode/ffi.rs`：PNG 序列 → H.264 MP4（libopenh264）。
     FFI 偏移表**逐字节复制**自已验证的原型；生产版另加 RAII 释放、中途取消
     （取消后产出仍可播放）、混合尺寸帧自动统一缩放。
   - `build.rs`：链接自编译最小 ffmpeg，并把 5 个 `av*.dll` + `libwinpthread-1.dll`
     自动部署到 `target/<profile>` 与 `target/<profile>/deps`（后者供 `cargo test` 启动）。
-- **技术验证原型**
+- **单页 GUI（`src/ui/mod.rs`、`src/ui/floatbar.rs`，原生 Win32，无第三方 UI 框架）**
+  - 460×455 单页：拾取按钮组 + 160×100 实时预览 + 状态提示、录制参数、导出参数、
+    历史会话折叠面板、贴底整宽状态栏；底部操作区随 Idle / Recording / Encoding 切换。
+  - 悬浮操作条 400×44：`TOPMOST | TOOLWINDOW | NOACTIVATE`，不抢绘画软件焦点；
+    暂停 / 标记 / 停止、计时与帧数写在**可见控件**里（不是无标题栏窗口的标题）。
+  - 历史会话列表（名称｜帧数）+ 重新导出 / 打开文件夹 / 删除；录制或合成中的会话禁止删除。
+  - 两个弹窗：帮助（4 款绘画软件浮动画布指引）、大图预览（等比缩放、置前）。
+  - 崩溃现场落盘：panic 写入 `%LOCALAPPDATA%\CanLapse\crash.log`（GUI 是 windows 子系统，
+    stderr 看不见）；拾取流程另有 `CANLAPSE_LOG` 显式开启的诊断日志。
+- **技术验证原型**（保留作为依据，不属于产品代码）
   - `spikes/dwm-capture/`：DWM 抓帧可行性原型（6 种读回方式 × 可见/遮挡/最小化三态，
     跨进程 `--helper` 对端，按 tick 绘制确定性图案做逐像素自证）+ FINDINGS + 实测截图。
   - `spikes/encode-mp4/`：离线 H.264/MP4 编码原型（手写 FFI 直链 ffmpeg-min 的 libopenh264）
     + FINDINGS + `out.mp4`（48 帧 / 640×360 / 4.8s，经三重验证）。
-- `docs/requirements.md`：v1.0 需求基线。
-- ADR 0002（Rust + DWM 缩略图抓帧）、ADR 0003（手写 FFI 直链自编译最小 ffmpeg 编码）。
+- **打包**
+  - `tools/build.ps1`：一键构建（cargo build + 构建后资源注入）。
+  - `tools/embed-resources.ps1` + `tools/ResInject.cs`：`.res` → `res.dll` → `UpdateResourceW`
+    注入图标与版本信息；`.rc` 用 UTF-16LE 且必须 `#define VS_VERSION_INFO 1`（否则写出空壳）。
+- `docs/requirements.md`：v1.0 需求基线；`docs/verification-log.md`：验证台账。
+- ADR 0002（Rust + DWM 缩略图抓帧）、0003（手写 FFI 直链自编译最小 ffmpeg）、
+  0004（UI 技术栈对比）、0005（Qt 类软件无画布子窗口）。
 
 ### 变更
 
@@ -42,12 +56,33 @@
   未引入 `image` crate（该路径只在"录制中途改了窗口尺寸"时才会走到）。
 - 录制信息栏实时显示基准分辨率，并在录制开始时给出"第一张画面决定视频分辨率"的提示。
 - 技术栈由「待定」定为 **Rust**（`x86_64-pc-windows-msvc` + `windows-sys`，无第三方 UI 框架）。
-- 项目骨架填充为真实内容：README 改为产品说明与进度表。
+- 与规格的两处有意偏差：窗口实际 460×455（内容需要更多高度，经确认观感次要）；
+  历史会话用「列表 + 三个按钮」而不是"每行三个按钮"（460px 宽塞不下）。
+- 按用户要求：拾取期间**最小化主窗口**（放弃半透明/鼠标穿透方案），并过滤输入法等系统浮层；
+  抓帧失败不再弹模态框，改写状态栏供用户直接重试。
+- 默认导出帧率 24fps；导出参数面板默认展开；录制按钮移到预览区右侧并变绿。
+- 拾取诊断日志改为**显式开启**（设 `CANLAPSE_LOG=<路径>` 才写文件），默认不再往
+  `%LOCALAPPDATA%\CanLapse\pick.log` 留调试残留。
 
 ### 修复
 
-- 录制循环原本用一次 `sleep` 等完整个采样间隔，低帧密度（如 1fps）下用户**短按 Esc/F8 会被整个漏掉**；
+- 录制循环原本用一次 `sleep` 等完整采样间隔，低帧密度（如 1fps）下用户**短按 Esc/F8 会被整个漏掉**；
   改为把等待切成 20ms 小片轮询按键。
+- 实跑才暴露的 GUI 缺陷（提醒：不要只靠读代码验收）：
+  悬浮条时长写在无标题栏窗口的标题里、exe 控制台子系统弹黑框、
+  `CanLapse.exe` 与 `canlapse.exe` 大小写同名互相覆盖、
+  重新导出的产物被自动清理删掉、大图预览创建在绘画软件后面、录后台窗口一直暂停（补 `--no-fg-pause`）。
+- 滑块"跳回、只能往左"：把 `TBM_GETPOS` 常量写成了 `TBM_SETRANGEMAX`。
+- 拾取"点了半天没反应"：点击被自家置顶窗口吃掉；系统浮层（`Windows.UI.Core.CoreWindow`）
+  把真正的候选顶掉；抓帧失败弹模态框挡住流程。
+- 版本信息读出全空：`.rc` 漏了 `#define VS_VERSION_INFO 1`，写出的 `RT_VERSION` 是空壳
+  （有名字项、无语言子项、0 字节）；另 `.rc` 必须存成 UTF-16LE，UTF-8 + `#pragma code_page`
+  会让 `rc.exe` 静默产出近乎空的 `.res`。
+- 预览区细节：占位文字用了窗口 DC 的默认 System 位图字体（巨大且被裁）、
+  `DT_CALCRECT` 会收窄矩形导致"居中"变成贴左；抓帧失败后旧预览仍留在画面上。
+- 拾取结束只调 `InvalidateRect`，而主窗口刚从小化恢复、WM_PAINT 时机不保证 →
+  改为 `InvalidateRect` + `UpdateWindow` 同步重绘；预览的尺寸防御检查也不再
+  在异常分支 `return`（那会跳过 `EndPaint`，每帧漏一个 DC）。
 
 ### 已验证（实测证据）
 
@@ -64,11 +99,17 @@
   解码退出码 0 —— 取消后的文件是**可播放的部分视频**，不是损坏文件。
 - `canlapse doctor` 打印的 `avcodec_configuration()` 确证：这套构建的视频编码器
   **只有 libopenh264、没有 x264**（`--disable-everything --enable-encoder='libopenh264,aac'`）。
+- **GUI 全流程**：460×455 主窗口、悬浮条三个按钮、进度条与取消合成、历史会话的
+  重新导出/删除、大图预览与帮助弹窗均逐项点过（细节见 `docs/verification-log.md`）。
+- **真实软件**：SAI2 画布子窗口、Krita（顶层窗口路径）、CSP 5.0.4 画布子窗口均实测；
+  CSP 上录到 90 秒真实绘画过程 → 36 帧 → 3.000 秒成片（36÷12fps 精确吻合）。
+- **打包**：`tools\build.ps1` 产出的两个 exe 都能读出 `1.0.0.0` 版本信息、带自定义图标；
+  GUI 入口无 `ConsoleWindowClass`。
 
 ### 尚未完成
 
-- 单页 GUI（460×380）、悬浮操作条、历史会话面板 UI、两个弹窗均未开始。
-- 超大画布（4K）、SAI2/Photoshop/CSP 真机、fragmented MP4 未验证。
+- Photoshop 真机（本机未安装）；4K 画布的**产品路径**复测；fragmented MP4。
+- H.264 版税责任（自编译 libopenh264）—— 发布前必须处理，见 ADR 0003。
 
 ### 备注（对原始需求的两处纠正）
 
