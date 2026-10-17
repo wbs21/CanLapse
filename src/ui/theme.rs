@@ -80,7 +80,7 @@ fn with_state<R>(f: impl FnOnce(&mut HashMap<isize, State>) -> R) -> R {
 pub fn font() -> HGDIOBJ {
     let f = *FONT.get_or_init(|| unsafe {
         let face = win::wide("Microsoft YaHei UI");
-        let mut f = CreateFontW(-14, 0, 0, 0, FW_NORMAL as i32, 0, 0, 0, 1, 0, 0, 0, 0, face.as_ptr())
+        let mut f = CreateFontW(-11, 0, 0, 0, FW_NORMAL as i32, 0, 0, 0, 1, 0, 0, 0, 0, face.as_ptr())
             as isize;
         if f == 0 {
             f = GetStockObject(DEFAULT_GUI_FONT) as isize;
@@ -96,11 +96,11 @@ pub fn bg_brush() -> HBRUSH {
     b as HBRUSH
 }
 
-/// 12px 小字体：窄按钮放不下时自动降一档
+/// 9px 小字体：窄按钮放不下时自动降一档
 pub fn small_font() -> HGDIOBJ {
     let f = *SMALL_FONT.get_or_init(|| unsafe {
         let face = win::wide("Microsoft YaHei UI");
-        let v = CreateFontW(-12, 0, 0, 0, FW_NORMAL as i32, 0, 0, 0, 1, 0, 0, 0, 0, face.as_ptr())
+        let v = CreateFontW(-9, 0, 0, 0, FW_NORMAL as i32, 0, 0, 0, 1, 0, 0, 0, 0, face.as_ptr())
             as isize;
         if v == 0 {
             font() as isize

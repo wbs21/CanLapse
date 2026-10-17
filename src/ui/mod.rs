@@ -327,14 +327,14 @@ fn compute_layout(app: &App, cw: i32) -> (Vec<(HWND, RECT, bool)>, RECT, i32) {
     push(c.progress, rect(m, by, inner - 52, 18), true);
     push(c.btn_cancel, rect(cw - m - 48, by, 48, 20), true);
     // 最下方：清理缓存按钮（宽度为内容宽度的 1/3，居中）
-    let cy = by + 19; // 比进度行再上移 5px（用户要求）
+    let cy = by + 9; // 紧贴内容区（用户要求再上移 10px）
     let clean_w = (inner / 3).max(88);
     push(
         c.btn_clean,
         rect(m + (inner - clean_w) / 2, cy, clean_w, 24),
         true,
     );
-    let need = cy + 30;
+    let need = cy + 40; // 按钮与下边框留 16px（用户两次各要求 +5px）
 
     (out, prev, need)
 }
@@ -1310,6 +1310,7 @@ impl App {
         ShowWindow(self.ctl.btn_record, SW_SHOW);
         ShowWindow(self.ctl.progress, 0);
         ShowWindow(self.ctl.btn_cancel, 0);
+        ShowWindow(self.ctl.btn_clean, SW_SHOW);
         // 恢复"已选中画布窗口…"这类常态信息（底部状态栏已移除，信息显示在这一行）
         self.refresh_labels();
     }
@@ -1324,6 +1325,8 @@ impl App {
 
     unsafe fn ui_set_encoding(&self) {
         ShowWindow(self.ctl.btn_record, 0);
+        // 进度条会占用按钮上方的空间，合成期间先隐藏清理按钮，避免叠在一起
+        ShowWindow(self.ctl.btn_clean, 0);
         ShowWindow(self.ctl.progress, SW_SHOW);
         ShowWindow(self.ctl.btn_cancel, SW_SHOW);
     }
