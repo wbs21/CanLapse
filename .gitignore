@@ -71,3 +71,19 @@ add/
 # ---- 临时诊断输出（跑验证脚本时产生）----
 .*-err.txt
 .*-out.txt
+
+# ---- 验证脚本用的临时缓存目录（都是点开头，别再提交）----
+.mf2/
+.multiframe/
+.real2/
+.real-timelapse/
+.mark-check/
+.krita-real/
+.hist-check/
+.hist-check2/
+.fg-check/
+.fg-check2/
+.bar-check/
+.warn-check/
+.warn-gui/
+.shot/
