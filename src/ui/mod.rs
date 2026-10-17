@@ -758,7 +758,9 @@ impl App {
         SetWindowTextW(self.ctl.state, t.as_ptr());
         UpdateWindow(self.hwnd);
 
-        let picked = win::pick_window_interactive();
+        let hint = win::pick_hint_create(self.hwnd, "请点击画布窗口的边框");
+        let picked = win::pick_window_interactive(Some(hint));
+        win::pick_hint_destroy(hint);
 
         // 拾取结束：取消半透明与置顶，把界面拉回最前并正常显示
         // SWP_NOMOVE|NOSIZE

@@ -129,7 +129,7 @@ fn cmd_list() -> i32 {
 }
 
 fn cmd_pick() -> i32 {
-    match win::pick_window_interactive() {
+    match win::pick_window_interactive(None) {
         Some(h) => {
             let info = win::describe(h);
             println!("已选中: {}", info.label());
@@ -160,7 +160,7 @@ fn cmd_sessions(root: &PathBuf) -> i32 {
 
 fn resolve_target(a: &RecordArgs) -> Option<win::WindowInfo> {
     if a.pick {
-        let hwnd = win::pick_window_interactive()?;
+        let hwnd = win::pick_window_interactive(None)?;
         return Some(win::describe(hwnd));
     }
     if let Some(h) = a.hwnd {
@@ -180,7 +180,7 @@ fn resolve_target(a: &RecordArgs) -> Option<win::WindowInfo> {
             }
         }
     }
-    let hwnd = win::pick_window_interactive()?;
+    let hwnd = win::pick_window_interactive(None)?;
     Some(win::describe(hwnd))
 }
 

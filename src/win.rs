@@ -224,6 +224,100 @@ fn key_down(vk: u16) -> bool {
     unsafe { (GetAsyncKeyState(vk as i32) as u16) & 0x8000 != 0 }
 }
 
+/// 拾取时跟随鼠标的提示条（Win32 tooltip）。
+///
+/// 为什么用 tooltip 而不是自建窗口：tooltip 天生**鼠标穿透、不抢焦点**，
+/// 不会挡住用户要点的那条边框 —— 自建窗口必须自己加 WS_EX_TRANSPARENT，容易漏。
+pub fn pick_hint_create(owner: HWND, text: &str) -> HWND {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, SendMessageW, WS_POPUP,
+    };
+    // 自己按 ABI 定义 TOOLINFOW，避免去猜它落在哪个模块
+    #[repr(C)]
+    struct ToolInfo {
+        cb_size: u32,
+        flags: u32,
+        hwnd: HWND,
+        id: usize,
+        rect: RECT,
+        inst: isize,
+        text: *mut u16,
+        lparam: isize,
+        reserved: *mut core::ffi::c_void,
+    }
+    unsafe {
+        let cls = wide("tooltips_class32");
+        // ex: LAYERED(0x80000) | TOPMOST(0x8) | TOOLWINDOW(0x80) | TRANSPARENT(0x20)
+        let tip = CreateWindowExW(
+            0x0008_0000 | 0x0000_0008 | 0x0000_0080 | 0x0000_0020,
+            cls.as_ptr(),
+            null(),
+            WS_POPUP | 0x0000_0003, // TTS_ALWAYSTIP|TTS_NOPREFIX
+            0,
+            0,
+            0,
+            0,
+            owner,
+            null_mut(),
+            module_handle(),
+            null(),
+        );
+        if tip.is_null() {
+            return tip;
+        }
+        let mut t: Vec<u16> = text.encode_utf16().collect();
+        t.push(0);
+        let mut ti: ToolInfo = std::mem::zeroed();
+        ti.cb_size = std::mem::size_of::<ToolInfo>() as u32;
+        ti.flags = 0x0020 | 0x0080; // TTF_TRACK | TTF_ABSOLUTE
+        ti.hwnd = owner;
+        ti.id = 1;
+        ti.text = t.as_mut_ptr();
+        SendMessageW(tip, 0x0432, 0, &ti as *const ToolInfo as isize); // TTM_ADDTOOLW
+        SendMessageW(tip, 0x0411, 1, &ti as *const ToolInfo as isize); // TTM_TRACKACTIVATE
+        let p = cursor_position();
+        SendMessageW(tip, 0x0412, 0, pack_xy(p.0 + 18, p.1 + 22)); // TTM_TRACKPOSITION
+        tip
+    }
+}
+
+/// 让提示条跟随鼠标（拾取循环里每次迭代调用）
+pub fn pick_hint_follow(tip: HWND) {
+    if tip.is_null() {
+        return;
+    }
+    let p = cursor_position();
+    unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW(
+            tip,
+            0x0412,
+            0,
+            pack_xy(p.0 + 18, p.1 + 22),
+        );
+    }
+}
+
+pub fn pick_hint_destroy(tip: HWND) {
+    if tip.is_null() {
+        return;
+    }
+    unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::DestroyWindow(tip);
+    }
+}
+
+fn pack_xy(x: i32, y: i32) -> isize {
+    ((y as isize) << 16) | (x as isize & 0xffff)
+}
+
+fn cursor_position() -> (i32, i32) {
+    unsafe {
+        let mut p: POINT = std::mem::zeroed();
+        GetCursorPos(&mut p);
+        (p.x, p.y)
+    }
+}
+
 /// 录制循环里用：是否按下了 Esc（请求停止录制）
 pub fn escape_pressed() -> bool {
     key_down(VK_ESCAPE)
@@ -250,7 +344,7 @@ fn cursor_window() -> HWND {
 /// 交互式拾取：鼠标移到目标窗口上，实时打印光标下的窗口，点左键确认，Esc 取消。
 ///
 /// v1.0 的 GUI 版会把"实时打印"换成屏幕高亮框；选择逻辑本身是同一套。
-pub fn pick_window_interactive() -> Option<HWND> {
+pub fn pick_window_interactive(hint: Option<HWND>) -> Option<HWND> {
     let me = std::process::id();
     let mut last: isize = 0;
     // 记住"最后一个有效的非本进程窗口"。
@@ -264,6 +358,9 @@ pub fn pick_window_interactive() -> Option<HWND> {
             return None;
         }
         let h = cursor_window();
+        if let Some(tip) = hint {
+            pick_hint_follow(tip);
+        }
         if !h.is_null() && pid_of(h) != me {
             candidate = h;
             if h as isize != last {
