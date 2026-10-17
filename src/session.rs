@@ -122,6 +122,14 @@ impl Session {
         Ok(self.meta.frames)
     }
 
+    /// 打一个标记（来自悬浮条的 🏷 按钮，或命令行的 F8）。
+    ///
+    /// `Marker::frame` 存的是**打标记那一刻已保存的帧数**，也就是
+    /// "下一个将要保存的帧的序号"，**不是**指向某个已存在的 frame_XXXX.png。
+    /// 例如只存了 `frame_0000.png` 时打标记，写的是 `frame: 1` —— 这是自洽的
+    /// （标记落在"当前内容之后"），但容易被误读成"指到 frame_0001.png"。
+    /// 想把标记映射到视频时间，应当用 `Marker::elapsed_ms`（与导出帧率一起换算），
+    /// 而不是这个字段。
     pub fn add_marker(&mut self, note: Option<String>, elapsed_ms: u64) {
         self.markers.push(Marker {
             frame: self.meta.frames,
