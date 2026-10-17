@@ -37,11 +37,13 @@
     跨进程 `--helper` 对端，按 tick 绘制确定性图案做逐像素自证）+ FINDINGS + 实测截图。
   - `spikes/encode-mp4/`：离线 H.264/MP4 编码原型（手写 FFI 直链 ffmpeg-min 的 libopenh264）
     + FINDINGS + `out.mp4`（48 帧 / 640×360 / 4.8s，经三重验证）。
-- **运行日志（debug 默认开启）**
-  - `src/log.rs`：debug 构建默认写 `%LOCALAPPDATA%\CanLapse\canlapse.log`（release 需设
-    `CANLAPSE_LOG`），超 4MB 自动轮转成 `.old`；记录启动环境、拾取全过程的窗口层级、
+- **运行日志（默认开启，含 exe 同目录镜像）**
+  - `src/log.rs`：主日志 `%LOCALAPPDATA%\CanLapse\canlapse.log`，同时在 **exe 同目录**
+    写一份 `canlapse.log` —— 用户跑的是 release 版、或 `%LOCALAPPDATA%` 不可写时也能拿到
+    （实测：用户跑过一次却没生成日志，排查卡住）。`CANLAPSE_LOG` 指定主日志、
+    `CANLAPSE_NOLOG=1` 关闭；超过 4MB 轮转为 `.old`。
+  - 记录启动环境（虚拟桌面/主屏尺寸）、拾取全过程的窗口层级与点击结果、
     抓帧器/首帧结果、录制与合成结果、预览抓帧失败（10 秒限流）。
-  - GUI 没有控制台，出问题只能靠这个文件；崩溃另有 `crash.log`。
 - **打包**
   - `tools/build.ps1`：一键构建（cargo build + 构建后资源注入）。
   - `tools/embed-resources.ps1` + `tools/ResInject.cs`：`.res` → `res.dll` → `UpdateResourceW`

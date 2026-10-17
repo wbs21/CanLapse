@@ -90,10 +90,11 @@ cargo test --offline                                              # 单元测试
 （`D:\CapLite\ffmpeg-min`、`D:\ffmpeg各版本\CapLite_c\ffmpeg-min` 等）。
 本机 `D:\CapLite` 被整体挪到 `D:\ffmpeg各版本\CapLite_c` 后，`build.rs` 与 `doctor` 都会自动找到。
 
-**排查日志**：debug 构建默认写入 `%LOCALAPPDATA%\CanLapse\canlapse.log`
-（release 构建需设 `CANLAPSE_LOG=<路径>` 才写；超过 4MB 自动轮转为 `.old`）。
+**排查日志**：默认开启 —— 主日志 `%LOCALAPPDATA%\CanLapse\canlapse.log`，
+并在 **exe 同目录**留一份 `canlapse.log` 镜像（沙箱/只读环境下也能拿到）。
+`CANLAPSE_LOG=<路径>` 可指定主日志，`CANLAPSE_NOLOG=1` 关闭；超过 4MB 自动轮转为 `.old`。
 拾取过程会记录光标经过的窗口层级、点击结果、抓帧器输出尺寸与失败原因 ——
-遇到"点不上/预览不对"直接把这份日志发出来即可定位。
+遇到"点不上/预览不对"直接把日志发出来即可定位。
 
 ## 目录结构
 

@@ -1,78 +1,135 @@
 //! 运行日志：GUI 是 windows 子系统，双击启动没有控制台，出问题只能靠落盘。
 //!
-//! 开关策略（默认**不打扰**用户）：
-//! * **debug 构建默认开启**，写到 `%LOCALAPPDATA%\CanLapse\canlapse.log`
-//!   —— 用户测试时直接跑 `target\debug\CanLapse.exe` 就够了，不需要设任何环境变量；
-//! * release 构建默认关闭，需要时用 `CANLAPSE_LOG=<路径>` 显式开启；
-//! * `CANLAPSE_LOG` 对两种构建都优先。
+//! 落盘策略（**默认开启**，`CANLAPSE_NOLOG=1` 可关）：
+//! * 主日志：`%LOCALAPPDATA%\CanLapse\canlapse.log`；
+//! * **镜像**：exe 同目录的 `canlapse.log` —— 万一本机/沙箱不让写 `%LOCALAPPDATA%`，
+//!   日志仍然落在程序旁边（用户测试后直接把 exe 目录里的那份发出来即可）；
+//! * `CANLAPSE_LOG=<路径>` 可显式指定主日志位置（优先级最高）。
 //!
-//! 为什么不用 `env_logger` 之类：这个项目刻意零 UI/运行时依赖，一个 60 行的追加写入
-//! 就够用，且日志点都在低频路径（拾取/开始/停止/合成），每次 open+append 的代价无所谓。
+//! 为什么不再按 debug/release 区分：用户拿到的往往是 release 版，
+//! "只有 debug 才有日志" 等于下次还是没数据（实测踩过：用户跑了 release，日志目录根本没生成）。
+//! 这个工具一天也写不了几 KB，一直开着没有实际代价。
+//!
+//! 为什么不用 `env_logger` 之类：项目刻意零 UI/运行时依赖，一个追加写入就够用；
+//! 日志点都在低频路径（拾取/开始/停止/合成），每次 open+append 的代价无所谓。
 //!
 //! 日志里**不写**任何用户画面内容，只写窗口句柄、类名、尺寸、错误串这类诊断信息。
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-static LOG_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+/// 实际启用的日志文件（第一个是主日志，第二个通常是 exe 目录的镜像）。
+static SINKS: OnceLock<Vec<PathBuf>> = OnceLock::new();
 
-/// 日志文件上限：超过就轮转成 `.old`（只留一份），避免用户长期开着越写越大。
+/// 单个日志文件上限：超过就轮转成 `.old`（只留一份），避免长期开着越写越大。
 const MAX_BYTES: u64 = 4 * 1024 * 1024;
 
-fn default_path() -> Option<PathBuf> {
-    let base = std::env::var("LOCALAPPDATA").ok()?;
-    Some(PathBuf::from(base).join("CanLapse").join("canlapse.log"))
+/// 尝试打开（必要时创建目录和文件）；成功即认为这个位置可写。
+fn writable(p: &PathBuf) -> bool {
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(p)
+        .is_ok()
 }
 
-/// 初始化日志（可重复调用；只有第一次生效）。返回实际日志路径（未开启时为 None）。
+fn rotate(p: &PathBuf) {
+    if let Ok(meta) = std::fs::metadata(p) {
+        if meta.len() > MAX_BYTES {
+            let _ = std::fs::rename(p, p.with_extension("log.old"));
+        }
+    }
+}
+
+/// 候选位置：显式指定 > LOCALAPPDATA > exe 同目录 > TEMP。
+fn candidates() -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = Vec::new();
+    if let Ok(p) = std::env::var("CANLAPSE_LOG") {
+        if !p.trim().is_empty() {
+            v.push(PathBuf::from(p));
+        }
+    }
+    if let Some(base) = std::env::var_os("LOCALAPPDATA") {
+        v.push(PathBuf::from(base).join("CanLapse").join("canlapse.log"));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            v.push(dir.join("canlapse.log"));
+        }
+    }
+    if let Some(tmp) = std::env::var_os("TEMP") {
+        v.push(PathBuf::from(tmp).join("CanLapse").join("canlapse.log"));
+    }
+    v
+}
+
+/// 初始化日志（可重复调用；只有第一次生效）。返回主日志路径（全部不可写时 None）。
 pub fn init() -> Option<PathBuf> {
-    LOG_PATH
+    SINKS
         .get_or_init(|| {
-            let path = std::env::var("CANLAPSE_LOG")
-                .ok()
-                .map(PathBuf::from)
-                .or_else(|| {
-                    if cfg!(debug_assertions) {
-                        default_path()
-                    } else {
-                        None
-                    }
-                })?;
-            if let Some(dir) = path.parent() {
-                let _ = std::fs::create_dir_all(dir);
+            if std::env::var("CANLAPSE_NOLOG").is_ok() {
+                return Vec::new();
             }
-            // 轮转：本次启动前就超限的话，把旧文件挪走
-            if let Ok(meta) = std::fs::metadata(&path) {
-                if meta.len() > MAX_BYTES {
-                    let _ = std::fs::rename(&path, path.with_extension("log.old"));
+            let cands = candidates();
+            let mut sinks: Vec<PathBuf> = Vec::new();
+            // 主日志 = 第一个可写的位置
+            for p in &cands {
+                if writable(p) {
+                    rotate(p);
+                    sinks.push(p.clone());
+                    break;
                 }
             }
-            Some(path)
+            // 镜像 = exe 同目录（与主日志不同、且可写）；写不进去就算了
+            if let Ok(exe) = std::env::current_exe() {
+                if let Some(dir) = exe.parent() {
+                    let mirror = dir.join("canlapse.log");
+                    if !sinks.contains(&mirror) && writable(&mirror) {
+                        rotate(&mirror);
+                        sinks.push(mirror);
+                    }
+                }
+            }
+            sinks
         })
-        .clone()
+        .first()
+        .cloned()
+}
+
+/// 当前启用的全部日志路径（主日志在前）。
+pub fn sinks() -> Vec<PathBuf> {
+    SINKS.get().cloned().unwrap_or_default()
 }
 
 pub fn path() -> Option<PathBuf> {
-    LOG_PATH.get().cloned().flatten()
+    sinks().into_iter().next()
 }
 
 pub fn enabled() -> bool {
-    path().is_some()
+    !sinks().is_empty()
 }
 
 /// 写一行日志（自动加毫秒级时间戳）。未初始化 / 未开启时是空操作。
 pub fn line(msg: &str) {
-    let Some(Some(p)) = LOG_PATH.get() else {
+    let Some(sinks) = SINKS.get() else {
         return;
     };
+    if sinks.is_empty() {
+        return;
+    }
     let st = crate::win::local_now();
     use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
-        let _ = writeln!(
-            f,
-            "[{:02}:{:02}:{:02}.{:03}] {}",
-            st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, msg
-        );
+    let text = format!(
+        "[{:02}:{:02}:{:02}.{:03}] {}\n",
+        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, msg
+    );
+    for p in sinks {
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+            let _ = f.write_all(text.as_bytes());
+        }
     }
 }
 

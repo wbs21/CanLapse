@@ -477,7 +477,7 @@ fn cmd_doctor() -> i32 {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    // 运行日志：debug 构建默认写 %LOCALAPPDATA%\CanLapse\canlapse.log，release 需设 CANLAPSE_LOG
+    // 运行日志：默认开启，写 %LOCALAPPDATA%\CanLapse\canlapse.log + exe 同目录镜像
     let log_path = canlapse::log::init();
     if args.len() < 2 {
         // 图形界面有独立入口（CanLapse.exe），所以这里没有参数就打印帮助

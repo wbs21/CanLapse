@@ -1492,7 +1492,7 @@ unsafe extern "system" fn preview_proc(
 pub fn run(initial_target: Option<isize>) -> i32 {
     // 运行日志：debug 构建默认写 %LOCALAPPDATA%\CanLapse\canlapse.log（GUI 没有控制台，
     // 用户测试后只能靠这个文件定位问题）；release 构建需显式设 CANLAPSE_LOG 才写。
-    let log_path = crate::log::init();
+    let _ = crate::log::init();
     logline!("");
     logline!(
         "==== CanLapse {} ({}) 启动 ====",
@@ -1500,7 +1500,16 @@ pub fn run(initial_target: Option<isize>) -> i32 {
         if cfg!(debug_assertions) { "debug" } else { "release" }
     );
     logline!("exe = {:?}", std::env::current_exe().ok());
-    logline!("log = {:?}", log_path);
+    logline!("日志 = {:?}", crate::log::sinks());
+    logline!(
+        "屏幕：虚拟桌面 {}x{} @({},{})，主屏 {}x{}",
+        unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetSystemMetrics(78) }, // SM_CXVIRTUALSCREEN
+        unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetSystemMetrics(79) }, // SM_CYVIRTUALSCREEN
+        unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetSystemMetrics(76) }, // SM_XVIRTUALSCREEN
+        unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetSystemMetrics(77) }, // SM_YVIRTUALSCREEN
+        unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetSystemMetrics(0) },  // SM_CXSCREEN
+        unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetSystemMetrics(1) },  // SM_CYSCREEN
+    );
     // 崩溃现场落盘：GUI 是 windows 子系统，stderr 默认不可见，panic 信息会完全丢失。
     // 装了钩子后，一旦崩溃可查看 %LOCALAPPDATA%\CanLapse\crash.log（追加写入）。
     std::panic::set_hook(Box::new(|info| {
