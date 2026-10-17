@@ -361,7 +361,7 @@ pub fn pick_window_interactive(hint: Option<HWND>) -> Option<HWND> {
         if let Some(tip) = hint {
             pick_hint_follow(tip);
         }
-        if !h.is_null() && pid_of(h) != me {
+        if !h.is_null() && pid_of(h) != me && looks_pickable(h) {
             candidate = h;
             if h as isize != last {
                 last = h as isize;
@@ -394,18 +394,46 @@ pub fn pick_window_interactive(hint: Option<HWND>) -> Option<HWND> {
 }
 
 /// 把拾取过程的诊断写进 %LOCALAPPDATA%\CanLapse\pick.log（追加）。
-fn writes_pick_log(line: &str) {
-    let dir = std::env::var("LOCALAPPDATA")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from("."))
-        .join("CanLapse");
-    let _ = std::fs::create_dir_all(&dir);
-    use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dir.join("pick.log"))
+/// 这个窗口是否值得作为拾取目标。
+///
+/// 实测教训：用户点击时光标可能落在**系统浮层**上（例如输入法/文本输入窗口
+/// `Windows.UI.Core.CoreWindow`、进程 `textinputhost.exe`，尺寸 318×125），
+/// 这类窗口抓帧必然失败，还会把真正的候选顶掉。所以这里主动过滤掉。
+fn looks_pickable(h: HWND) -> bool {
+    if h.is_null() {
+        return false;
+    }
+    let info = describe(h);
+    let cls = info.class_name.to_lowercase();
+    let proc = info.process.to_lowercase();
+    if cls.contains("windows.ui.core.corewindow")
+        || cls.contains("tooltips_class32")
+        || cls.contains("ime")
+        || proc.contains("textinputhost")
+        || proc.contains("searchhost")
     {
+        return false;
+    }
+    // 太小的窗口不可能是画布
+    let (w, ht) = client_size(h);
+    w >= 64 && ht >= 64
+}
+
+fn writes_pick_log(line: &str) {
+    use std::io::Write;
+    // 优先用 CANLAPSE_LOG 指定的文件（测试时写进工作区，保证可读）；
+    // 否则退回 %LOCALAPPDATA%\CanLapse\pick.log
+    let path = if let Ok(p) = std::env::var("CANLAPSE_LOG") {
+        std::path::PathBuf::from(p)
+    } else {
+        let dir = std::env::var("LOCALAPPDATA")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+            .join("CanLapse");
+        let _ = std::fs::create_dir_all(&dir);
+        dir.join("pick.log")
+    };
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
         let _ = writeln!(f, "{line}");
     }
 }

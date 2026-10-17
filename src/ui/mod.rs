@@ -792,7 +792,9 @@ impl App {
                 self.preview_cap = Some(cap);
             }
             Err(e) => {
-                message(self.hwnd, "无法抓取该窗口", &e);
+                // 不再弹模态框：把原因写进状态栏，用户可直接再点一次【拾取窗口】
+                let t = win::wide(&format!("无法抓取该窗口：{e}　请重新拾取"));
+                SetWindowTextW(self.ctl.state, t.as_ptr());
                 return;
             }
         }
