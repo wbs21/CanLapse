@@ -21,7 +21,7 @@ use std::thread::JoinHandle;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, CreatePen, DeleteObject, EndPaint, GetStockObject, InvalidateRect, RoundRect,
-    SelectObject, SetBkMode, HDC, NULL_BRUSH, PS_SOLID,
+    SelectObject, SetBkMode, NULL_BRUSH, PS_SOLID,
     StretchDIBits, UpdateWindow, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HGDIOBJ,
     PAINTSTRUCT, RGBQUAD, SRCCOPY,
 };
@@ -31,12 +31,13 @@ use windows_sys::Win32::UI::Controls::{
 };
 use windows_sys::Win32::UI::Controls::Dialogs::{GetSaveFileNameW, OPENFILENAMEW};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClientRect, GetMessageW, GetWindowLongPtrW,
-    MessageBoxW, MoveWindow, PostQuitMessage, RegisterClassW, SendMessageW, SetForegroundWindow,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
+    GetMessageW, GetWindowLongPtrW, GetWindowRect, LoadCursorW, MessageBoxW, MoveWindow, PostQuitMessage,
+    RegisterClassW, SendMessageW, SetCursor, SetForegroundWindow,
     SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, TranslateMessage,
     GWLP_USERDATA, MB_ICONINFORMATION, MB_OK, MSG, SW_MINIMIZE, SW_RESTORE, SW_SHOW, SWP_NOZORDER,
     WM_COMMAND, WM_CREATE, WM_DESTROY, WM_GETMINMAXINFO, WM_HSCROLL, WM_LBUTTONUP,
-    WM_PAINT, WM_SETCURSOR, WM_SIZE, WM_TIMER,
+    WM_CLOSE, WM_ERASEBKGND, WM_PAINT, WM_SETCURSOR, WM_SIZE, WM_TIMER,
     WNDCLASSW, WS_CAPTION, WS_CHILD, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU, WS_THICKFRAME,
     WS_VISIBLE,
 };
@@ -206,8 +207,6 @@ struct App {
     shared: Option<Arc<Shared>>,
     worker: Option<JoinHandle<()>>,
     bar: HWND,
-    /// 合成进度遮罩开关：为 true 时隐藏所有子控件，改由主窗口 `on_paint` 整块自绘
-    enc_overlay: bool,
     enc: Option<EncState>,
     relayouting: bool,
     /// 预览抓帧失败的上一次记录：`(错误串, 时间)` —— 目标窗口关闭/最小化时
@@ -422,46 +421,6 @@ unsafe extern "system" fn main_wndproc(
             }
             0
         }
-        WM_LBUTTONUP => {
-            // 合成遮罩上的"取消合成"是自绘的，这里做命中
-            if let Some(app) = app_mut(hwnd) {
-                if app.enc_overlay {
-                    let x = (lparam as i32) & 0xffff;
-                    let y = ((lparam as i32) >> 16) & 0xffff;
-                    let mut cr: RECT = std::mem::zeroed();
-                    GetClientRect(hwnd, &mut cr);
-                    let cb = enc_cancel_rect(cr.right, cr.bottom);
-                    if x >= cb.left && x < cb.right && y >= cb.top && y < cb.bottom {
-                        if let Some(e) = &app.enc {
-                            e.cancel.store(true, Ordering::SeqCst);
-                            crate::logline!("[encode] 用户点了『取消合成』");
-                        }
-                    }
-                }
-            }
-            0
-        }
-        WM_SETCURSOR => {
-            if let Some(app) = app_mut(hwnd) {
-                if app.enc_overlay {
-                    let mut cr: RECT = std::mem::zeroed();
-                    GetClientRect(hwnd, &mut cr);
-                    let cb = enc_cancel_rect(cr.right, cr.bottom);
-                    let mut p: POINT = std::mem::zeroed();
-                    windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut p);
-                    windows_sys::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut p);
-                    if p.x >= cb.left && p.x < cb.right && p.y >= cb.top && p.y < cb.bottom {
-                        let h = windows_sys::Win32::UI::WindowsAndMessaging::LoadCursorW(
-                            std::ptr::null_mut(),
-                            windows_sys::Win32::UI::WindowsAndMessaging::IDC_HAND,
-                        );
-                        windows_sys::Win32::UI::WindowsAndMessaging::SetCursor(h);
-                        return 1;
-                    }
-                }
-            }
-            DefWindowProcW(hwnd, msg, wparam, lparam)
-        }
         WM_HSCROLL => 0, // 已无滑块（帧密度/灵敏度改下拉），留空避免消息落进 DefWindowProc
         WM_TIMER => {
             if let Some(app) = app_mut(hwnd) {
@@ -547,7 +506,6 @@ impl App {
             shared: None,
             worker: None,
             bar: std::ptr::null_mut(),
-            enc_overlay: false,
             enc: None,
             relayouting: false,
             preview_err: None,
@@ -728,10 +686,6 @@ impl App {
                 DEFAULT_H,
                 SWP_NOZORDER | 0x0004,
             );
-        }
-        // 合成遮罩期间：重排后仍要把子控件藏起来（否则它们会画在遮罩上）
-        if self.enc_overlay {
-            self.hide_all_controls();
         }
         InvalidateRect(self.hwnd, std::ptr::null(), 1);
         self.relayouting = false;
@@ -1070,13 +1024,20 @@ impl App {
             shared.as_ref().map(|s| s.frames()).unwrap_or(0),
             failed
         );
+        // ⚠️ 每个提前返回的分支都要把 UI 恢复成待机态，否则会停在"录制中"
+        // （【开始录制】藏起来、状态栏还写着"录制中…"）—— 实测踩过。
         if let Some(e) = failed {
+            self.ui_set_idle();
             message(self.hwnd, "录制失败", &e);
             return;
         }
-        let Some(dir) = dir else { return };
+        let Some(dir) = dir else {
+            self.ui_set_idle();
+            return;
+        };
         let frames = shared.as_ref().map(|s| s.frames()).unwrap_or(0);
         if frames == 0 {
+            self.ui_set_idle();
             message(self.hwnd, "录制结束", "这次没有保存到任何帧（画面可能始终没有变化）。");
             return;
         }
@@ -1228,9 +1189,6 @@ impl App {
             let total = e.total.load(Ordering::SeqCst);
             let pct = if total > 0 { (done * 100 / total) as isize } else { 0 };
             SendMessageW(self.ctl.progress, PBM_SETPOS, pct as usize, 0);
-            if self.enc_overlay {
-                InvalidateRect(self.hwnd, std::ptr::null(), 0);
-            }
             let t = win::wide(&format!(
                 "视频合成中… 已处理：{} / {} 帧",
                 done, total
@@ -1246,35 +1204,31 @@ impl App {
                 self.ui_set_idle();
                 match outcome {
                     Some(Ok(EncodeOutcome::Done(s))) => {
-                        let msg = format!(
-                            "合成完成：{} 帧，{:.2} MB，{}x{}，{:.1} 秒\n输出：{}",
-                            s.frames,
-                            s.bytes as f64 / 1048576.0,
-                            s.width,
-                            s.height,
-                            s.seconds,
-                            out.display()
-                        );
                         if clean_after {
                             // 规格：合成成功自动清理缓存（默认勾选）
                             if Session::delete(&session).is_ok() {
                                 self.refresh_session_list();
                             }
                         }
-                        message(self.hwnd, "合成完成", &msg);
+                        let msg = format!(
+                            "合成完成：{} 帧 · {:.2} MB · {}x{}\n{}",
+                            s.frames,
+                            s.bytes as f64 / 1048576.0,
+                            s.width,
+                            s.height,
+                            out.display()
+                        );
+                        // 结果直接写进合成弹窗，1.6 秒后自动关闭（不再弹【确定】）
+                        finish_enc_dialog(&msg);
                     }
                     Some(Ok(EncodeOutcome::Cancelled(s))) => {
-                        message(
-                            self.hwnd,
-                            "已取消合成",
-                            &format!(
-                                "已写入 {} 帧，文件仍可播放：\n{}",
-                                s.frames,
-                                out.display()
-                            ),
-                        );
+                        finish_enc_dialog(&format!(
+                            "已取消合成：写入 {} 帧，文件仍可播放\n{}",
+                            s.frames,
+                            out.display()
+                        ));
                     }
-                    Some(Err(err)) => message(self.hwnd, "合成失败", &err),
+                    Some(Err(err)) => finish_enc_dialog(&format!("合成失败：{err}")),
                     None => {}
                 }
             }
@@ -1364,11 +1318,6 @@ impl App {
     /// 底部操作区随状态切换（规格：Idle 显示【开始录制】；录制中只显示提示；
     /// 合成中整窗盖一层进度遮罩）。此前这三样一直可见，是明显的可用性问题。
     unsafe fn ui_set_idle(&mut self) {
-        if self.enc_overlay {
-            self.enc_overlay = false;
-            // 遮罩期间所有子控件都是隐藏的，重排一次把它们恢复
-            self.relayout(false);
-        }
         ShowWindow(self.ctl.btn_record, SW_SHOW);
         ShowWindow(self.ctl.progress, 0);
         ShowWindow(self.ctl.btn_cancel, 0);
@@ -1386,67 +1335,23 @@ impl App {
     }
 
     unsafe fn ui_set_encoding(&mut self) {
-        // 规格（用户要求）：停止录制后**立即**恢复窗口，并在窗口上盖一层合成进度
+        // 规格（用户要求）：停止录制后**立即**恢复主窗口，并弹出独立的"合成进度"窗口；
+        // 合成完成后弹窗自动消失（不再用 MessageBox 的【确定】）。
         ShowWindow(self.hwnd, SW_RESTORE);
         SetForegroundWindow(self.hwnd);
-        self.enc_overlay = true;
-        // 遮罩铺满整窗，子控件先全部藏起来（否则会画在遮罩上面）
-        self.hide_all_controls();
-        InvalidateRect(self.hwnd, std::ptr::null(), 1);
-    }
-
-    /// 合成遮罩显示期间把子控件全部隐藏
-    unsafe fn hide_all_controls(&self) {
-        for h in [
-            self.ctl.title,
-            self.ctl.status,
-            self.ctl.hdr_rec,
-            self.ctl.lbl_fps,
-            self.ctl.cmb_recfps,
-            self.ctl.lbl_thr,
-            self.ctl.cmb_sens,
-            self.ctl.hint_sens,
-            self.ctl.hdr_exp,
-            self.ctl.lbl_out,
-            self.ctl.edit_out,
-            self.ctl.btn_out,
-            self.ctl.btn_pick,
-            self.ctl.btn_help,
-            self.ctl.btn_record,
-            self.ctl.btn_cancel,
-            self.ctl.btn_clean,
-            self.ctl.chk_clean,
-            self.ctl.progress,
-            self.ctl.hdr_hist,
-            self.ctl.list,
-            self.ctl.btn_reexport,
-            self.ctl.btn_open,
-            self.ctl.btn_delete,
-        ] {
-            if !h.is_null() {
-                ShowWindow(h, 0);
-            }
+        if let Some(e) = &self.enc {
+            show_enc_dialog(
+                self.hwnd,
+                e.progress.clone(),
+                e.total.clone(),
+                e.cancel.clone(),
+            );
         }
     }
 
     unsafe fn on_paint(&mut self) {
         let mut ps: PAINTSTRUCT = std::mem::zeroed();
         let hdc = BeginPaint(self.hwnd, &mut ps);
-        // 合成遮罩：整窗自绘一层，子控件此时都已隐藏
-        if self.enc_overlay {
-            let mut cr: RECT = std::mem::zeroed();
-            GetClientRect(self.hwnd, &mut cr);
-            let (done, total) = match &self.enc {
-                Some(e) => (
-                    e.progress.load(Ordering::SeqCst),
-                    e.total.load(Ordering::SeqCst),
-                ),
-                None => (0, 0),
-            };
-            paint_enc_overlay(hdc, cr, done, total);
-            EndPaint(self.hwnd, &mut ps);
-            return;
-        }
         let r = self.preview_rect;
         let (bw, bh) = (r.right - r.left, r.bottom - r.top);
         // 预览图：把最近一帧等比缩放到 160×100 的框里
@@ -1826,20 +1731,34 @@ pub fn run(initial_target: Option<isize>) -> i32 {
 
 const MAIN_CLASS: &str = "CanLapseMain";
 
+
+
 // ---------------------------------------------------------------------------
-// 合成进度遮罩
+// 合成进度弹窗
 // ---------------------------------------------------------------------------
 //
-// 需求：停止录制后**立即**恢复主窗口，并在窗口上盖一层显示合成进度
-// （"视频合成中 / 进度条 xx% / 已处理 a / b 帧"）。
-// 做法：一个覆盖客户区的自绘子窗口（创建在主窗口里、最后显示 → 盖住所有控件），
-// 进度从 `App::enc` 的原子量现取，200ms 定时器刷新。
+// 需求（v1.0.0 收工后增补）：停止录制后立即恢复主窗口，并**弹出独立窗口**显示合成进度；
+// 合成完成后弹窗自动消失（无需点【确定】）；风格与主界面统一（深色底 + 圆角 + 同字体）。
+// 实现：带标题栏的小窗（owner = 主窗，置顶），内容全部自绘，进度从 EncState 的原子量现取。
 
-/// 遮罩里的"取消合成"按钮矩形（与绘制共用，避免点击区对不上）
-fn enc_cancel_rect(w: i32, h: i32) -> RECT {
-    let bw = 104;
+const ENC_DLG_CLASS: &str = "CanLapseEncodeDialog";
+
+struct EncDlg {
+    main: HWND,
+    progress: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    total: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// 结束文案与出现时刻；None = 还在合成
+    done: Option<(String, std::time::Instant)>,
+}
+
+static ENC_DLG_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+/// 弹窗里的【取消合成】按钮矩形（绘制与命中共用）
+fn dlg_btn_rect(w: i32, h: i32) -> RECT {
+    let bw = 108;
     let bh = 26;
-    let top = h / 2 + 74;
+    let top = h - 42;
     RECT {
         left: (w - bw) / 2,
         top,
@@ -1848,34 +1767,43 @@ fn enc_cancel_rect(w: i32, h: i32) -> RECT {
     }
 }
 
-
-unsafe fn paint_enc_overlay(dc: HDC, rc: RECT, done: u32, total: u32) {
+unsafe fn enc_dlg_paint(hwnd: HWND) {
+    let mut ps: PAINTSTRUCT = std::mem::zeroed();
+    let dc = BeginPaint(hwnd, &mut ps);
+    let mut rc: RECT = std::mem::zeroed();
+    GetClientRect(hwnd, &mut rc);
     let (w, h) = (rc.right, rc.bottom);
+    theme::fill_round(dc, rc, theme::BG, 0);
 
-    // 整块底色（比主界面再深一点，形成"盖了一层"的感觉）
-    theme::fill_round(dc, rc, 0x0026_2320, 0);
+    let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut EncDlg;
+    if ptr.is_null() {
+        EndPaint(hwnd, &mut ps);
+        return;
+    }
+    let dlg = &*ptr;
+    let done = dlg.progress.load(Ordering::SeqCst);
+    let total = dlg.total.load(Ordering::SeqCst);
     let pct = if total > 0 {
         (done as i64 * 100 / total as i64) as i32
     } else {
         0
     };
 
-    let old = SelectObject(dc, theme::heading_font());
     SetBkMode(dc, 1);
-
-    // 标题
-    let title = RECT {
-        left: 0,
-        top: h / 2 - 78,
-        right: w,
-        bottom: h / 2 - 54,
+    let old = SelectObject(dc, theme::heading_font());
+    let title = if dlg.done.is_some() { "合成完成" } else { "视频合成中" };
+    let title_rc = RECT {
+        left: 18,
+        top: 14,
+        right: w - 18,
+        bottom: 40,
     };
-    theme::text(dc, "视频合成中", title, theme::TEXT, 0x0000_0001 | 0x0000_0004);
+    theme::text(dc, title, title_rc, theme::TEXT, 0x0000_0000 | 0x0000_0004);
 
-    // 进度条：左侧条 + 右侧百分比
-    let bar_w = (w - 150).max(120);
-    let bar_x = 40;
-    let bar_top = h / 2 - 30;
+    // 进度条
+    let bar_x = 18;
+    let bar_w = (w - 36 - 54).max(80);
+    let bar_top = 54;
     let track = RECT {
         left: bar_x,
         top: bar_top,
@@ -1898,48 +1826,233 @@ unsafe fn paint_enc_overlay(dc: HDC, rc: RECT, done: u32, total: u32) {
     let pct_rc = RECT {
         left: bar_x + bar_w + 8,
         top: bar_top - 4,
-        right: w - 24,
+        right: w - 18,
         bottom: bar_top + 16,
     };
     theme::text(dc, &format!("{pct}%"), pct_rc, theme::TEXT, 0x0000_0000 | 0x0000_0004);
 
-    // 已处理帧数
+    // 帧数 / 结束信息
     let small = theme::small_font();
     let old2 = SelectObject(dc, small);
-    let cnt = RECT {
-        left: 0,
-        top: bar_top + 26,
-        right: w,
-        bottom: bar_top + 46,
+    let info = match &dlg.done {
+        Some((t, _)) => t.clone(),
+        None => format!("已处理：{done} / {total} 帧"),
     };
-    theme::text(
-        dc,
-        &format!("已处理：{done} / {total} 帧"),
-        cnt,
-        theme::MUTED,
-        0x0000_0001 | 0x0000_0004,
-    );
+    let info_rc = RECT {
+        left: 18,
+        top: bar_top + 24,
+        right: w - 18,
+        bottom: bar_top + 64,
+    };
+    theme::text(dc, &info, info_rc, theme::MUTED, 0x0000_0001 | 0x0000_0010); // DT_CENTER | DT_WORDBREAK
     SelectObject(dc, old2);
 
-    // 取消合成按钮（幽灵样式）
-    let cb = enc_cancel_rect(w, h);
-    theme::fill_round(dc, cb, theme::PANEL, 10);
-    let border = CreatePen(PS_SOLID, 1, theme::BORDER);
-    let ob = SelectObject(dc, GetStockObject(NULL_BRUSH));
-    let op = SelectObject(dc, border);
-    RoundRect(dc, cb.left, cb.top, cb.right - 1, cb.bottom - 1, 10, 10);
-    SelectObject(dc, op);
-    SelectObject(dc, ob);
-    DeleteObject(border);
-    theme::text(
-        dc,
-        "取消合成",
-        cb,
-        theme::TEXT,
-        0x0000_0001 | 0x0000_0004,
-    );
+    // 取消按钮（合成中才显示）
+    if dlg.done.is_none() {
+        let cb = dlg_btn_rect(w, h);
+        theme::fill_round(dc, cb, theme::PANEL, 10);
+        let border = CreatePen(PS_SOLID, 1, theme::BORDER);
+        let ob = SelectObject(dc, GetStockObject(NULL_BRUSH));
+        let op = SelectObject(dc, border);
+        RoundRect(dc, cb.left, cb.top, cb.right - 1, cb.bottom - 1, 10, 10);
+        SelectObject(dc, op);
+        SelectObject(dc, ob);
+        DeleteObject(border);
+        theme::text(dc, "取消合成", cb, theme::TEXT, 0x0000_0001 | 0x0000_0004);
+    }
 
     SelectObject(dc, old);
+    EndPaint(hwnd, &mut ps);
 }
 
+unsafe extern "system" fn enc_dlg_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    win::guard(|| match msg {
+        WM_CREATE => 0,
+        WM_PAINT => {
+            enc_dlg_paint(hwnd);
+            0
+        }
+        WM_ERASEBKGND => 1,
+        WM_TIMER => {
+            let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut EncDlg;
+            if !ptr.is_null() {
+                if let Some((_, at)) = &(*ptr).done {
+                    // 结果停留 1.6 秒后自动关闭（用户要求：不用点确定）
+                    if at.elapsed().as_millis() >= 1600 {
+                        DestroyWindow(hwnd);
+                        return 0;
+                    }
+                }
+            }
+            InvalidateRect(hwnd, std::ptr::null(), 0);
+            0
+        }
+        WM_LBUTTONUP => {
+            let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut EncDlg;
+            if !ptr.is_null() && (*ptr).done.is_none() {
+                let x = (lparam as i32) & 0xffff;
+                let y = ((lparam as i32) >> 16) & 0xffff;
+                let mut cr: RECT = std::mem::zeroed();
+                GetClientRect(hwnd, &mut cr);
+                let cb = dlg_btn_rect(cr.right, cr.bottom);
+                if x >= cb.left && x < cb.right && y >= cb.top && y < cb.bottom {
+                    (*ptr).cancel.store(true, Ordering::SeqCst);
+                    crate::logline!("[encode] 用户点了『取消合成』");
+                }
+            }
+            0
+        }
+        WM_SETCURSOR => {
+            let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut EncDlg;
+            if !ptr.is_null() && (*ptr).done.is_none() {
+                let mut cr: RECT = std::mem::zeroed();
+                GetClientRect(hwnd, &mut cr);
+                let cb = dlg_btn_rect(cr.right, cr.bottom);
+                let mut p: POINT = std::mem::zeroed();
+                windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut p);
+                windows_sys::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut p);
+                if p.x >= cb.left && p.x < cb.right && p.y >= cb.top && p.y < cb.bottom {
+                    let hand = LoadCursorW(std::ptr::null_mut(), 32649 as *const u16); // IDC_HAND
+                    SetCursor(hand);
+                    return 1;
+                }
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        WM_CLOSE => {
+            let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut EncDlg;
+            if !ptr.is_null() && (*ptr).done.is_none() {
+                (*ptr).cancel.store(true, Ordering::SeqCst);
+            }
+            DestroyWindow(hwnd);
+            0
+        }
+        WM_DESTROY => {
+            let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut EncDlg;
+            if !ptr.is_null() {
+                let main = (*ptr).main;
+                windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow(main, 1);
+                SetForegroundWindow(main);
+                drop(Box::from_raw(ptr));
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            }
+            ENC_DLG_HWND.store(0, Ordering::SeqCst);
+            0
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    })
+}
 
+/// 弹出"合成进度"窗口（已存在则复用）
+pub unsafe fn show_enc_dialog(
+    main: HWND,
+    progress: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    total: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> HWND {
+    static REG: std::sync::Once = std::sync::Once::new();
+    REG.call_once(|| {
+        let c = cls(ENC_DLG_CLASS);
+        let wc = WNDCLASSW {
+            style: 0x0002 | 0x0020, // CS_HREDRAW | CS_VREDRAW
+            lpfnWndProc: Some(enc_dlg_proc),
+            cbClsExtra: 0,
+            cbWndExtra: 0,
+            hInstance: win::module_handle(),
+            hIcon: app_icon(),
+            hCursor: LoadCursorW(std::ptr::null_mut(), 32512 as *const u16), // IDC_ARROW
+            hbrBackground: std::ptr::null_mut(),
+            lpszMenuName: std::ptr::null(),
+            lpszClassName: c.as_ptr(),
+        };
+        RegisterClassW(&wc);
+    });
+
+    let old = ENC_DLG_HWND.load(Ordering::SeqCst);
+    if old != 0 {
+        return old as HWND;
+    }
+
+    let (dw, dh) = (380, 196);
+    let mut mr: RECT = std::mem::zeroed();
+    GetWindowRect(main, &mut mr);
+    // 居中到主窗口，但必须夹在工作区内 —— 主窗贴边时居中会跑到屏幕外（实测 x=-25）
+    let mut work: RECT = std::mem::zeroed();
+    windows_sys::Win32::UI::WindowsAndMessaging::SystemParametersInfoW(
+        0x0030, // SPI_GETWORKAREA
+        0,
+        &mut work as *mut _ as *mut _,
+        0,
+    );
+    if work.right <= work.left {
+        work = RECT { left: 0, top: 0, right: 1920, bottom: 1080 };
+    }
+    let x = (mr.left + ((mr.right - mr.left) - dw) / 2)
+        .clamp(work.left + 8, (work.right - dw - 8).max(work.left + 8));
+    let y = (mr.top + ((mr.bottom - mr.top) - dh) / 2)
+        .clamp(work.top + 8, (work.bottom - dh - 8).max(work.top + 8));
+
+    let c = cls(ENC_DLG_CLASS);
+    let t = win::wide("合成进度");
+    let hwnd = CreateWindowExW(
+        0x0000_0008,                                 // WS_EX_TOPMOST
+        c.as_ptr(),
+        t.as_ptr(),
+        0x8000_0000 | 0x00C0_0000 | 0x0008_0000,     // WS_POPUP | WS_CAPTION | WS_SYSMENU
+        x,
+        y,
+        dw,
+        dh,
+        main,
+        std::ptr::null_mut(),
+        win::module_handle(),
+        std::ptr::null(),
+    );
+    if hwnd.is_null() {
+        return std::ptr::null_mut();
+    }
+    let ctx = Box::new(EncDlg {
+        main,
+        progress,
+        total,
+        cancel,
+        done: None,
+    });
+    SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(ctx) as isize);
+    theme::dark_window_frame(hwnd);
+    // 标题栏也用自己的图标（否则左上角是空白方块）
+    let ic = app_icon();
+    if !ic.is_null() {
+        SendMessageW(hwnd, 0x0080, 1, ic as isize); // WM_SETICON / ICON_BIG
+        SendMessageW(hwnd, 0x0080, 0, ic as isize); // ICON_SMALL
+    }
+    // 合成期间主窗不接受操作（弹窗是唯一交互面），关窗时在 WM_DESTROY 里恢复
+    windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow(main, 0);
+    ShowWindow(hwnd, SW_SHOW);
+    UpdateWindow(hwnd);
+    SetTimer(hwnd, 1, 120, None);
+    ENC_DLG_HWND.store(hwnd as isize, Ordering::SeqCst);
+    hwnd
+}
+
+/// 通知弹窗"合成结束"：显示结果文案，1.6 秒后自动关闭
+pub unsafe fn finish_enc_dialog(text: &str) {
+    let h = ENC_DLG_HWND.load(Ordering::SeqCst);
+    if h == 0 {
+        return;
+    }
+    let hwnd = h as HWND;
+    let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut EncDlg;
+    if ptr.is_null() {
+        return;
+    }
+    if (*ptr).done.is_none() {
+        (*ptr).done = Some((text.to_string(), std::time::Instant::now()));
+        InvalidateRect(hwnd, std::ptr::null(), 1);
+    }
+}
