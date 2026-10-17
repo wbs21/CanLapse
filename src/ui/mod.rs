@@ -775,6 +775,9 @@ impl App {
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, self as *mut App as isize);
             ShowWindow(hwnd, SW_SHOW);
             UpdateWindow(hwnd);
+            // 必须主动提到前台：否则会创建在绘画软件**后面**，用户以为"预览打不开"
+            // （实测踩过：截图抓到的是压在上面的别的窗口）
+            SetForegroundWindow(hwnd);
         }
         self.preview_win = hwnd;
     }
