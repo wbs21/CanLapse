@@ -3,7 +3,7 @@
 > 面向手绘创作者（SAI2 > Photoshop > CLIP STUDIO PAINT > Krita）的 **Windows 画布窗口缩时录屏工具**。
 
 当前状态：**v1.0 功能完整、四款软件实测通过** —— 拾取窗口 → 差分 → 帧缓存（JPEG/PNG）→ 合成 MP4 全链路可用；
-单页 GUI（330×371）、悬浮操作条、历史会话面板与两个弹窗均已完成。
+单页 GUI（330×371）、自绘的深色录制控制条、历史会话面板与两个弹窗均已完成。
 SAI2 / CLIP STUDIO PAINT / Photoshop / Krita 均实测可迅速锁定画布窗口，
 明细见 [docs/verification-log.md](docs/verification-log.md)。
 
@@ -18,7 +18,7 @@ SAI2 / CLIP STUDIO PAINT / Photoshop / Krita 均实测可迅速锁定画布窗�
 4. 录制帧密度四档（1 帧/5 秒、1 帧/2 秒、1 帧/秒、2 帧/秒，默认 1 帧/5 秒）；导出固定 **30fps、画质中**。
 
 设计约束（v1.0）：**单页面小巧主窗口（330×371，窄屏/多窗口并列时更省地方）**，
-无独立设置面板；录制时主窗口最小化，只保留悬浮操作条；**无自动画布识别**。
+无独立设置面板；录制时主窗口最小化，只保留一条深色录制控制条（自绘、圆角、无灰边）；**无自动画布识别**。
 完整需求见 [docs/requirements.md](docs/requirements.md)。
 
 ## 当前进度
