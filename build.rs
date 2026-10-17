@@ -22,11 +22,51 @@ const AV_DLL_PREFIXES: [&str; 5] = [
     "avformat-", "avcodec-", "avutil-", "swscale-", "swresample-",
 ];
 
+/// 找自编译最小 ffmpeg 的根目录。
+///
+/// 顺序：
+/// 1. 环境变量 `CANLAPSE_FFMPEG_MIN` / `FFMPEG_MIN_DIR`（最优先，跨机器可移植）；
+/// 2. `tools\ffmpeg-min.path`：一行路径（本机把依赖目录挪走后改这里即可，无需动代码）；
+/// 3. 本机已知的几个位置 —— `D:\CapLite` 被整体挪到 `D:\ffmpeg各版本\CapLite_c` 过，
+///    只认一个默认路径会让"换个位置就编不过"（实测）。
+fn find_ffmpeg_min() -> PathBuf {
+    for key in ["CANLAPSE_FFMPEG_MIN", "FFMPEG_MIN_DIR"] {
+        if let Ok(v) = env::var(key) {
+            if !v.trim().is_empty() {
+                return PathBuf::from(v);
+            }
+        }
+    }
+    if let Ok(dir) = env::var("CARGO_MANIFEST_DIR") {
+        let hint = PathBuf::from(&dir).join("tools").join("ffmpeg-min.path");
+        if let Ok(txt) = fs::read_to_string(&hint) {
+            let line = txt
+                .lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty() && !l.starts_with('#'));
+            if let Some(line) = line {
+                return PathBuf::from(line.trim_matches('"'));
+            }
+        }
+    }
+    let candidates = [
+        r"D:\CapLite\ffmpeg-min",
+        r"D:\ffmpeg各版本\CapLite_c\ffmpeg-min",
+        r"D:\WorkbuddyWW\CapLite\ffmpeg-min",
+        r"D:\tools\ffmpeg-min-new",
+    ];
+    for c in candidates {
+        let p = PathBuf::from(c);
+        if p.join("bin").join("avformat.lib").is_file() {
+            println!("cargo:warning=使用 ffmpeg-min：{}", p.display());
+            return p;
+        }
+    }
+    PathBuf::from(r"D:\CapLite\ffmpeg-min")
+}
+
 fn main() {
-    let root = env::var("CANLAPSE_FFMPEG_MIN")
-        .or_else(|_| env::var("FFMPEG_MIN_DIR"))
-        .unwrap_or_else(|_| r"D:\CapLite\ffmpeg-min".to_string());
-    let root = PathBuf::from(root);
+    let root = find_ffmpeg_min();
     let bin = root.join("bin");
 
     let avcodec_lib = bin.join("avcodec.lib");
@@ -47,6 +87,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CANLAPSE_FFMPEG_MIN");
     println!("cargo:rerun-if-env-changed=FFMPEG_MIN_DIR");
     println!("cargo:rerun-if-env-changed=CANLAPSE_WINPTHREAD");
+    println!("cargo:rerun-if-changed=tools/ffmpeg-min.path");
 
     embed_manifest();
     compile_resources();

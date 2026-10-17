@@ -38,11 +38,19 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::frame::Frame;
+use crate::logline;
 use crate::win;
 
 const HOST_CLASS: &str = "CanLapseThumbnailHost";
 const PW_RENDERFULLCONTENT_FLAG: u32 = 0x2;
 static REGISTER_HOST_CLASS: Once = Once::new();
+
+/// `WS_EX_TOOLWINDOW`：宿主窗口**不进任务栏、不进 Alt+Tab**。
+/// 少了它，用户把鼠标停在任务栏图标上会看到一堆"CanLapse 抓帧宿主"的预览
+/// （实测：每抓一次就多一个，因为每个 ThumbnailCapture 都建一个宿主）。
+const WS_EX_TOOLWINDOW: u32 = 0x0000_0080;
+/// `WS_EX_NOACTIVATE`：宿主永远不抢焦点（它是幕后窗口，不该打断绘画）。
+const WS_EX_NOACTIVATE: u32 = 0x0800_0000;
 
 /// 桌面合成是否开启。关闭时 DWM 缩略图不可用，必须提前告诉用户而不是静默坏掉。
 pub fn composition_enabled() -> bool {
@@ -239,7 +247,7 @@ impl ThumbnailCapture {
         // 放到虚拟桌面左外侧，确保用户看不到
         let off_x = GetSystemMetrics(SM_XVIRTUALSCREEN) - 4000;
         let host = CreateWindowExW(
-            0,
+            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
             cls.as_ptr(),
             title.as_ptr(),
             WS_POPUP, // 不加 WS_VISIBLE，建完再 ShowWindow(SW_SHOWNOACTIVATE)
@@ -253,19 +261,37 @@ impl ThumbnailCapture {
             null(),
         );
         if host.is_null() {
+            logline!("[capture] 创建抓帧宿主失败");
             return Err("创建抓帧宿主窗口失败".into());
         }
         ShowWindow(host, SW_SHOWNOACTIVATE);
+        logline!(
+            "[capture] 建宿主 0x{:X} {}x{} @x={}  (toolwindow)",
+            host as isize,
+            crop.2,
+            crop.3,
+            off_x
+        );
 
         let mut thumb: isize = 0;
         // ★ 源**必须**是顶层窗口：传子窗口会得到 E_INVALIDARG（SAI2 上实测）
         let hr = DwmRegisterThumbnail(host, root, &mut thumb);
         if hr != 0 {
             DestroyWindow(host);
+            logline!("[capture] DwmRegisterThumbnail 失败 hr=0x{hr:08X} root=0x{:X}", root as isize);
             return Err(format!(
                 "DwmRegisterThumbnail 失败 hr=0x{hr:08X}（顶层窗口可能已失效）"
             ));
         }
+        logline!(
+            "[capture] 注册缩略图 ok thumb={} root=0x{:X} crop=({},{},{},{})",
+            thumb,
+            root as isize,
+            crop.0,
+            crop.1,
+            crop.2,
+            crop.3
+        );
         Ok((host, thumb))
     }
 

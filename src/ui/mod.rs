@@ -48,6 +48,7 @@ const TBM_GETPOS_C: u32 = 0x0400;
 use crate::capture::ThumbnailCapture;
 use crate::encode::{self, EncodeOptions, EncodeOutcome, Progress, Quality};
 use crate::frame::Frame;
+use crate::logline;
 use crate::recorder::{self, Phase, RecorderConfig, Shared};
 use crate::session::Session;
 use crate::win;
@@ -97,7 +98,7 @@ fn cls(s: &str) -> Vec<u16> {
     win::wide(s)
 }
 
-#[derive(PartialEq, Eq, Clone, Copy)]
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
 enum PickState {
     Empty,
     Ok,
@@ -178,6 +179,11 @@ struct App {
     enc: Option<EncState>,
     relayouting: bool,
     preview_win: HWND,
+    /// 预览抓帧失败的上一次记录：`(错误串, 时间)` —— 目标窗口关闭/最小化时
+    /// 这个错误会每 500ms 重复一次，只在"错误变了或过了 10 秒"时写日志，避免刷屏。
+    preview_err: Option<(String, std::time::Instant)>,
+    /// 上一次成功抓到的预览尺寸，尺寸变化时记一条日志（换目标/改窗口大小时有用）
+    preview_size: (i32, i32),
 }
 
 impl App {
@@ -444,6 +450,8 @@ impl App {
             enc: None,
             relayouting: false,
             preview_win: std::ptr::null_mut(),
+            preview_err: None,
+            preview_size: (0, 0),
         }
     }
 
@@ -758,11 +766,12 @@ impl App {
         );
         // 拾取期间最小化主窗口（用户要求），让开目标；拾取结束再恢复。
         ShowWindow(self.hwnd, SW_MINIMIZE);
-        let t = win::wide("请在目标窗口的上边框（标题栏）上点一下左键；按 Esc 取消");
+        logline!("[pick] 主窗口已最小化，进入拾取");
+        let t = win::wide("请直接点一下画布画面（或浮动画布窗口的标题栏）；按 Esc 取消");
         SetWindowTextW(self.ctl.state, t.as_ptr());
         UpdateWindow(self.hwnd);
 
-        let hint = win::pick_hint_create(self.hwnd, "请点击画布窗口的边框");
+        let hint = win::pick_hint_create(self.hwnd, "点画布画面或它的标题栏");
         let picked = win::pick_window_interactive(Some(hint));
         win::pick_hint_destroy(hint);
 
@@ -777,29 +786,47 @@ impl App {
         InvalidateRect(self.hwnd, std::ptr::null(), 1);
 
         let Some(hwnd) = picked else {
+            logline!("[pick] 用户取消（Esc）");
             self.refresh_labels();
             return;
         };
-        // 统一解析到顶层窗口：点标题栏命中的本来就是顶层，这里再兜一次底，
-        // 保证"点画布"和"点标题栏"得到一致的目标。
-        let root = win::root_of(hwnd);
-        let info = win::describe(if root.is_null() { hwnd } else { root });
+        // ⚠️ 这里**不要**把目标"统一解析到顶层窗口"。
+        // 旧写法 `root_of(hwnd)` 会把用户点中的"画布子窗口"换成整个主窗口 ——
+        // 预览里于是出现工具栏和颜色面板，用户看到的就是"没锁到画布"（SAI2 上实测）。
+        // 子窗口由 ThumbnailCapture::new 自己解析成「顶层缩略图 + rcSource 裁剪」。
+        let info = win::describe(hwnd);
+        let (cw, ch) = info.client_size();
+        logline!(
+            "[pick] 目标 0x{:X} | {} | 客户区 {}x{} | root=0x{:X} | 层级：{}",
+            hwnd as isize,
+            info.label(),
+            cw,
+            ch,
+            win::root_of(hwnd) as isize,
+            win::ancestor_chain(hwnd)
+        );
         // 释放上一个预览抓帧器
         self.preview_cap = None;
-        match ThumbnailCapture::new(info.hwnd) {
+        match ThumbnailCapture::new(hwnd) {
             Ok(cap) => {
-                win::pick_log("CAPTURE 建抓帧器 OK，开始抓第一帧");
-                self.preview = cap.grab().ok();
-                win::pick_log(&format!(
-                    "CAPTURE 首帧 = {}",
-                    if self.preview.is_some() { "成功" } else { "失败" }
-                ));
+                let (ow, oh) = cap.size();
+                self.preview = match cap.grab() {
+                    Ok(f) => {
+                        logline!("[pick] 抓帧器 ok，输出 {}x{}，首帧 {}x{}", ow, oh, f.width, f.height);
+                        Some(f)
+                    }
+                    Err(e) => {
+                        logline!("[pick] 抓帧器 ok，但首帧失败：{e}");
+                        None
+                    }
+                };
                 self.preview_cap = Some(cap);
             }
             Err(e) => {
                 // 不再弹模态框：把原因写进状态栏，用户可直接再点一次【拾取窗口】
                 // ⚠️ 必须把旧预览清掉：否则状态栏说"抓不到"，画面上却还留着上一个目标的图，
                 //    用户会以为拾取成功了（实测踩过）。
+                logline!("[pick] 建抓帧器失败：{e}");
                 self.preview = None;
                 let t = win::wide(&format!("无法抓取该窗口：{e}　请重新拾取"));
                 SetWindowTextW(self.ctl.state, t.as_ptr());
@@ -807,7 +834,6 @@ impl App {
                 return;
             }
         }
-        win::pick_log("DO_PICK 抓帧完成，准备更新界面");
         // 辅助提醒：目标客户区明显大于"典型画布比例"时提示可能没浮动
         // （规格：仅提示，允许强行继续）
         self.pick_state = if looks_like_panel(&info) {
@@ -815,15 +841,19 @@ impl App {
         } else {
             PickState::Ok
         };
+        logline!(
+            "[pick] 拾取完成 pick_state={:?} 预览={}x{}",
+            self.pick_state,
+            self.preview.as_ref().map(|f| f.width).unwrap_or(0),
+            self.preview.as_ref().map(|f| f.height).unwrap_or(0)
+        );
         self.target = Some(info);
-        win::pick_log("DO_PICK 已设置 target，调用 refresh_labels");
         self.refresh_labels();
-        win::pick_log("DO_PICK refresh_labels 完成，触发重绘");
         // 拾取期间主窗口被最小化过，WM_PAINT 的时机不保证；这里**同步**重绘一次，
         // 保证"点完标题栏，预览立刻出现"，而不是等下一个计时器/曝光周期。
         InvalidateRect(self.hwnd, std::ptr::null(), 1);
         UpdateWindow(self.hwnd);
-        win::pick_log("DO_PICK 同步重绘完成");
+        logline!("[pick] 同步重绘完成");
     }
 
     unsafe fn show_help(&self) {
@@ -920,6 +950,13 @@ impl App {
             return;
         }
         self.preview_cap = None; // 录制期间由录制线程独占抓帧
+        logline!(
+            "[record] 开始录制 target=0x{:X} | {} | fps={} threshold={}",
+            target.hwnd as isize,
+            target.label(),
+            self.fps,
+            self.threshold
+        );
         let cfg = RecorderConfig {
             hwnd: target.hwnd as isize,
             root: default_cache_root(),
@@ -964,6 +1001,12 @@ impl App {
         }
 
         let failed = shared.as_ref().map(|s| s.error()).flatten();
+        logline!(
+            "[record] 停止：dir={:?} frames={} error={:?}",
+            dir,
+            shared.as_ref().map(|s| s.frames()).unwrap_or(0),
+            failed
+        );
         if let Some(e) = failed {
             message(self.hwnd, "录制失败", &e);
             return;
@@ -1002,8 +1045,17 @@ impl App {
             quality: self.quality,
             output: out,
         };
+        logline!(
+            "[encode] 开始 session={:?} out={:?} fps={} quality={:?} clean_after={}",
+            session,
+            opts.output,
+            opts.fps,
+            opts.quality,
+            clean_after
+        );
         let dir = session;
         std::thread::spawn(move || {
+            let started = std::time::Instant::now();
             let r = encode::encode_session(&dir, &opts, &mut |done, all| {
                 progress.store(done, Ordering::SeqCst);
                 total.store(all, Ordering::SeqCst);
@@ -1013,6 +1065,16 @@ impl App {
                     Progress::Continue
                 }
             });
+            crate::log::line(&format!(
+                "[encode] 结束（{:.1}s）: {:?}",
+                started.elapsed().as_secs_f64(),
+                r.as_ref().map(|o| match o {
+                    EncodeOutcome::Done(s) =>
+                        format!("Done {}帧 {}x{} {:.1}s {}字节", s.frames, s.width, s.height, s.seconds, s.bytes),
+                    EncodeOutcome::Cancelled(s) =>
+                        format!("Cancelled {}帧 {}x{}", s.frames, s.width, s.height),
+                })
+            ));
             if let Ok(mut slot) = outcome.lock() {
                 *slot = Some(r);
             }
@@ -1147,10 +1209,41 @@ impl App {
             .map(|s| s.phase().is_running())
             .unwrap_or(false);
         if !recording && self.preview_cap.is_some() {
-            if let Some(cap) = &self.preview_cap {
-                if let Ok(f) = cap.grab() {
-                    self.preview = Some(f);
-                    InvalidateRect(self.hwnd, &self.preview_rect, 0);
+            // 先抓完再把结果搬出来，避免 `&self.preview_cap` 的不可变借用挡住后面的字段修改
+            let grabbed = self.preview_cap.as_ref().map(|c| c.grab());
+            if let Some(res) = grabbed {
+                match res {
+                    Ok(f) => {
+                        let sz = (f.width, f.height);
+                        if self.preview_size != (0, 0) && sz != self.preview_size {
+                            logline!(
+                                "[preview] 输出尺寸变化 {}x{} -> {}x{}",
+                                self.preview_size.0,
+                                self.preview_size.1,
+                                sz.0,
+                                sz.1
+                            );
+                        }
+                        if self.preview_err.take().is_some() {
+                            logline!("[preview] 抓帧恢复正常");
+                        }
+                        self.preview_size = sz;
+                        self.preview = Some(f);
+                        InvalidateRect(self.hwnd, &self.preview_rect, 0);
+                    }
+                    Err(e) => {
+                        // 目标被关掉/最小化时这个错误每 500ms 重复一次：
+                        // 只在"错误内容变了"或"距上次记录 ≥10 秒"时写
+                        let now = std::time::Instant::now();
+                        let due = match &self.preview_err {
+                            None => true,
+                            Some((old, at)) => *old != e || now.duration_since(*at).as_secs() >= 10,
+                        };
+                        if due {
+                            logline!("[preview] 抓帧失败：{e}");
+                            self.preview_err = Some((e, now));
+                        }
+                    }
                 }
             }
         }
@@ -1231,7 +1324,12 @@ impl App {
                 );
                 painted = true;
             } else {
-                win::pick_log("PAINT 帧数据异常，跳过绘制");
+                logline!(
+                    "[paint] 预览帧数据异常，跳过绘制（{}x{} len={}）",
+                    frame.width,
+                    frame.height,
+                    frame.bgra.len()
+                );
             }
         }
         if !painted && bw > 0 && bh > 0 {
@@ -1392,6 +1490,17 @@ unsafe extern "system" fn preview_proc(
 
 /// 启动 GUI（阻塞到窗口关闭）
 pub fn run(initial_target: Option<isize>) -> i32 {
+    // 运行日志：debug 构建默认写 %LOCALAPPDATA%\CanLapse\canlapse.log（GUI 没有控制台，
+    // 用户测试后只能靠这个文件定位问题）；release 构建需显式设 CANLAPSE_LOG 才写。
+    let log_path = crate::log::init();
+    logline!("");
+    logline!(
+        "==== CanLapse {} ({}) 启动 ====",
+        env!("CARGO_PKG_VERSION"),
+        if cfg!(debug_assertions) { "debug" } else { "release" }
+    );
+    logline!("exe = {:?}", std::env::current_exe().ok());
+    logline!("log = {:?}", log_path);
     // 崩溃现场落盘：GUI 是 windows 子系统，stderr 默认不可见，panic 信息会完全丢失。
     // 装了钩子后，一旦崩溃可查看 %LOCALAPPDATA%\CanLapse\crash.log（追加写入）。
     std::panic::set_hook(Box::new(|info| {
@@ -1402,6 +1511,7 @@ pub fn run(initial_target: Option<isize>) -> i32 {
         let _ = std::fs::create_dir_all(&dir);
         let stamp = win::stamp_iso(&win::local_now());
         let text = format!("[{stamp}] {info}\n");
+        crate::log::line(&format!("[panic] {info}"));
         use std::io::Write;
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
@@ -1478,6 +1588,13 @@ pub fn run(initial_target: Option<isize>) -> i32 {
                 if let Some(cap) = &app.preview_cap {
                     app.preview = cap.grab().ok();
                 }
+                logline!(
+                    "[start] 命令行指定目标 0x{:X} | {:?} | 预览={}x{}",
+                    h,
+                    app.target.as_ref().map(|t| t.label()),
+                    app.preview.as_ref().map(|f| f.width).unwrap_or(0),
+                    app.preview.as_ref().map(|f| f.height).unwrap_or(0)
+                );
                 app.refresh_labels();
             }
         }

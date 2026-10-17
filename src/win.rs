@@ -5,8 +5,10 @@ use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use crate::logline;
+
 use windows_sys::core::BOOL;
-use windows_sys::Win32::Foundation::{CloseHandle, HWND, LPARAM, POINT, RECT, SYSTEMTIME};
+use windows_sys::Win32::Foundation::{CloseHandle, HWND, LPARAM, LRESULT, POINT, RECT, SYSTEMTIME, WPARAM};
 // 注意：ClientToScreen 在 Graphics::Gdi 下，不在 WindowsAndMessaging（实测踩过）。
 use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -18,10 +20,11 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, VK_ESCAPE, VK_F8, VK_LBUTTON,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, EnumWindows, GetAncestor, GetClassNameW, GetClientRect, GetCursorPos,
-    GetForegroundWindow, GetParent, GetWindow, GetWindowRect, GetWindowTextW,
-    GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, MSG, PM_REMOVE, PeekMessageW,
-    TranslateMessage, WindowFromPoint, GA_ROOT, GW_OWNER,
+    CallNextHookEx, DispatchMessageW, EnumWindows, GetAncestor, GetClassNameW, GetClientRect,
+    GetCursorPos, GetForegroundWindow, GetParent, GetWindow, GetWindowRect, GetWindowTextW,
+    GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, MSG, MSLLHOOKSTRUCT, PM_REMOVE,
+    PeekMessageW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WindowFromPoint,
+    GA_ROOT, GW_OWNER, HHOOK, WH_MOUSE_LL, WM_LBUTTONDOWN, WM_LBUTTONUP,
 };
 
 pub fn wide(s: &str) -> Vec<u16> {
@@ -341,9 +344,69 @@ fn cursor_window() -> HWND {
     cursor_window_deep()
 }
 
-/// 交互式拾取：鼠标移到目标窗口上，实时打印光标下的窗口，点左键确认，Esc 取消。
+// ---------------------------------------------------------------------------
+// 拾取用的低级鼠标钩子（WH_MOUSE_LL）
+// ---------------------------------------------------------------------------
+//
+// 为什么需要它：拾取要求用户"点一下画布"，但这一下如果原样传给绘画软件，
+// 笔刷会在画布上留下一个点（真实 SAI2 上会）。用低级钩子**吞掉**这次点击：
+// 我们只从坐标算出窗口，目标软件什么也收不到。
+// 顺带解决了"快速点击落在两次 60ms 轮询之间被漏掉"的问题。
+
+use std::sync::atomic::AtomicIsize;
+
+static CLICK_HWND: AtomicIsize = AtomicIsize::new(0);
+static CLICK_HIT: AtomicBool = AtomicBool::new(false);
+
+unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if code >= 0 {
+        match wparam as u32 {
+            WM_LBUTTONDOWN => {
+                let info = &*(lparam as *const MSLLHOOKSTRUCT);
+                CLICK_HWND.store(WindowFromPoint(info.pt) as isize, Ordering::SeqCst);
+                CLICK_HIT.store(true, Ordering::SeqCst);
+                return 1; // 吞掉：不传给目标软件
+            }
+            WM_LBUTTONUP => {
+                return 1; // 与 down 成对吞掉，免得目标软件收到"半截"点击
+            }
+            _ => {}
+        }
+    }
+    CallNextHookEx(null_mut(), code, wparam, lparam)
+}
+
+/// 低级鼠标钩子的 RAII 句柄：离开作用域自动卸载。
+struct MouseHook(HHOOK);
+
+impl MouseHook {
+    fn install() -> Option<Self> {
+        let hk = unsafe {
+            SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), module_handle() as _, 0)
+        };
+        if hk.is_null() {
+            logline!("[pick] 低级鼠标钩子安装失败，退回轮询点击（点击可能会落到目标软件里）");
+            None
+        } else {
+            logline!("[pick] 低级鼠标钩子已安装（拾取点击会被拦截，不会画到画布上）");
+            Some(Self(hk))
+        }
+    }
+}
+
+impl Drop for MouseHook {
+    fn drop(&mut self) {
+        unsafe {
+            UnhookWindowsHookEx(self.0);
+        }
+    }
+}
+
+/// 交互式拾取：光标移到目标上，**点一下**确认，Esc 取消。
 ///
-/// v1.0 的 GUI 版会把"实时打印"换成屏幕高亮框；选择逻辑本身是同一套。
+/// 点击有两条路径：
+/// 1. **首选**：低级鼠标钩子 —— 点击被吞掉，不会画到画布上，也不会漏掉快速点击；
+/// 2. 兜底（钩子装不上时）：60ms 轮询 `GetAsyncKeyState`，同时看"按住"和"按下过"边沿。
 pub fn pick_window_interactive(hint: Option<HWND>) -> Option<HWND> {
     let me = std::process::id();
     let mut last: isize = 0;
@@ -351,47 +414,127 @@ pub fn pick_window_interactive(hint: Option<HWND>) -> Option<HWND> {
     // 旧实现把点击判定放在 pid/null 检查之后：只要鼠标当下落在我们自己的窗口或空处，
     // 代码就 continue，**永远走不到检测点击那一步** —— 表现为"最小化后点哪都没反应"。
     let mut candidate: HWND = null_mut();
-    let mut ticks = 0u32;
+    let hook = MouseHook::install();
+    // 清掉"点【拾取窗口】按钮"那一下留下的边沿
+    unsafe {
+        GetAsyncKeyState(VK_LBUTTON as i32);
+    }
+    logline!("[pick] 进入拾取循环（Esc 取消）");
     loop {
         pump();
         if key_down(VK_ESCAPE) {
+            logline!("[pick] Esc 取消");
             return None;
+        }
+        // 首选路径：钩子已经截获了这次点击
+        if hook.is_some() && CLICK_HIT.swap(false, Ordering::SeqCst) {
+            let h = CLICK_HWND.load(Ordering::SeqCst) as HWND;
+            if !h.is_null() && pid_of(h) != me && looks_pickable(h) {
+                logline!(
+                    "[pick] 左键点击（已拦截）-> 0x{:X} | {} | 层级：{}",
+                    h as isize,
+                    describe(h).label(),
+                    ancestor_chain(h)
+                );
+                // 等松开，确保 up 也被吞掉，目标软件不会收到"半截"点击
+                while key_down(VK_LBUTTON) {
+                    pump();
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                return Some(h);
+            }
+            logline!(
+                "[pick] 点击被拦截，但目标不可用：0x{:X}（pid={}，本进程={}）",
+                h as isize,
+                if h.is_null() { 0 } else { pid_of(h) },
+                h.is_null() || pid_of(h) == me
+            );
+        }
+        // 兜底路径：没有钩子时轮询
+        if hook.is_none() {
+            let (btn_down, btn_edge) = left_button_state();
+            if btn_down || btn_edge {
+                while key_down(VK_LBUTTON) {
+                    pump();
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                if !candidate.is_null() {
+                    logline!(
+                        "[pick] 左键确认（轮询）-> 0x{:X} | {} | 层级：{}",
+                        candidate as isize,
+                        describe(candidate).label(),
+                        ancestor_chain(candidate)
+                    );
+                    return Some(candidate);
+                }
+                logline!("[pick] 左键点击但无可用候选（光标窗口 0x{:X}）", cursor_window() as isize);
+            }
         }
         let h = cursor_window();
         if let Some(tip) = hint {
             pick_hint_follow(tip);
         }
-        if !h.is_null() && pid_of(h) != me && looks_pickable(h) {
+        let pickable = !h.is_null() && pid_of(h) != me && looks_pickable(h);
+        if pickable {
             candidate = h;
-            if h as isize != last {
-                last = h as isize;
-                println!("  当前指向: {}", describe(h).label());
-            }
         }
-        // 诊断日志（最多 300 行）：下一次失败时可以直接看出卡在哪一步
-        if ticks < 300 {
-            writes_pick_log(&format!(
-                "t{ticks} cursor=0x{:X} pid={} cand=0x{:X} lbtn={}",
-                h as isize,
-                if h.is_null() { 0 } else { pid_of(h) },
-                candidate as isize,
-                key_down(VK_LBUTTON)
-            ));
-            ticks += 1;
-        }
-        if key_down(VK_LBUTTON) {
-            // 等左键松开，避免把这次按下当成"开始录制"之类
-            while key_down(VK_LBUTTON) {
-                pump();
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            if !candidate.is_null() {
-                return Some(candidate);
+        if h as isize != last {
+            last = h as isize;
+            if h.is_null() {
+                logline!("[pick] 光标下没有窗口");
+            } else {
+                let info = describe(h);
+                logline!(
+                    "[pick] 光标 0x{:X} | {} | 客户区 {}x{} | pid={} | 可拾取={} | 本进程={}",
+                    h as isize,
+                    info.label(),
+                    info.client.right - info.client.left,
+                    info.client.bottom - info.client.top,
+                    info.pid,
+                    pickable,
+                    info.pid == me
+                );
             }
         }
         std::thread::sleep(Duration::from_millis(60));
     }
 }
+
+
+/// 左键状态：`(当前是否按住, 自上次调用以来是否按下过)`。
+///
+/// 低位是"按下过"的边沿锁存，读取即清除 —— 每轮循环只能读一次，否则会丢事件。
+fn left_button_state() -> (bool, bool) {
+    let st = unsafe { GetAsyncKeyState(VK_LBUTTON as i32) as u16 };
+    (st & 0x8000 != 0, st & 0x0001 != 0)
+}
+
+/// 从 `hwnd` 往上到顶层（含）的窗口链，用于诊断"这一下点到了哪一层"。
+pub fn ancestor_chain(hwnd: HWND) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut h = hwnd;
+    for _ in 0..8 {
+        if h.is_null() {
+            break;
+        }
+        let info = describe(h);
+        let (w, ht) = info.client_size();
+        parts.push(format!(
+            "0x{:X} {} {}x{}",
+            h as isize,
+            if info.class_name.is_empty() { "?" } else { &info.class_name },
+            w,
+            ht
+        ));
+        let p = unsafe { GetParent(h) };
+        if p.is_null() {
+            break;
+        }
+        h = p;
+    }
+    parts.join(" <- ")
+}
+
 
 /// 这个窗口是否值得作为拾取目标。
 ///
@@ -416,31 +559,6 @@ fn looks_pickable(h: HWND) -> bool {
     // 太小的窗口不可能是画布
     let (w, ht) = client_size(h);
     w >= 64 && ht >= 64
-}
-
-/// 把拾取过程的诊断**显式开启后才**写文件（见下方 `writes_pick_log`）。
-pub fn pick_log(line: &str) {
-    writes_pick_log(line);
-}
-
-/// 拾取诊断日志：只有设置了 `CANLAPSE_LOG` 才写。
-///
-/// 之前默认往 `%LOCALAPPDATA%\CanLapse\pick.log` 里写（每次拾取最多 300 行），
-/// 排查期很方便，但用户机器上不该留下这种调试残留 —— 而且预览每重绘一次也写一行，
-/// 长时间开着会一直长。改成**显式开启**：需要排查时设
-/// `CANLAPSE_LOG=<某文件路径>` 再启动，默认零副作用。
-fn writes_pick_log(line: &str) {
-    use std::io::Write;
-    let Ok(path) = std::env::var("CANLAPSE_LOG") else {
-        return;
-    };
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
-        let _ = writeln!(f, "{line}");
-    }
 }
 
 // ---------------------------------------------------------------------------

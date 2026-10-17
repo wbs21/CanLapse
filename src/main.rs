@@ -431,10 +431,8 @@ fn cmd_doctor() -> i32 {
     );
 
     println!("\n[编码]");
-    let ffdir = std::env::var("CANLAPSE_FFMPEG_MIN")
-        .or_else(|_| std::env::var("FFMPEG_MIN_DIR"))
-        .unwrap_or_else(|_| r"D:\CapLite\ffmpeg-min".to_string());
-    println!("  ffmpeg-min 目录：{ffdir}");
+    let ffdir = canlapse::ffmpeg_min_dir();
+    println!("  ffmpeg-min 目录：{}", ffdir.display());
     println!(
         "  libopenh264 编码器：{}",
         if encode::encoder_available() {
@@ -479,6 +477,8 @@ fn cmd_doctor() -> i32 {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    // 运行日志：debug 构建默认写 %LOCALAPPDATA%\CanLapse\canlapse.log，release 需设 CANLAPSE_LOG
+    let log_path = canlapse::log::init();
     if args.len() < 2 {
         // 图形界面有独立入口（CanLapse.exe），所以这里没有参数就打印帮助
         help();
@@ -486,6 +486,12 @@ fn main() {
     }
     let cmd = args[1].as_str();
     let rest: Vec<String> = args[2..].to_vec();
+    canlapse::log::line(&format!(
+        "==== canlapse-cli {} 启动: {} (log={:?}) ====",
+        env!("CARGO_PKG_VERSION"),
+        args[1..].join(" "),
+        log_path
+    ));
 
     let code = match cmd {
         "gui" => {

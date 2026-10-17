@@ -31,16 +31,22 @@
   - 历史会话列表（名称｜帧数）+ 重新导出 / 打开文件夹 / 删除；录制或合成中的会话禁止删除。
   - 两个弹窗：帮助（4 款绘画软件浮动画布指引）、大图预览（等比缩放、置前）。
   - 崩溃现场落盘：panic 写入 `%LOCALAPPDATA%\CanLapse\crash.log`（GUI 是 windows 子系统，
-    stderr 看不见）；拾取流程另有 `CANLAPSE_LOG` 显式开启的诊断日志。
+    stderr 看不见）。
 - **技术验证原型**（保留作为依据，不属于产品代码）
   - `spikes/dwm-capture/`：DWM 抓帧可行性原型（6 种读回方式 × 可见/遮挡/最小化三态，
     跨进程 `--helper` 对端，按 tick 绘制确定性图案做逐像素自证）+ FINDINGS + 实测截图。
   - `spikes/encode-mp4/`：离线 H.264/MP4 编码原型（手写 FFI 直链 ffmpeg-min 的 libopenh264）
     + FINDINGS + `out.mp4`（48 帧 / 640×360 / 4.8s，经三重验证）。
+- **运行日志（debug 默认开启）**
+  - `src/log.rs`：debug 构建默认写 `%LOCALAPPDATA%\CanLapse\canlapse.log`（release 需设
+    `CANLAPSE_LOG`），超 4MB 自动轮转成 `.old`；记录启动环境、拾取全过程的窗口层级、
+    抓帧器/首帧结果、录制与合成结果、预览抓帧失败（10 秒限流）。
+  - GUI 没有控制台，出问题只能靠这个文件；崩溃另有 `crash.log`。
 - **打包**
   - `tools/build.ps1`：一键构建（cargo build + 构建后资源注入）。
   - `tools/embed-resources.ps1` + `tools/ResInject.cs`：`.res` → `res.dll` → `UpdateResourceW`
     注入图标与版本信息；`.rc` 用 UTF-16LE 且必须 `#define VS_VERSION_INFO 1`（否则写出空壳）。
+
 - `docs/requirements.md`：v1.0 需求基线；`docs/verification-log.md`：验证台账。
 - ADR 0002（Rust + DWM 缩略图抓帧）、0003（手写 FFI 直链自编译最小 ffmpeg）、
   0004（UI 技术栈对比）、0005（Qt 类软件无画布子窗口）。
@@ -83,6 +89,18 @@
 - 拾取结束只调 `InvalidateRect`，而主窗口刚从小化恢复、WM_PAINT 时机不保证 →
   改为 `InvalidateRect` + `UpdateWindow` 同步重绘；预览的尺寸防御检查也不再
   在异常分支 `return`（那会跳过 `EndPaint`，每帧漏一个 DC）。
+- **拾取把画布子窗口换成了整个主窗口**：`do_pick` 里一句"统一解析到顶层窗口"
+  （`root_of`）把用户点中的画布子窗口替换成主窗口，预览里于是出现工具栏/颜色面板
+  —— 用户看到的就是"没锁到画布"（SAI2 上实测；画布 0x100F0A 的裁剪应为 652×773）。
+  改为保留用户点中的窗口，子窗口由抓帧器自己解析成「顶层缩略图 + rcSource 裁剪」。
+- **抓帧宿主出现在任务栏预览里**：宿主窗口没加 `WS_EX_TOOLWINDOW`，鼠标停在任务栏
+  图标上会看到一堆"CanLapse 抓帧宿主"；补上 `TOOLWINDOW | NOACTIVATE`。
+- **拾取点击会画到画布上**：改为装 `WH_MOUSE_LL` 低级鼠标钩子，拾取时的这一次点击
+  被直接吞掉（目标软件收不到），同时避免快速点击落在两次 60ms 轮询之间被漏掉；
+  装不上钩子时退回轮询。
+- **依赖目录被挪走后构建直接失败**（`D:\CapLite` → `D:\ffmpeg各版本\CapLite_c`，
+  `link.exe` 报 LNK1181 找不到 `avformat.lib`）：`build.rs` 与 `doctor` 改为按
+  「环境变量 → `tools\ffmpeg-min.path` → 本机已知位置」解析，两边顺序保持一致。
 
 ### 已验证（实测证据）
 
@@ -106,6 +124,9 @@
 - **4K 画布**：3840×2160（裸 `WS_POPUP`，绕开 WinForms 的 `WM_GETMINMAXINFO` 限制）产品路径实测：
   1fps×8s 录到 6 帧、基准 3840×2160、编码 3 秒出 0.6 秒成片；debug 构建峰值工作集 169.9 MB。
   已知边界：桌面之外的部分是黑的（屏幕外区域源窗口从未绘制，缩略图拿不到内容）。
+- **SAI2 画布子窗口**：以 `--hwnd 0x100F0A`（"新建画布1 (42%)"）启动，抓帧器输出
+  `crop=(698,79,652,773)`、预览只含画布内容（无工具栏/颜色面板）；
+  抓帧宿主扩展样式实测 `0x08000080` = `TOOLWINDOW | NOACTIVATE`，不再出现在任务栏预览。
 - **打包**：`tools\build.ps1` 产出的两个 exe 都能读出 `1.0.0.0` 版本信息、带自定义图标；
   GUI 入口无 `ConsoleWindowClass`。
 
