@@ -61,13 +61,14 @@ GUI（460×380 单页 + 悬浮操作条）尚未开始。
 ```powershell
 cargo build --offline
 
-.\target\debug\canlapse.exe list                                  # 列出可见顶层窗口
-.\target\debug\canlapse.exe pick                                  # 鼠标拾取画布窗口
-.\target\debug\canlapse.exe doctor                                # 自检：抓帧/编码/运行时 DLL/缓存
-.\target\debug\canlapse.exe record --pick --fps 2 --threshold 0.01 # 录制（Esc 停止，F8 打标记）
-.\target\debug\canlapse.exe record --title Krita --duration 30 --name 下雨天
-.\target\debug\canlapse.exe sessions                              # 历史缓存会话
-.\target\debug\canlapse.exe encode --session "<会话目录>" --fps 10 --quality high
+.\target\debug\CanLapse.exe                                       # 图形界面（双击这个；无控制台）
+.\target\debug\canlapse-cli.exe list                              # 列出可见顶层窗口
+.\target\debug\canlapse-cli.exe pick                              # 鼠标拾取画布窗口
+.\target\debug\canlapse-cli.exe doctor                            # 自检：抓帧/编码/运行时 DLL/缓存
+.\target\debug\canlapse-cli.exe record --pick --fps 2 --threshold 0.01 # 录制（Esc 停止，F8 打标记）
+.\target\debug\canlapse-cli.exe record --title SAI --duration 30 --name 下雨天
+.\target\debug\canlapse-cli.exe sessions                          # 历史缓存会话
+.\target\debug\canlapse-cli.exe encode --session "<会话目录>" --fps 10 --quality high
 cargo test --offline                                              # 单元测试
 ```
 

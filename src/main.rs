@@ -68,15 +68,15 @@ fn help() {
         r#"CanLapse —— 画布窗口缩时录屏工具（{version}）
 
 用法:
-  canlapse                                         启动图形界面（等同双击 exe）
-  canlapse gui [--hwnd 0x… | --title 子串]         启动图形界面并预先指定目标窗口
-  canlapse list                                    列出可见顶层窗口（挑目标用）
-  canlapse pick                                    鼠标拾取画布窗口并打印结果
-  canlapse record [目标] [选项]                     开始录制（抓帧到缓存目录）
-  canlapse sessions                                列出历史缓存会话
-  canlapse encode --session DIR [选项]             把会话缓存合成 MP4
-  canlapse doctor                                  自检（抓帧/编码/运行时 DLL/缓存）
-  canlapse --help
+  CanLapse                                         启动图形界面（双击这个 exe）
+  canlapse-cli gui [--hwnd 0x… | --title 子串]     启动图形界面并预先指定目标窗口
+  canlapse-cli list                                列出可见顶层窗口（挑目标用）
+  canlapse-cli pick                                鼠标拾取画布窗口并打印结果
+  canlapse-cli record [目标] [选项]                 开始录制（抓帧到缓存目录）
+  canlapse-cli sessions                            列出历史缓存会话
+  canlapse-cli encode --session DIR [选项]         把会话缓存合成 MP4
+  canlapse-cli doctor                              自检（抓帧/编码/运行时 DLL/缓存）
+  canlapse-cli --help
 
 录制目标（三选一，都不给则进入鼠标拾取）:
   --hwnd 0x1234        直接指定窗口句柄
@@ -304,7 +304,7 @@ fn cmd_record(a: RecordArgs) -> i32 {
     if let Some(dir) = shared.session_dir() {
         println!("会话目录: {}", dir.display());
         println!(
-            "下一步：canlapse encode --session \"{}\" --fps 10",
+            "下一步：canlapse-cli encode --session \"{}\" --fps 10",
             dir.display()
         );
     }
@@ -480,8 +480,9 @@ fn cmd_doctor() -> i32 {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        // 没有参数 = 双击启动：直接进 GUI（产品形态）
-        std::process::exit(ui::run(None));
+        // 图形界面有独立入口（CanLapse.exe），所以这里没有参数就打印帮助
+        help();
+        std::process::exit(0);
     }
     let cmd = args[1].as_str();
     let rest: Vec<String> = args[2..].to_vec();
