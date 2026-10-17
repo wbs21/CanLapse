@@ -2,9 +2,9 @@
 
 > 面向手绘创作者（SAI2 > Photoshop > CLIP STUDIO PAINT > Krita）的 **Windows 画布窗口缩时录屏工具**。
 
-当前状态：**v1.0 功能完整、真机验证通过** —— 拾取窗口 → 差分 → PNG 缓存 → 合成 MP4 全链路可用；
-单页 GUI（460×455）、悬浮操作条、历史会话面板与两个弹窗均已完成，并在真实绘画软件
-（SAI2 / Krita / CSP）上实测，4K 画布也已跑通产品路径。尚未覆盖的只剩 Photoshop（本机未安装），
+当前状态：**v1.0 功能完整、四款软件实测通过** —— 拾取窗口 → 差分 → PNG 缓存 → 合成 MP4 全链路可用；
+单页 GUI（460×455）、悬浮操作条、历史会话面板与两个弹窗均已完成。
+SAI2 / CLIP STUDIO PAINT / Photoshop / Krita 均实测可迅速锁定画布窗口，
 明细见 [docs/verification-log.md](docs/verification-log.md)。
 
 ## 它怎么工作
@@ -124,8 +124,8 @@ CanLapse/
    这是"缩略图 = 屏幕合成结果"的固有边界。
 4. **依赖实现行为**：`缩略图 + PW_RENDERFULLCONTENT` 没有微软的明确文档承诺，
    代码里已有纯色画面告警作为兜底。
-5. **目标应用差异**：SAI2 / Krita / CSP 已真机验证（Qt 类软件只能录整个窗口，见 ADR 0005）；
-   **Photoshop 本机未安装，尚未验证**。
+5. **目标应用差异**：SAI2 / CSP / Photoshop / Krita 均已实测可拾取（Qt 类软件无画布子窗口，
+   只能录整个窗口，见 ADR 0005；建议按 `Tab` 进 Canvas-only 模式）。
 
 ## 许可
 
