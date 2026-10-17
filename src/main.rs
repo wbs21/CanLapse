@@ -233,10 +233,18 @@ fn cmd_record(a: RecordArgs) -> i32 {
             None => String::new(),
         }
     );
+    println!(
+        "提示: 录制开始后**第一张保存的画面决定视频分辨率**。建议录制初期就把画布窗口调到目标大小；\n\
+         录制中尽量不要缩小画布窗口（画布变小、后续帧会被拉伸放大，画面会糊；变大则会被缩小）。"
+    );
 
     let interval = Duration::from_secs_f64(1.0 / a.fps);
     let start = Instant::now();
     let mut last_saved: Option<Frame> = None;
+    // 分辨率统一：**第一张保存的帧**决定视频分辨率（base_size），
+    // 之后所有帧都等比缩放 + 居中 + 黑边填充到这个尺寸再落盘。
+    // 注意差分始终用**原始捕获帧**，不能用填充后的图（黑边会干扰差分、放大误触发）。
+    let mut base_size: Option<(i32, i32)> = None;
     let mut dropped: u32 = 0;
     let mut skipped: u32 = 0; // 因"画面没变"而没存帧的采样次数
     let mut blank_warned = false;
@@ -269,9 +277,17 @@ fn cmd_record(a: RecordArgs) -> i32 {
         match cap.sync_source_size() {
             Ok(true) => {
                 let (nw, nh) = cap.size();
-                println!("\n目标客户区尺寸变为 {nw}x{nh}，已重建抓帧；上一帧作废。");
-                sess.update_geometry(nw, nh);
-                last_saved = None;
+                match base_size {
+                    Some((bw, bh)) => println!(
+                        "\n目标客户区尺寸变为 {nw}x{nh}，已重建抓帧；后续帧会等比适配到基准 {bw}x{bh}。"
+                    ),
+                    None => {
+                        // 基准还没确定：此时会话元信息跟随当前窗口
+                        sess.update_geometry(nw, nh);
+                        println!("\n目标客户区尺寸变为 {nw}x{nh}，已重建抓帧。");
+                    }
+                }
+                last_saved = None; // 强制下一帧保存
             }
             Ok(false) => {}
             Err(e) => {
@@ -296,12 +312,30 @@ fn cmd_record(a: RecordArgs) -> i32 {
                     None => 1.0, // 第一帧总是存
                 };
                 if changed > a.threshold {
-                    match sess.save_frame(&f) {
+                    // 第一张保存帧确定基准分辨率；之后的帧统一适配到它
+                    let to_save = match base_size {
+                        None => {
+                            base_size = Some((f.width, f.height));
+                            sess.update_geometry(f.width, f.height);
+                            println!(
+                                "\n基准分辨率已确定：{}×{}（第一张保存的画面决定视频分辨率，之后所有帧都会等比适配到它）",
+                                f.width, f.height
+                            );
+                            f.clone()
+                        }
+                        Some((bw, bh)) => f.fit_into(bw, bh, [0, 0, 0]),
+                    };
+                    match sess.save_frame(&to_save) {
                         Ok(n) => {
+                            // 差分用的始终是**原始捕获帧**，不是填充后的图
                             last_saved = Some(f);
                             if !a.quiet {
+                                let base = match base_size {
+                                    Some((bw, bh)) => format!("{bw}×{bh}"),
+                                    None => "-".to_string(),
+                                };
                                 print!(
-                                    "\r已录制 {n} 帧 | 画面变化 {:.1}% | 丢弃 {dropped} | 跳过 {skipped}   ",
+                                    "\r已录制 {n} 帧 | 基准 {base} | 变化 {:.1}% | 丢弃 {dropped} | 跳过 {skipped}   ",
                                     changed * 100.0
                                 );
                                 use std::io::Write;

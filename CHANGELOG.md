@@ -33,6 +33,14 @@
 
 ### 变更
 
+- **分辨率统一（按 `add/分辨率统一.md` 的规格实现）**：录制以**第一张保存的画面**确定基准分辨率，
+  之后所有帧**等比缩放 + 居中 + 黑边填充**到该尺寸再落盘；
+  **差分始终用原始捕获帧**（填充的黑边会干扰差分、放大误触发）。
+  实测：录制中途把目标窗口 480×320 改成 640×400，32 帧全部为 480×320，
+  改后帧内容为 480×300 居中、上下各 10 行黑边。
+- 新增 `Frame::get` / `resize_to` / `fit_into`：缩小用**面积平均**（避免降采样锯齿）、放大用双线性；
+  未引入 `image` crate（该路径只在"录制中途改了窗口尺寸"时才会走到）。
+- 录制信息栏实时显示基准分辨率，并在录制开始时给出"第一张画面决定视频分辨率"的提示。
 - 技术栈由「待定」定为 **Rust**（`x86_64-pc-windows-msvc` + `windows-sys`，无第三方 UI 框架）。
 - 项目骨架填充为真实内容：README 改为产品说明与进度表。
 
@@ -68,5 +76,14 @@
    因此编码验证可以做真实解码回读。
 2. 「自编译最小方案」的出处不在 `D:\CapLite` 下，而在 `D:\tools\`
    （`build-oh264.sh` + `wrappers/pkgconf-fit.c`），openh264 2.6.0 是**静态编进 `avcodec-63.dll`** 的。
+
+### 备注（两条与 `add/` 参考材料不一致之处，需决策）
+
+3. `add/openh264.md` 描述的是「仅编码器、`DISABLEDECODER=1`」的最小 openh264 构建，
+   但当前实际链接的 ffmpeg-min 是**编解码都带**的：
+   `--enable-encoder='libopenh264,aac' --enable-decoder='h264,aac'`（由 `canlapse doctor` 打印证实）。
+   若确实要纯编码器版，需按该文档重新编译 openh264 并改为**直接调用 WelsEnc\***（绕开 libavcodec）。
+4. `add/分辨率统一.md` 里的合成命令用 `-c:v libx264`，但这套 ffmpeg-min **没有 x264**
+   （`--disable-everything --enable-encoder='libopenh264,aac'`），只能用 libopenh264。
 
 [Unreleased]: https://example.com/canlapse/compare/v0.0.0...HEAD
