@@ -188,9 +188,19 @@ struct App {
 
 impl App {
     fn status_text(&self) -> String {
+        // 把目标尺寸/类名带出来：用户一眼就能分辨"选中的是画布还是整个窗口"
+        // （之前只显示"已选中画布窗口"，选到主窗口也照样这么说，没法判断）。
+        let picked = self
+            .target
+            .as_ref()
+            .map(|t| {
+                let (w, h) = t.client_size();
+                format!("{w}×{h}")
+            })
+            .unwrap_or_default();
         match self.pick_state {
             PickState::Empty => "尚未选择画布窗口".to_string(),
-            PickState::Ok => "✅ 已选中画布窗口".to_string(),
+            PickState::Ok => format!("✅ 已选中画布窗口（{picked}）"),
             PickState::HasPanel => {
                 "⚠️ 检测到窗口包含工具栏，画布未浮动（点【如何定位窗口】查看做法）".to_string()
             }
