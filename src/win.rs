@@ -404,10 +404,14 @@ impl Drop for MouseHook {
 
 /// 交互式拾取：光标移到目标上，**点一下**确认，Esc 取消。
 ///
+/// `owner` 是发起拾取的窗口（会先最小化）。它一旦回到前台就**取消拾取** ——
+/// 实测日志里出现过：拾取期间主窗口被恢复（Alt+Tab/任务栏/宏键盘），用户点来点去
+/// 全点在自己窗口上，被当成"无效目标"吞掉，看起来就是"点了没反应"。
+///
 /// 点击有两条路径：
 /// 1. **首选**：低级鼠标钩子 —— 点击被吞掉，不会画到画布上，也不会漏掉快速点击；
 /// 2. 兜底（钩子装不上时）：60ms 轮询 `GetAsyncKeyState`，同时看"按住"和"按下过"边沿。
-pub fn pick_window_interactive(hint: Option<HWND>) -> Option<HWND> {
+pub fn pick_window_interactive(owner: HWND, hint: Option<HWND>) -> Option<HWND> {
     let me = std::process::id();
     let mut last: isize = 0;
     // 记住"最后一个有效的非本进程窗口"。
@@ -420,16 +424,31 @@ pub fn pick_window_interactive(hint: Option<HWND>) -> Option<HWND> {
         GetAsyncKeyState(VK_LBUTTON as i32);
     }
     logline!("[pick] 进入拾取循环（Esc 取消）");
+    let mut ticks = 0u32;
     loop {
         pump();
+        ticks += 1;
         if key_down(VK_ESCAPE) {
             logline!("[pick] Esc 取消");
+            return None;
+        }
+        // 最小化有极短的过渡期，前 10 轮（约 0.6s）不判"被恢复"，避免误取消
+        if ticks > 10 && !owner.is_null() && unsafe { IsIconic(owner) } == 0 {
+            logline!("[pick] 主窗口回到了前台，取消拾取（请重新点【拾取窗口】）");
             return None;
         }
         // 首选路径：钩子已经截获了这次点击
         if hook.is_some() && CLICK_HIT.swap(false, Ordering::SeqCst) {
             let h = CLICK_HWND.load(Ordering::SeqCst) as HWND;
-            if !h.is_null() && pid_of(h) != me && looks_pickable(h) {
+            if h.is_null() || pid_of(h) == me {
+                // 点到自己的窗口：用户显然想操作本程序，取消拾取把控制权还给他
+                logline!(
+                    "[pick] 点击落在本程序窗口（0x{:X}），取消拾取",
+                    h as isize
+                );
+                return None;
+            }
+            if looks_pickable(h) {
                 logline!(
                     "[pick] 左键点击（已拦截）-> 0x{:X} | {} | 层级：{}",
                     h as isize,
@@ -444,10 +463,9 @@ pub fn pick_window_interactive(hint: Option<HWND>) -> Option<HWND> {
                 return Some(h);
             }
             logline!(
-                "[pick] 点击被拦截，但目标不可用：0x{:X}（pid={}，本进程={}）",
+                "[pick] 点击被拦截，但目标不可用：0x{:X}（pid={}）",
                 h as isize,
-                if h.is_null() { 0 } else { pid_of(h) },
-                h.is_null() || pid_of(h) == me
+                pid_of(h)
             );
         }
         // 兜底路径：没有钩子时轮询

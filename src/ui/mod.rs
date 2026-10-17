@@ -777,12 +777,12 @@ impl App {
         // 拾取期间最小化主窗口（用户要求），让开目标；拾取结束再恢复。
         ShowWindow(self.hwnd, SW_MINIMIZE);
         logline!("[pick] 主窗口已最小化，进入拾取");
-        let t = win::wide("请直接点一下画布画面（或浮动画布窗口的标题栏）；按 Esc 取消");
+        let t = win::wide("请点一下画布画面（不要点 CanLapse 自己的窗口）；按 Esc 取消");
         SetWindowTextW(self.ctl.state, t.as_ptr());
         UpdateWindow(self.hwnd);
 
-        let hint = win::pick_hint_create(self.hwnd, "点画布画面或它的标题栏");
-        let picked = win::pick_window_interactive(Some(hint));
+        let hint = win::pick_hint_create(self.hwnd, "点画布画面（不是 CanLapse 窗口）");
+        let picked = win::pick_window_interactive(self.hwnd, Some(hint));
         win::pick_hint_destroy(hint);
 
         // 拾取结束：取消半透明与置顶，把界面拉回最前并正常显示
@@ -796,8 +796,10 @@ impl App {
         InvalidateRect(self.hwnd, std::ptr::null(), 1);
 
         let Some(hwnd) = picked else {
-            logline!("[pick] 用户取消（Esc）");
+            logline!("[pick] 拾取取消（Esc / 主窗口被恢复 / 点在本程序窗口上）");
             self.refresh_labels();
+            let t = win::wide("已取消拾取，请重新点【拾取窗口】");
+            SetWindowTextW(self.ctl.state, t.as_ptr());
             return;
         };
         // ⚠️ 这里**不要**把目标"统一解析到顶层窗口"。
