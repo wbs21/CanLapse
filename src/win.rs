@@ -19,8 +19,8 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, EnumWindows, GetAncestor, GetClassNameW, GetClientRect, GetCursorPos,
-    GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible,
-    MSG, PM_REMOVE, PeekMessageW, TranslateMessage, WindowFromPoint, GA_ROOT,
+    GetParent, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow,
+    IsWindowVisible, MSG, PM_REMOVE, PeekMessageW, TranslateMessage, WindowFromPoint, GA_ROOT,
 };
 
 pub fn wide(s: &str) -> Vec<u16> {
@@ -47,9 +47,11 @@ impl WindowInfo {
         } else {
             self.title.clone()
         };
+        let is_child = unsafe { !GetParent(self.hwnd).is_null() };
         format!(
-            "{} [{}] {}x{}",
+            "{}{} [{}] {}x{}",
             t,
+            if is_child { "（子窗口）" } else { "" },
             if self.process.is_empty() { "?" } else { &self.process },
             self.client.right - self.client.left,
             self.client.bottom - self.client.top
@@ -238,23 +240,10 @@ pub fn marker_key_pressed() -> bool {
 }
 
 fn cursor_window() -> HWND {
-    unsafe {
-        let mut pt = POINT { x: 0, y: 0 };
-        if GetCursorPos(&mut pt) == 0 {
-            return null_mut();
-        }
-        let h = WindowFromPoint(pt);
-        if h.is_null() {
-            return null_mut();
-        }
-        // 点到的是子窗口（画布常常是子窗口），要上溯到顶层窗口
-        let root = GetAncestor(h, GA_ROOT);
-        if root.is_null() {
-            h
-        } else {
-            root
-        }
-    }
+    // 注意：**不要**上溯到顶层窗口。SAI2 的画布就是子窗口，
+    // 上溯会把整个主窗口（含所有面板）当成目标 —— 录出来是一堆工具栏。
+    // 拾取要取光标下最深的那一层。
+    cursor_window_deep()
 }
 
 /// 交互式拾取：鼠标移到目标窗口上，实时打印光标下的窗口，点左键确认，Esc 取消。
@@ -340,6 +329,86 @@ pub fn module_handle() -> *mut c_void {
     unsafe { GetModuleHandleW(null()) }
 }
 
+// ---------------------------------------------------------------------------
+// 子窗口几何：抓"画布子窗口"的关键
+// ---------------------------------------------------------------------------
+
+/// 取窗口的**顶层祖先**。DWM 缩略图只能对顶层窗口注册
+/// （对子窗口调用 `DwmRegisterThumbnail` 会返回 E_INVALIDARG —— SAI2 上实测）。
+pub fn root_of(hwnd: HWND) -> HWND {
+    unsafe {
+        let r = GetAncestor(hwnd, GA_ROOT);
+        if r.is_null() {
+            hwnd
+        } else {
+            r
+        }
+    }
+}
+
+/// 计算 `child` 的**客户区**在 `root` 客户区坐标系里的矩形 `(x, y, w, h)`。
+///
+/// 抓"画布子窗口"的做法就是：对 `root` 注册缩略图，把这个矩形当作 `rcSource`，
+/// DWM 会直接把这块 1:1 送到宿主窗口 —— 既拿到的是子窗口内容，
+/// 又完全不走屏幕像素，因此不受遮挡影响。
+pub fn crop_rect_in_root(child: HWND, root: HWND) -> Option<(i32, i32, i32, i32)> {
+    unsafe {
+        let mut rc: RECT = std::mem::zeroed();
+        if GetClientRect(child, &mut rc) == 0 {
+            return None;
+        }
+        let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
+        if w <= 0 || h <= 0 {
+            return None;
+        }
+        let mut cp = POINT { x: 0, y: 0 };
+        if ClientToScreen(child, &mut cp) == 0 {
+            return None;
+        }
+        let mut rp = POINT { x: 0, y: 0 };
+        if ClientToScreen(root, &mut rp) == 0 {
+            return None;
+        }
+        Some((cp.x - rp.x, cp.y - rp.y, w, h))
+    }
+}
+
+/// 光标下"有意义"的窗口。
+///
+/// `WindowFromPoint` 本身就会返回子窗口（画布常常是子窗口），
+/// 但它也可能返回分隔条/滚动条这类极小的控件 —— 那对用户没意义。
+/// 所以遇到太小的窗口就往上退一层，最多退几层。
+pub fn cursor_window_deep() -> HWND {
+    unsafe {
+        let mut pt = POINT { x: 0, y: 0 };
+        if GetCursorPos(&mut pt) == 0 {
+            return null_mut();
+        }
+        let mut h = WindowFromPoint(pt);
+        let me = std::process::id();
+        for _ in 0..4 {
+            if h.is_null() {
+                break;
+            }
+            let mut rc: RECT = std::mem::zeroed();
+            GetWindowRect(h, &mut rc);
+            let (w, ht) = (rc.right - rc.left, rc.bottom - rc.top);
+            let mut pid: u32 = 0;
+            GetWindowThreadProcessId(h, &mut pid);
+            if pid == me || w < 24 || ht < 24 {
+                let parent = GetParent(h);
+                if parent.is_null() {
+                    break;
+                }
+                h = parent;
+                continue;
+            }
+            break;
+        }
+        h
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -354,6 +423,107 @@ mod tests {
     fn 空名字有兜底() {
         assert_eq!(sanitize_name("   "), "未命名");
         assert_eq!(sanitize_name("..."), "未命名");
+    }
+
+    /// 需求「跟随窗口缩放」的几何验证：裁剪矩形必须随子窗口移动/缩放而变。
+    /// 用自己创建的父子窗口验证，**不去动用户的绘画软件窗口**。
+    #[test]
+    fn 子窗口裁剪矩形随子窗口移动与缩放() {
+        unsafe {
+            use windows_sys::Win32::UI::WindowsAndMessaging::{
+                CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, SetWindowPos,
+                SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WNDCLASSW, WS_CHILD,
+                WS_POPUP, WS_VISIBLE,
+            };
+            let hinst = module_handle();
+            let mk_class = |name: &str| -> Vec<u16> {
+                let n = wide(name);
+                let wc = WNDCLASSW {
+                    style: 0,
+                    lpfnWndProc: Some(DefWindowProcW),
+                    cbClsExtra: 0,
+                    cbWndExtra: 0,
+                    hInstance: hinst,
+                    hIcon: null_mut(),
+                    hCursor: null_mut(),
+                    hbrBackground: null_mut(),
+                    lpszMenuName: null(),
+                    lpszClassName: n.as_ptr(),
+                };
+                RegisterClassW(&wc);
+                n
+            };
+            let pc = mk_class("CanLapseTestParent");
+            let parent = CreateWindowExW(
+                0,
+                pc.as_ptr(),
+                wide("parent").as_ptr(),
+                WS_POPUP | WS_VISIBLE,
+                100,
+                100,
+                800,
+                600,
+                null_mut(),
+                null_mut(),
+                hinst,
+                null(),
+            );
+            assert!(!parent.is_null(), "创建父窗口失败");
+            let cc = mk_class("CanLapseTestChild");
+            let child = CreateWindowExW(
+                0,
+                cc.as_ptr(),
+                wide("child").as_ptr(),
+                WS_CHILD | WS_VISIBLE,
+                50,
+                60,
+                200,
+                150,
+                parent,
+                null_mut(),
+                hinst,
+                null(),
+            );
+            assert!(!child.is_null(), "创建子窗口失败");
+
+            let r = crop_rect_in_root(child, parent).expect("应能算出裁剪矩形");
+            assert_eq!((r.0, r.1, r.2, r.3), (50, 60, 200, 150), "初始裁剪矩形");
+
+            // 缩放子窗口 -> 裁剪尺寸跟随
+            SetWindowPos(
+                child,
+                null_mut(),
+                0,
+                0,
+                120,
+                90,
+                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+            let r2 = crop_rect_in_root(child, parent).unwrap();
+            assert_eq!((r2.2, r2.3), (120, 90), "裁剪尺寸应跟随子窗口缩放");
+            assert_eq!((r2.0, r2.1), (50, 60), "缩放不应改变偏移");
+
+            // 移动子窗口 -> 裁剪偏移跟随
+            SetWindowPos(
+                child,
+                null_mut(),
+                30,
+                40,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+            let r3 = crop_rect_in_root(child, parent).unwrap();
+            assert_eq!((r3.0, r3.1), (30, 40), "裁剪偏移应跟随子窗口移动");
+
+            // 顶层窗口自己：矩形应等于整个客户区
+            let r4 = crop_rect_in_root(parent, parent).unwrap();
+            assert_eq!((r4.0, r4.1), (0, 0));
+            assert_eq!((r4.2, r4.3), (800, 600));
+
+            DestroyWindow(child);
+            DestroyWindow(parent);
+        }
     }
 
     #[test]

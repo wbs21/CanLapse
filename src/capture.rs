@@ -170,93 +170,117 @@ impl Drop for Dib {
     }
 }
 
-/// 一个画布窗口的持续抓帧器。
+/// 一个窗口（或它的某个**子窗口**区域）的持续抓帧器。
+///
+/// ⚠️ 关键事实（在真实 SAI2 上实测得出）：**`DwmRegisterThumbnail` 不接受子窗口** ——
+/// 对子窗口调用返回 `E_INVALIDARG (0x80070057)`，因为 DWM 只合成顶层窗口，
+/// 子窗口是画进父窗口表面里的（直接对子窗口 `PrintWindow` 同样失败）。
+///
+/// 所以抓"画布子窗口"的正确做法是三步：
+///   1. 对**顶层窗口**注册缩略图；
+///   2. 把 `rcSource` 设成画布子窗口在**顶层客户区坐标系**里的矩形 ——
+///      DWM 会把这一块 1:1 送到宿主窗口，不需要我们自己拷整窗再裁剪
+///      （SAI2 实测：每帧拷贝量从 1920×986 降到 651×761，约 1/5）；
+///   3. 每帧重新查询子窗口矩形 —— 用户拖动画布/改变布局时裁剪框**自动跟随**。
 pub struct ThumbnailCapture {
-    source: HWND,
+    /// 缩略图源：**顶层窗口**（DWM 只认它）
+    root: HWND,
+    /// 用户拾取的目标：可能是 root 自己，也可能是它的子窗口
+    target: HWND,
     host: HWND,
     thumb: isize,
     dib: Dib,
-    width: i32,
-    height: i32,
+    /// 裁剪矩形 `(x, y, w, h)`，相对 root 的客户区原点
+    crop: (i32, i32, i32, i32),
 }
 
 impl ThumbnailCapture {
     /// 建宿主窗口并注册缩略图。
     ///
-    /// 宿主放在虚拟桌面之外（屏幕外），用户完全看不到它 —— 这是实测可行的（FINDINGS 实验 1 的 M6）。
-    pub fn new(source: HWND) -> Result<Self, String> {
-        if !win::is_window_alive(source) {
+    /// `target` 可以是顶层窗口，也可以是它的子窗口（SAI2 的画布就是子窗口）；
+    /// 子窗口会自动解析成「顶层窗口 + 裁剪矩形」。
+    ///
+    /// 宿主放在虚拟桌面之外（屏幕外），用户完全看不到它 —— 实测可行（FINDINGS 实验 1 的 M6）。
+    pub fn new(target: HWND) -> Result<Self, String> {
+        if !win::is_window_alive(target) {
             return Err("目标窗口无效（可能已关闭）".into());
         }
         if !composition_enabled() {
             return Err("桌面合成（DWM）未开启，无法使用缩略图抓帧".into());
         }
-        let (w, h) = win::client_size(source);
-        if w <= 0 || h <= 0 {
-            // 最小化的窗口客户区可能退化为 0，但实测缩略图仍可取到画面；
-            // 这里退回到一个安全尺寸，避免建不出 DIB。
-            return Err(format!("目标窗口客户区尺寸异常（{w}x{h}）"));
+        let root = win::root_of(target);
+        let crop = win::crop_rect_in_root(target, root)
+            .ok_or_else(|| "无法计算目标窗口在顶层窗口中的位置".to_string())?;
+        if crop.2 <= 0 || crop.3 <= 0 {
+            return Err(format!("目标窗口区域尺寸异常（{}x{}）", crop.2, crop.3));
         }
-
         unsafe {
-            ensure_host_class();
-            let cls = win::wide(HOST_CLASS);
-            let title = win::wide("CanLapse 抓帧宿主");
-            // 放到虚拟桌面左外侧，确保用户看不到
-            let off_x = GetSystemMetrics(SM_XVIRTUALSCREEN) - 4000;
-            let _ = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-            let host = CreateWindowExW(
-                0,
-                cls.as_ptr(),
-                title.as_ptr(),
-                WS_POPUP, // 注意：不加 WS_VISIBLE，建完再 ShowWindow(SW_SHOWNOACTIVATE)
-                off_x,
-                0,
-                w,
-                h,
-                null_mut(),
-                null_mut(),
-                win::module_handle(),
-                null(),
-            );
-            if host.is_null() {
-                return Err("创建抓帧宿主窗口失败".into());
-            }
-            ShowWindow(host, SW_SHOWNOACTIVATE);
-
-            let mut thumb: isize = 0;
-            let hr = DwmRegisterThumbnail(host, source, &mut thumb);
-            if hr != 0 {
-                DestroyWindow(host);
-                return Err(format!(
-                    "DwmRegisterThumbnail 失败 hr=0x{hr:08X}（目标窗口可能已失效，或系统禁止缩略图）"
-                ));
-            }
-
+            let (host, thumb) = Self::create_host_and_register(root, crop)?;
             let mut me = ThumbnailCapture {
-                source,
+                root,
+                target,
                 host,
                 thumb,
-                dib: Dib::new(w, h)?,
-                width: w,
-                height: h,
+                dib: Dib::new(crop.2, crop.3)?,
+                crop,
             };
             me.apply_properties()?;
             Ok(me)
         }
     }
 
-    unsafe fn apply_properties(&mut self) -> Result<(), String> {
+    unsafe fn create_host_and_register(
+        root: HWND,
+        crop: (i32, i32, i32, i32),
+    ) -> Result<(HWND, isize), String> {
+        ensure_host_class();
+        let cls = win::wide(HOST_CLASS);
+        let title = win::wide("CanLapse 抓帧宿主");
+        // 放到虚拟桌面左外侧，确保用户看不到
+        let off_x = GetSystemMetrics(SM_XVIRTUALSCREEN) - 4000;
+        let host = CreateWindowExW(
+            0,
+            cls.as_ptr(),
+            title.as_ptr(),
+            WS_POPUP, // 不加 WS_VISIBLE，建完再 ShowWindow(SW_SHOWNOACTIVATE)
+            off_x,
+            0,
+            crop.2,
+            crop.3,
+            null_mut(),
+            null_mut(),
+            win::module_handle(),
+            null(),
+        );
+        if host.is_null() {
+            return Err("创建抓帧宿主窗口失败".into());
+        }
+        ShowWindow(host, SW_SHOWNOACTIVATE);
+
+        let mut thumb: isize = 0;
+        // ★ 源**必须**是顶层窗口：传子窗口会得到 E_INVALIDARG（SAI2 上实测）
+        let hr = DwmRegisterThumbnail(host, root, &mut thumb);
+        if hr != 0 {
+            DestroyWindow(host);
+            return Err(format!(
+                "DwmRegisterThumbnail 失败 hr=0x{hr:08X}（顶层窗口可能已失效）"
+            ));
+        }
+        Ok((host, thumb))
+    }
+
+    unsafe fn apply_properties(&self) -> Result<(), String> {
+        let (cx, cy, cw, ch) = self.crop;
         let props = DWM_THUMBNAIL_PROPERTIES {
             dwFlags: DWM_TNP_RECTDESTINATION
                 | DWM_TNP_RECTSOURCE
                 | DWM_TNP_OPACITY
                 | DWM_TNP_VISIBLE
                 | DWM_TNP_SOURCECLIENTAREAONLY,
-            // 目标矩形 = 宿主客户区；源矩形 = 源窗口客户区。
-            // 两者尺寸相同 => 1:1 不缩放，画布像素不会被重采样。
-            rcDestination: RECT { left: 0, top: 0, right: self.width, bottom: self.height },
-            rcSource: RECT { left: 0, top: 0, right: self.width, bottom: self.height },
+            // 目标矩形 = 宿主客户区；源矩形 = 目标窗口在**源客户区坐标系**里的位置。
+            // 两者尺寸相同 => 1:1 不缩放；"裁剪出子窗口那一块"完全由 rcSource 完成。
+            rcDestination: RECT { left: 0, top: 0, right: cw, bottom: ch },
+            rcSource: RECT { left: cx, top: cy, right: cx + cw, bottom: cy + ch },
             opacity: 255,
             fVisible: 1,
             fSourceClientAreaOnly: 1,
@@ -268,66 +292,67 @@ impl ThumbnailCapture {
         Ok(())
     }
 
-    pub fn source(&self) -> HWND {
-        self.source
+    pub fn target(&self) -> HWND {
+        self.target
     }
 
+    pub fn root(&self) -> HWND {
+        self.root
+    }
+
+    /// 兼容旧调用名
+    pub fn source(&self) -> HWND {
+        self.target
+    }
+
+    /// 输出尺寸 = 裁剪矩形尺寸
     pub fn size(&self) -> (i32, i32) {
-        (self.width, self.height)
+        (self.crop.2, self.crop.3)
     }
 
     pub fn source_alive(&self) -> bool {
-        win::is_window_alive(self.source)
+        win::is_window_alive(self.root) && win::is_window_alive(self.target)
     }
 
-    /// 目标窗口大小变了就重建 DIB 并重设缩略图矩形。
-    /// 返回 `true` 表示尺寸发生了变化（调用方应把"上一帧"作废，避免拿不同尺寸比差分）。
+    /// 重新查询目标矩形并让缩略图跟上（子窗口被移动/缩放时这一步是必要的）。
+    ///
+    /// 返回 `true` 表示**尺寸**变了 —— 调用方应把"上一帧"作废，
+    /// 避免拿不同尺寸的两帧去比差分。
+    pub fn sync(&mut self) -> Result<bool, String> {
+        if !self.source_alive() {
+            return Err("目标窗口已关闭".into());
+        }
+        let crop = win::crop_rect_in_root(self.target, self.root)
+            .ok_or_else(|| "无法计算目标窗口位置".to_string())?;
+        if crop.2 <= 0 || crop.3 <= 0 {
+            return Err(format!("目标窗口区域尺寸异常（{}x{}）", crop.2, crop.3));
+        }
+        let size_changed = crop.2 != self.crop.2 || crop.3 != self.crop.3;
+        if size_changed {
+            unsafe {
+                win::pump();
+                if self.thumb != 0 {
+                    DwmUnregisterThumbnail(self.thumb);
+                    self.thumb = 0;
+                }
+                if !self.host.is_null() {
+                    DestroyWindow(self.host);
+                    self.host = null_mut();
+                }
+                let (host, thumb) = Self::create_host_and_register(self.root, crop)?;
+                self.host = host;
+                self.thumb = thumb;
+                self.dib = Dib::new(crop.2, crop.3)?;
+            }
+        }
+        self.crop = crop;
+        unsafe { self.apply_properties()? };
+        Ok(size_changed)
+    }
+
+    /// 兼容旧调用名
     pub fn sync_source_size(&mut self) -> Result<bool, String> {
-        let (w, h) = win::client_size(self.source);
-        if w <= 0 || h <= 0 {
-            return Err(format!("目标窗口客户区尺寸异常（{w}x{h}）"));
-        }
-        if w == self.width && h == self.height {
-            return Ok(false);
-        }
-        unsafe {
-            win::pump();
-            DestroyWindow(self.host);
-            let cls = win::wide(HOST_CLASS);
-            let title = win::wide("CanLapse 抓帧宿主");
-            let off_x = GetSystemMetrics(SM_XVIRTUALSCREEN) - 4000;
-            let host = CreateWindowExW(
-                0,
-                cls.as_ptr(),
-                title.as_ptr(),
-                WS_POPUP,
-                off_x,
-                0,
-                w,
-                h,
-                null_mut(),
-                null_mut(),
-                win::module_handle(),
-                null(),
-            );
-            if host.is_null() {
-                return Err("重建抓帧宿主窗口失败".into());
-            }
-            ShowWindow(host, SW_SHOWNOACTIVATE);
-            let mut thumb: isize = 0;
-            let hr = DwmRegisterThumbnail(host, self.source, &mut thumb);
-            if hr != 0 {
-                DestroyWindow(host);
-                return Err(format!("重新注册缩略图失败 hr=0x{hr:08X}"));
-            }
-            self.host = host;
-            self.thumb = thumb;
-            self.width = w;
-            self.height = h;
-            self.dib = Dib::new(w, h)?;
-            self.apply_properties()?;
-        }
-        Ok(true)
+        self.sync()
     }
 
     /// 抓一帧。返回的像素是**源窗口客户区**的内容（1:1）。
@@ -344,7 +369,11 @@ impl ThumbnailCapture {
         if ok == 0 {
             return Err("PrintWindow(宿主, PW_RENDERFULLCONTENT) 返回失败".into());
         }
-        Ok(Frame::new(self.width, self.height, self.dib.pixels().to_vec()))
+        Ok(Frame::new(
+            self.crop.2,
+            self.crop.3,
+            self.dib.pixels().to_vec(),
+        ))
     }
 
     /// 直接对源窗口抓一帧（`PrintWindow(源, PW_RENDERFULLCONTENT)`）。
@@ -353,12 +382,12 @@ impl ThumbnailCapture {
     /// 因此它不是主路径，不要拿它替换 `grab()`。
     #[allow(dead_code)]
     pub fn grab_direct_from_source(&self) -> Result<Frame, String> {
-        let (w, h) = win::client_size(self.source);
+        let (w, h) = win::client_size(self.target);
         if w <= 0 || h <= 0 {
             return Err(format!("源窗口客户区尺寸异常（{w}x{h}）"));
         }
         let dib = Dib::new(w, h)?;
-        let ok = unsafe { PrintWindow(self.source, dib.dc, PW_RENDERFULLCONTENT_FLAG) };
+        let ok = unsafe { PrintWindow(self.target, dib.dc, PW_RENDERFULLCONTENT_FLAG) };
         if ok == 0 {
             return Err("PrintWindow(源窗口) 返回失败".into());
         }

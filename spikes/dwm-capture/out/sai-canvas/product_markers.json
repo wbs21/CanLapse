@@ -1,0 +1,19 @@
+{
+  "session": {
+    "version": 1,
+    "name": "sai",
+    "created": "2026-10-17T08:29:03.624",
+    "source_title": "新建画布1 (33.3%)",
+    "source_class": "sflChildWindow",
+    "source_process": "sai2.exe",
+    "width": 625,
+    "height": 715,
+    "record_fps": 2.0,
+    "threshold": 0.005,
+    "frames": 1,
+    "dropped": 0,
+    "duration_ms": 8500,
+    "completed": true
+  },
+  "markers": []
+}
