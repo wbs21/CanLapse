@@ -189,8 +189,8 @@ fn cmd_record(a: RecordArgs) -> i32 {
         eprintln!("桌面合成（DWM）未开启，无法使用缩略图抓帧。");
         return 2;
     }
-    if !(1.0..=8.0).contains(&a.fps) {
-        eprintln!("帧密度必须在 1~8 之间（收到 {}）", a.fps);
+    if !(0.1..=8.0).contains(&a.fps) {
+        eprintln!("帧密度必须在 0.1~8 之间（收到 {}）", a.fps);
         return 2;
     }
     if !(0.0..=0.05).contains(&a.threshold) {

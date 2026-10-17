@@ -25,8 +25,7 @@ use windows_sys::Win32::Graphics::Gdi::{
 };
 use windows_sys::Win32::UI::Controls::{
     InitCommonControlsEx, INITCOMMONCONTROLSEX, ICC_BAR_CLASSES, ICC_PROGRESS_CLASS,
-    ICC_STANDARD_CLASSES, PBM_SETPOS, PBM_SETRANGE32, TBM_SETPOS, TBM_SETRANGE, TBS_HORZ,
-    TBS_NOTICKS,
+    ICC_STANDARD_CLASSES, PBM_SETPOS, PBM_SETRANGE32,
 };
 use windows_sys::Win32::UI::Controls::Dialogs::{GetSaveFileNameW, OPENFILENAMEW};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -38,12 +37,6 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WM_HSCROLL, WM_PAINT, WM_SIZE, WM_TIMER, WNDCLASSW, WS_CAPTION, WS_CHILD, WS_MINIMIZEBOX,
     WS_OVERLAPPED, WS_SYSMENU, WS_THICKFRAME, WS_VISIBLE,
 };
-
-/// windows-sys 没有导出 TBM_GETPOS（只导出了 SET），用官方消息值兜底
-// ⚠️ TBM_GETPOS = WM_USER = 0x0400。
-// 这里曾经写成 0x0408 —— 那是 **TBM_SETRANGEMAX**，导致每次滑动都把最大值改成 0：
-// 表现为滑块位置"跳回"、且只能往左不能往右（往右被 max=0 挡住）。
-const TBM_GETPOS_C: u32 = 0x0400;
 
 use crate::capture::ThumbnailCapture;
 use crate::encode::{self, EncodeOptions, EncodeOutcome, Progress, Quality};
@@ -63,16 +56,13 @@ const ID_HELP: usize = 102;
 const ID_STATUS: usize = 103;
 const ID_HDR_REC: usize = 110;
 const ID_LBL_FPS: usize = 111;
-const ID_SLD_FPS: usize = 112;
+const ID_CMB_RECFPS: usize = 112;
 const ID_LBL_THR: usize = 113;
-const ID_SLD_THR: usize = 114;
+const ID_CMB_SENS: usize = 114;
+const ID_HINT_SENS: usize = 115;
 const ID_HDR_EXP: usize = 120;
 const ID_TIP: usize = 121;
 const ID_CHK_CLEAN: usize = 122;
-const ID_LBL_EFPS: usize = 123;
-const ID_CMB_FPS: usize = 124;
-const ID_LBL_QUAL: usize = 125;
-const ID_CMB_QUAL: usize = 126;
 const ID_LBL_OUT: usize = 127;
 const ID_EDIT_OUT: usize = 128;
 const ID_BTN_OUT: usize = 129;
@@ -97,6 +87,48 @@ const DEFAULT_W: i32 = 460;
 const DEFAULT_H: i32 = 380;
 const MIN_W: i32 = 400;
 const MIN_H: i32 = 320;
+
+/// 帧密度四档：(界面文字, 每秒采样帧数)
+const REC_FPS_OPTIONS: [(&str, f64); 4] = [
+    ("1 帧 / 5 秒", 0.2),
+    ("1 帧 / 2 秒", 0.5),
+    ("1 帧 / 秒", 1.0),
+    ("2 帧 / 秒", 2.0),
+];
+/// 帧密度默认第 1 档（1 帧 / 5 秒）
+const REC_FPS_DEFAULT: usize = 0;
+
+/// 画面检测灵敏度 8 档：档位 1~8 → 变化像素比例阈值（数字越大越灵敏）
+const SENS_LEVELS: [f32; 8] = [0.08, 0.04, 0.02, 0.01, 0.008, 0.004, 0.002, 0.001];
+/// 默认第 4 档（0.01）
+const SENS_DEFAULT: usize = 3;
+
+/// 播放帧率与画质固定，不提供选择
+const EXPORT_FPS: f64 = 30.0;
+const EXPORT_QUALITY: Quality = Quality::Medium;
+
+/// 由 fps 反查档位文字（日志/标签用）
+fn rec_fps_label(fps: f64) -> &'static str {
+    REC_FPS_OPTIONS
+        .iter()
+        .find(|(_, v)| (v - fps).abs() < 1e-9)
+        .map(|(s, _)| *s)
+        .unwrap_or("自定义")
+}
+
+/// 由阈值反查灵敏度档位（1~8；非标准值取最近的档）
+fn sens_level_of(threshold: f32) -> usize {
+    let mut best = 0usize;
+    let mut best_d = f32::MAX;
+    for (i, v) in SENS_LEVELS.iter().enumerate() {
+        let d = (*v - threshold).abs();
+        if d < best_d {
+            best_d = d;
+            best = i;
+        }
+    }
+    best + 1
+}
 
 fn cls(s: &str) -> Vec<u16> {
     win::wide(s)
@@ -133,16 +165,13 @@ struct Ctl {
     status: HWND,
     hdr_rec: HWND,
     lbl_fps: HWND,
-    sld_fps: HWND,
+    cmb_recfps: HWND,
     lbl_thr: HWND,
-    sld_thr: HWND,
+    cmb_sens: HWND,
+    hint_sens: HWND,
     hdr_exp: HWND,
     tip: HWND,
     chk_clean: HWND,
-    lbl_efps: HWND,
-    cmb_fps: HWND,
-    lbl_qual: HWND,
-    cmb_qual: HWND,
     lbl_out: HWND,
     edit_out: HWND,
     btn_out: HWND,
@@ -166,8 +195,6 @@ struct App {
     hist_open: bool,
     fps: f64,
     threshold: f32,
-    export_fps: f64,
-    quality: Quality,
     auto_clean: bool,
     out_path: PathBuf,
     target: Option<win::WindowInfo>,
@@ -265,26 +292,22 @@ fn compute_layout(app: &App, cw: i32) -> (Vec<(HWND, RECT, bool)>, RECT, i32) {
 
     // 录制参数（不折叠，直接显示）。折叠标题栏控件保留但隐藏、不占高度。
     push(c.hdr_rec, rect(m, y, inner, 22), false);
-    push(c.lbl_fps, rect(m + 8, y, inner - 16, 16), true);
-    y += 18;
-    push(c.sld_fps, rect(m + 8, y, inner - 16, 24), true);
+    push(c.lbl_fps, rect(m + 8, y, 120, 22), true);
+    push(c.cmb_recfps, rect(m + 132, y, 140, 22), true);
+    y += 28;
+    push(c.lbl_thr, rect(m + 8, y, 120, 22), true);
+    push(c.cmb_sens, rect(m + 132, y, 80, 22), true);
     y += 26;
-    push(c.lbl_thr, rect(m + 8, y, inner - 16, 16), true);
-    y += 18;
-    push(c.sld_thr, rect(m + 8, y, inner - 16, 24), true);
-    y += 30;
+    push(c.hint_sens, rect(m + 8, y, inner - 16, 16), true);
+    y += 22;
 
-    // 导出视频参数（不折叠，直接显示）
+    // 导出视频参数（不折叠，直接显示）。播放帧率（固定 30fps）与画质（固定中）
+    // 不再提供选择，按用户要求从界面移除。
     push(c.hdr_exp, rect(m, y, inner, 22), false);
     push(c.tip, rect(m + 8, y, inner - 16, 32), true);
     y += 34;
     push(c.chk_clean, rect(m + 8, y, inner - 16, 20), true);
     y += 24;
-    push(c.lbl_efps, rect(m + 8, y, 70, 20), true);
-    push(c.cmb_fps, rect(m + 80, y, 80, 22), true);
-    push(c.lbl_qual, rect(m + 170, y, 50, 20), true);
-    push(c.cmb_qual, rect(m + 220, y, inner - 220 + m - 8, 22), true);
-    y += 28;
     push(c.lbl_out, rect(m + 8, y, 40, 20), true);
     push(c.edit_out, rect(m + 48, y, inner - 48 - 60, 22), true);
     push(c.btn_out, rect(cw - m - 52, y, 52, 22), true);
@@ -404,12 +427,7 @@ unsafe extern "system" fn main_wndproc(
             }
             0
         }
-        WM_HSCROLL => {
-            if let Some(app) = app_mut(hwnd) {
-                app.sync_sliders();
-            }
-            0
-        }
+        WM_HSCROLL => 0, // 已无滑块（帧密度/灵敏度改下拉），留空避免消息落进 DefWindowProc
         WM_TIMER => {
             if let Some(app) = app_mut(hwnd) {
                 app.on_timer();
@@ -480,10 +498,8 @@ impl App {
             rec_open: true,
             exp_open: true, // 按要求：导出参数不再折叠，直接显示
             hist_open: false,
-            fps: 2.0,
-            threshold: 0.01,
-            export_fps: 24.0,
-            quality: Quality::Medium,
+            fps: REC_FPS_OPTIONS[REC_FPS_DEFAULT].1,
+            threshold: SENS_LEVELS[SENS_DEFAULT],
             auto_clean: true,
             out_path: root.join("timelapse.mp4"),
             target: None,
@@ -520,40 +536,33 @@ impl App {
         c.status = mk(h, "Static", "", ws, ID_STATUS, f);
 
         c.hdr_rec = mk(h, "Button", "▼ 录制参数", ws, ID_HDR_REC, f);
-        c.lbl_fps = mk(h, "Static", "", ws, ID_LBL_FPS, f);
-        c.sld_fps = mk(h, "msctls_trackbar32", "", ws | TBS_HORZ | TBS_NOTICKS, ID_SLD_FPS, f);
-        c.lbl_thr = mk(h, "Static", "", ws, ID_LBL_THR, f);
-        c.sld_thr = mk(h, "msctls_trackbar32", "", ws | TBS_HORZ | TBS_NOTICKS, ID_SLD_THR, f);
-        SendMessageW(c.sld_fps, TBM_SETRANGE, 1, pack(1, 8));
-        SendMessageW(c.sld_fps, TBM_SETPOS, 1, 2);
-        SendMessageW(c.sld_thr, TBM_SETRANGE, 1, pack(0, 50));
-        SendMessageW(c.sld_thr, TBM_SETPOS, 1, 10);
+        c.lbl_fps = mk(h, "Static", "帧密度", ws, ID_LBL_FPS, f);
+        c.cmb_recfps = mk(h, "ComboBox", "", ws | 0x0003 | 0x0020_0000, ID_CMB_RECFPS, f);
+        for (label, _) in REC_FPS_OPTIONS {
+            let s = win::wide(label);
+            SendMessageW(c.cmb_recfps, 0x0143, 0, s.as_ptr() as isize); // CB_ADDSTRING
+        }
+        SendMessageW(c.cmb_recfps, 0x014E, REC_FPS_DEFAULT, 0); // CB_SETCURSEL
+        c.lbl_thr = mk(h, "Static", "画面检测灵敏度", ws, ID_LBL_THR, f);
+        c.cmb_sens = mk(h, "ComboBox", "", ws | 0x0003 | 0x0020_0000, ID_CMB_SENS, f);
+        for level in 1..=SENS_LEVELS.len() {
+            let s = win::wide(&format!("{level}"));
+            SendMessageW(c.cmb_sens, 0x0143, 0, s.as_ptr() as isize);
+        }
+        SendMessageW(c.cmb_sens, 0x014E, SENS_DEFAULT, 0); // CB_SETCURSEL = 3（第 4 档 = 0.01）
+        c.hint_sens = mk(h, "Static", "画布越大，需要越精细", ws, ID_HINT_SENS, f);
 
         c.hdr_exp = mk(h, "Button", "▶ 导出视频参数", ws, ID_HDR_EXP, f);
         c.tip = mk(
             h,
             "Static",
-            "💡提示：如果取消勾选「合成成功自动清理缓存」，PNG帧图片会保留在缓存目录，占用磁盘空间，请记得定期手动删除缓存。",
+            "💡提示：如果取消勾选「合成成功自动清理缓存」，帧图片会保留在缓存目录，占用磁盘空间，请记得定期手动删除缓存。",
             ws,
             ID_TIP,
             f,
         );
         c.chk_clean = mk(h, "Button", "合成成功自动清理缓存", ws | 0x0000_0003, ID_CHK_CLEAN, f);
         SendMessageW(c.chk_clean, 0x00F1, 1, 0); // BM_SETCHECK = BST_CHECKED
-        c.lbl_efps = mk(h, "Static", "播放帧率", ws, ID_LBL_EFPS, f);
-        c.cmb_fps = mk(h, "ComboBox", "", ws | 0x0003 | 0x0020_0000, ID_CMB_FPS, f); // CBS_DROPDOWNLIST|WS_VSCROLL
-        for rate in ["5 fps", "10 fps", "15 fps", "20 fps", "24 fps"] {
-            let s = win::wide(rate);
-            SendMessageW(c.cmb_fps, 0x0143, 0, s.as_ptr() as isize); // CB_ADDSTRING
-        }
-        SendMessageW(c.cmb_fps, 0x014E, 4, 0); // CB_SETCURSEL = 4（24 fps 默认）
-        c.lbl_qual = mk(h, "Static", "画质", ws, ID_LBL_QUAL, f);
-        c.cmb_qual = mk(h, "ComboBox", "", ws | 0x0003 | 0x0020_0000, ID_CMB_QUAL, f);
-        for q in ["高", "中", "低"] {
-            let s = win::wide(q);
-            SendMessageW(c.cmb_qual, 0x0143, 0, s.as_ptr() as isize);
-        }
-        SendMessageW(c.cmb_qual, 0x014E, 1, 0); // CB_SETCURSEL = 1（默认"中"）
         c.lbl_out = mk(h, "Static", "输出", ws, ID_LBL_OUT, f);
         c.edit_out = mk(h, "Edit", "", ws | 0x0080, ID_EDIT_OUT, f); // ES_AUTOHSCROLL
         c.btn_out = mk(h, "Button", "选择", ws, ID_BTN_OUT, f);
@@ -564,7 +573,7 @@ impl App {
         c.btn_open = mk(h, "Button", "打开文件夹", ws, ID_OPEN_DIR, f);
         c.btn_delete = mk(h, "Button", "删除", ws, ID_DELETE, f);
 
-        c.state = mk(h, "Static", "待机", ws, ID_STATE, f);
+        c.state = mk(h, "Static", "", ws, ID_STATE, f);
         // 【开始录制】用 Static 而非常规按钮：带视觉主题的按钮会忽略 WM_CTLCOLORBTN，
         // 而静态控件认 WM_CTLCOLORSTATIC，才能可靠地画成绿底白字。
         // SS_CENTER(0x1) | SS_NOTIFY(0x100) | SS_CENTERIMAGE(0x200)
@@ -596,13 +605,10 @@ impl App {
         let show = |h: HWND, v: bool| {
             ShowWindow(h, if v { SW_SHOW } else { 0 });
         };
-        for h in [c.lbl_fps, c.sld_fps, c.lbl_thr, c.sld_thr] {
+        for h in [c.lbl_fps, c.cmb_recfps, c.lbl_thr, c.cmb_sens, c.hint_sens] {
             show(h, self.rec_open);
         }
-        for h in [
-            c.tip, c.chk_clean, c.lbl_efps, c.cmb_fps, c.lbl_qual, c.cmb_qual, c.lbl_out,
-            c.edit_out, c.btn_out,
-        ] {
+        for h in [c.tip, c.chk_clean, c.lbl_out, c.edit_out, c.btn_out] {
             show(h, self.exp_open);
         }
         for h in [c.list, c.btn_reexport, c.btn_open, c.btn_delete] {
@@ -611,25 +617,26 @@ impl App {
     }
 
     unsafe fn refresh_labels(&self) {
-        let c = &self.ctl;
-        let t = win::wide(&format!("帧密度：{} fps", self.fps));
-        SetWindowTextW(c.lbl_fps, t.as_ptr());
-        let t = win::wide(&format!("像素差异阈值：{:.3}", self.threshold));
-        SetWindowTextW(c.lbl_thr, t.as_ptr());
+        // 帧密度 / 灵敏度现在是下拉框：值就显示在框里，标签只写名字，不再重复显示数值
         let t = win::wide(&self.status_text());
-        SetWindowTextW(c.status, t.as_ptr());
+        SetWindowTextW(self.ctl.status, t.as_ptr());
     }
 
-    unsafe fn sync_sliders(&mut self) {
+    /// 下拉框的选择变化时，把档位写回 `fps` / `threshold`
+    unsafe fn sync_from_combos(&mut self) {
         let c = &self.ctl;
-        // 保险：控件句柄异常时直接返回，不要让读位置引发崩溃
-        if c.sld_fps.is_null() || c.sld_thr.is_null() {
-            return;
+        if !c.cmb_recfps.is_null() {
+            let i = SendMessageW(c.cmb_recfps, 0x0147, 0, 0) as usize; // CB_GETCURSEL
+            if let Some((_, v)) = REC_FPS_OPTIONS.get(i) {
+                self.fps = *v;
+            }
         }
-        let f = SendMessageW(c.sld_fps, TBM_GETPOS_C, 0, 0) as i32;
-        let t = SendMessageW(c.sld_thr, TBM_GETPOS_C, 0, 0) as i32;
-        self.fps = (f.clamp(1, 8)) as f64;
-        self.threshold = (t.clamp(0, 50)) as f32 / 1000.0;
+        if !c.cmb_sens.is_null() {
+            let i = SendMessageW(c.cmb_sens, 0x0147, 0, 0) as usize;
+            if let Some(v) = SENS_LEVELS.get(i) {
+                self.threshold = *v;
+            }
+        }
         self.refresh_labels();
     }
 
@@ -743,21 +750,7 @@ impl App {
                     let v = SendMessageW(self.ctl.chk_clean, 0x00F0, 0, 0); // BM_GETCHECK
                     self.auto_clean = v == 1;
                 }
-                ID_CMB_FPS => {
-                    let i = SendMessageW(self.ctl.cmb_fps, 0x0147, 0, 0) as i32; // CB_GETCURSEL
-                    self.export_fps = [5.0, 10.0, 15.0, 20.0, 24.0]
-                        .get(i.max(0) as usize)
-                        .copied()
-                        .unwrap_or(10.0);
-                }
-                ID_CMB_QUAL => {
-                    let i = SendMessageW(self.ctl.cmb_qual, 0x0147, 0, 0) as i32;
-                    self.quality = match i {
-                        1 => Quality::Medium,
-                        2 => Quality::Low,
-                        _ => Quality::High,
-                    };
-                }
+                ID_CMB_RECFPS | ID_CMB_SENS => self.sync_from_combos(),
                 ID_BTN_OUT => self.choose_output(),
                 ID_RECORD => {
                     let running = self.shared.as_ref().map(|s| s.phase().is_running()).unwrap_or(false);
@@ -1017,10 +1010,12 @@ impl App {
         }
         self.preview_cap = None; // 录制期间由录制线程独占抓帧
         logline!(
-            "[record] 开始录制 target=0x{:X} | {} | fps={} threshold={}",
+            "[record] 开始录制 target=0x{:X} | {} | fps={}（{}） | 灵敏度={}档 | threshold={:.3}",
             target.hwnd as isize,
             target.label(),
             self.fps,
+            rec_fps_label(self.fps),
+            sens_level_of(self.threshold),
             self.threshold
         );
         let cfg = RecorderConfig {
@@ -1107,8 +1102,8 @@ impl App {
         };
         self.enc = Some(st);
         let opts = EncodeOptions {
-            fps: self.export_fps,
-            quality: self.quality,
+            fps: EXPORT_FPS,
+            quality: EXPORT_QUALITY,
             output: out,
         };
         logline!(
@@ -1169,7 +1164,7 @@ impl App {
         let stem = s.name.clone();
         let out = dir
             .parent()
-            .map(|p| p.join(format!("{stem}_{}fps.mp4", self.export_fps as i32)))
+            .map(|p| p.join(format!("{stem}_{}fps.mp4", EXPORT_FPS as i32)))
             .unwrap_or_else(|| dir.join("timelapse.mp4"));
         // 重新导出面向的是"已有缓存"，不应该清理它
         self.start_encoding(dir, out, false);
@@ -1362,8 +1357,7 @@ impl App {
         ShowWindow(self.ctl.btn_record, SW_SHOW);
         ShowWindow(self.ctl.progress, 0);
         ShowWindow(self.ctl.btn_cancel, 0);
-        let t = win::wide("待机");
-        SetWindowTextW(self.ctl.state, t.as_ptr());
+        SetWindowTextW(self.ctl.state, [0u16].as_ptr());
     }
 
     unsafe fn ui_set_recording(&self) {
@@ -1483,10 +1477,6 @@ impl App {
 // ---------------------------------------------------------------------------
 // 辅助
 // ---------------------------------------------------------------------------
-
-fn pack(lo: i32, hi: i32) -> isize {
-    ((hi as isize) << 16) | (lo as isize & 0xffff)
-}
 
 fn default_cache_root() -> PathBuf {
     if let Ok(p) = std::env::var("CANLAPSE_CACHE") {
