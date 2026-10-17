@@ -266,13 +266,14 @@ fn compute_layout(app: &App, cw: i32) -> (Vec<(HWND, RECT, bool)>, RECT, i32) {
     push(c.btn_open, rect(m, y, 80, 24), false);
     push(c.btn_delete, rect(m, y, 80, 24), false);
 
-    // 底部操作区：状态 + 合成进度 + 取消合成（开始录制已移到预览区右侧）
-    let bottom_h = 46;
+    // 合成进度 + 取消合成（开始录制已移到预览区右侧）
     let by = y.max(0) + 2;
-    push(c.state, rect(m, by, inner, 18), true);
-    push(c.progress, rect(m, by + 22, inner - 76, 20), true);
-    push(c.btn_cancel, rect(cw - m - 64, by + 20, 64, 26), true);
-    let need = by + bottom_h;
+    push(c.progress, rect(m, by, inner - 76, 20), true);
+    push(c.btn_cancel, rect(cw - m - 64, by, 64, 24), true);
+    // 状态栏：贴窗口最底部、整宽（最后一行）
+    let status_h = 20;
+    let need = by + 26 + status_h;
+    push(c.state, rect(0, need - status_h, cw, status_h), true);
 
     (out, prev, need)
 }
