@@ -832,6 +832,8 @@ impl App {
             fps: self.fps,
             threshold: self.threshold,
             fill_rgb: [0, 0, 0],
+            // GUI 流程启用"其他软件在前台就暂停"（用户点完录制会点进画布）
+            fg_pause: true,
         };
         let shared = Shared::new();
         let worker = recorder::spawn(cfg, shared.clone());

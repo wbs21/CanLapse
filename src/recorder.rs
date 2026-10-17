@@ -64,6 +64,12 @@ pub struct RecorderConfig {
     pub threshold: f32,
     /// 分辨率统一时的填充色（默认黑边）
     pub fill_rgb: [u8; 3],
+    /// 是否启用"其他软件在前台就暂停抓帧"。
+    ///
+    /// GUI 流程用 `true`（用户点完录制会点进画布，规则正是为此设计）。
+    /// 但**命令行/脚本**常常是"在终端里录一个后台窗口"，此时前台永远是终端，
+    /// 规则会让录制一直暂停、一帧都不出 —— 所以这类场景要能关掉。
+    pub fg_pause: bool,
 }
 
 pub struct Shared {
@@ -234,7 +240,7 @@ fn run(cfg: &RecorderConfig, shared: &Arc<Shared>) -> Result<(), String> {
             // 用户规则：别的软件在前台 => 说明绘画软件此刻挂起、没有新笔触，不必抓帧。
             // 我们自己的进程不算（悬浮条是 WS_EX_NOACTIVATE，本来也不会成为前台）。
             let fg = win::foreground_pid();
-            let other = fg != 0 && fg != target_pid && fg != std::process::id();
+            let other = cfg.fg_pause && fg != 0 && fg != target_pid && fg != std::process::id();
             shared.fg_paused.store(other, Ordering::SeqCst);
             other
         } {

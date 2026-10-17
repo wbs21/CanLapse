@@ -32,6 +32,8 @@ struct RecordArgs {
     threshold: f32,
     duration: Option<f64>,
     quiet: bool,
+    /// 关闭"其他软件在前台就暂停抓帧"（录后台窗口时必需）
+    no_fg_pause: bool,
 }
 
 impl Default for RecordArgs {
@@ -46,6 +48,7 @@ impl Default for RecordArgs {
             threshold: 0.01, // 需求：像素差异阈值 0.00~0.05
             duration: None,
             quiet: false,
+            no_fg_pause: false,
         }
     }
 }
@@ -87,6 +90,9 @@ fn help() {
   --threshold F        像素差异阈值 0.00~0.05（默认 0.01）
   --duration SEC       录制时长上限，0 或省略表示手动停止（Esc 或关闭画布窗口）
   --quiet              少打印
+  --no-fg-pause        关闭"其他软件在前台就暂停抓帧"。
+                       默认开启该规则（切到别的软件=没在画画，自动暂停）；
+                       但命令行录**后台窗口**时必须关掉，否则会一直暂停、一帧都不出。
 
 导出选项（canlapse encode）:
   --session DIR        会话缓存目录（必填）
@@ -226,6 +232,7 @@ fn cmd_record(a: RecordArgs) -> i32 {
         fps: a.fps,
         threshold: a.threshold,
         fill_rgb: [0, 0, 0],
+        fg_pause: !a.no_fg_pause,
     };
     let shared = recorder::Shared::new();
     let worker = recorder::spawn(cfg, shared.clone());
@@ -554,6 +561,7 @@ fn main() {
                         }
                     }
                     "--quiet" => a.quiet = true,
+                    "--no-fg-pause" => a.no_fg_pause = true,
                     _ => {}
                 }
                 i += 1;
