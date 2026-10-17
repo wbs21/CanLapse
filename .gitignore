@@ -60,3 +60,10 @@ add/
 
 # ---- SAI2 实测产物 ----
 .sai-test/
+
+# ---- GUI 端到端产物 ----
+.gui-e2e/
+.gui-*.png
+.gui-pid
+.gui-out.txt
+.gui-err.txt

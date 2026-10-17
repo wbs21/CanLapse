@@ -494,6 +494,7 @@ impl App {
         SetWindowTextW(self.ctl.edit_out, s.as_ptr());
         self.refresh_session_list();
         self.refresh_labels();
+        self.ui_set_idle();
     }
 
     unsafe fn set_panel_visible(&self) {
@@ -828,6 +829,7 @@ impl App {
         self.worker = Some(worker);
         self.bar = floatbar::create(shared).unwrap_or(std::ptr::null_mut());
         // 规格：开始录制后主窗口自动最小化，只留悬浮条
+        self.ui_set_recording();
         ShowWindow(self.hwnd, SW_MINIMIZE);
         SetTimer(self.hwnd, TIMER_UI, 200, None);
     }
@@ -845,6 +847,10 @@ impl App {
         // 规格：停止录制后主窗口自动恢复
         ShowWindow(self.hwnd, SW_RESTORE);
         SetForegroundWindow(self.hwnd);
+        // 恢复实时预览（录制期间抓帧归录制线程独占）
+        if let Some(t) = &self.target {
+            self.preview_cap = ThumbnailCapture::new(t.hwnd).ok();
+        }
 
         let failed = shared.as_ref().map(|s| s.error()).flatten();
         if let Some(e) = failed {
@@ -898,8 +904,9 @@ impl App {
             }
             finished.store(true, Ordering::SeqCst);
         });
-        let t = win::wide("合成中…");
+        let t = win::wide("正在准备合成…");
         SetWindowTextW(self.ctl.state, t.as_ptr());
+        self.ui_set_encoding();
         SetTimer(self.hwnd, TIMER_UI, 200, None);
     }
 
@@ -974,7 +981,8 @@ impl App {
                 let out = e.out.clone();
                 let session = e.session.clone();
                 self.enc = None;
-                self.ctl_show_idle();
+                SendMessageW(self.ctl.progress, PBM_SETPOS, 0, 0);
+                self.ui_set_idle();
                 match outcome {
                     Some(Ok(EncodeOutcome::Done(s))) => {
                         let msg = format!(
@@ -1026,12 +1034,28 @@ impl App {
         }
     }
 
-    unsafe fn ctl_show_idle(&self) {
-        SendMessageW(self.ctl.progress, PBM_SETPOS, 0, 0);
+    /// 底部操作区随状态切换（规格：Idle 显示【开始录制】；录制中只显示提示；
+    /// 合成中显示进度条与【取消合成】）。此前这三样一直可见，是明显的可用性问题。
+    unsafe fn ui_set_idle(&self) {
+        ShowWindow(self.ctl.btn_record, SW_SHOW);
+        ShowWindow(self.ctl.progress, 0);
+        ShowWindow(self.ctl.btn_cancel, 0);
         let t = win::wide("待机");
         SetWindowTextW(self.ctl.state, t.as_ptr());
-        let t = win::wide("开始录制");
-        SetWindowTextW(self.ctl.btn_record, t.as_ptr());
+    }
+
+    unsafe fn ui_set_recording(&self) {
+        ShowWindow(self.ctl.btn_record, 0);
+        ShowWindow(self.ctl.progress, 0);
+        ShowWindow(self.ctl.btn_cancel, 0);
+        let t = win::wide("录制中…主窗口已最小化，请使用悬浮操作条（暂停 / 标记 / 停止）");
+        SetWindowTextW(self.ctl.state, t.as_ptr());
+    }
+
+    unsafe fn ui_set_encoding(&self) {
+        ShowWindow(self.ctl.btn_record, 0);
+        ShowWindow(self.ctl.progress, SW_SHOW);
+        ShowWindow(self.ctl.btn_cancel, SW_SHOW);
     }
 
     unsafe fn on_paint(&mut self) {
