@@ -42,6 +42,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::capture::ThumbnailCapture;
+use crate::lang;
 use crate::encode::{self, EncodeOptions, EncodeOutcome, Progress, Quality};
 use crate::frame::Frame;
 use crate::logline;
@@ -88,12 +89,12 @@ const DEFAULT_H: i32 = 344;
 const MIN_W: i32 = 320;
 const MIN_H: i32 = 300;
 
-/// 帧密度四档：(界面文字, 每秒采样帧数)
-const REC_FPS_OPTIONS: [(&str, f64); 4] = [
-    ("1 帧 / 5 秒", 0.2),
-    ("1 帧 / 2 秒", 0.5),
-    ("1 帧 / 秒", 1.0),
-    ("2 帧 / 秒", 2.0),
+/// 帧密度四档：(文案键, 每秒采样帧数) —— 文案键而不是字符串，因为语言在运行时才确定
+const REC_FPS_KEYS: [(lang::K, f64); 4] = [
+    (lang::K::Fps1of5, 0.2),
+    (lang::K::Fps1of2, 0.5),
+    (lang::K::Fps1, 1.0),
+    (lang::K::Fps2, 2.0),
 ];
 /// 帧密度默认第 1 档（1 帧 / 5 秒）
 const REC_FPS_DEFAULT: usize = 0;
@@ -109,11 +110,11 @@ const EXPORT_QUALITY: Quality = Quality::Medium;
 
 /// 由 fps 反查档位文字（日志/标签用）
 fn rec_fps_label(fps: f64) -> &'static str {
-    REC_FPS_OPTIONS
+    REC_FPS_KEYS
         .iter()
         .find(|(_, v)| (v - fps).abs() < 1e-9)
-        .map(|(s, _)| *s)
-        .unwrap_or("自定义")
+        .map(|(k, _)| lang::s(*k))
+        .unwrap_or("custom")
 }
 
 /// 由阈值反查灵敏度档位（1~8；非标准值取最近的档）
@@ -232,13 +233,13 @@ impl App {
             })
             .unwrap_or_default();
         match self.pick_state {
-            PickState::Empty => "尚未选择画布窗口".to_string(),
+            PickState::Empty => lang::s(lang::K::StatusEmpty).to_string(),
             PickState::Ok => match self.pick_where {
-                Some(where_) => format!("✅ 已选中画布窗口（{picked}，点到{where_}）"),
-                None => format!("✅ 已选中画布窗口（{picked}）"),
+                Some(where_) => lang::f(lang::K::StatusOkWith, &[&picked, &where_]),
+                None => lang::f(lang::K::StatusOkPlain, &[&picked]),
             },
             PickState::HasPanel => {
-                "⚠️ 画布未浮动？点【如何定位窗口】".to_string()
+                lang::s(lang::K::StatusPanelWarn).to_string()
             }
         }
     }
@@ -398,7 +399,7 @@ unsafe extern "system" fn main_wndproc(
             0
         }
         // WM_CTLCOLORSTATIC = 0x0138：wparam 是 DC，lparam 是控件句柄。
-        // 所有标签/状态文字都走深色底 + 浅色字；"开始录制"已改为自绘按钮，不再特判。
+        // 所有标签/状态文字都走深色底 + 浅色字；lang::s(lang::K::StartRecording)已改为自绘按钮，不再特判。
         0x0138 => theme::paint_static(wparam as _),
         // WM_CTLCOLOREDIT = 0x0133：输出路径输入框深色底 + 浅色字
         0x0133 => theme::paint_edit(wparam as _),
@@ -480,7 +481,7 @@ impl App {
             rec_open: true,
             exp_open: true, // 按要求：导出参数不再折叠，直接显示
             hist_open: false,
-            fps: REC_FPS_OPTIONS[REC_FPS_DEFAULT].1,
+            fps: REC_FPS_KEYS[REC_FPS_DEFAULT].1,
             threshold: SENS_LEVELS[SENS_DEFAULT],
             auto_clean: true,
             // 默认导出到"程序所在目录\output"（不再放在缓存目录里）
@@ -511,36 +512,36 @@ impl App {
         let f = self.font;
         let ws = WS_CHILD | WS_VISIBLE;
         let mut c = Ctl::default();
-        c.title = mk(h, "Static", &format!("{} · 画布缩时录屏", app_title()), ws, 0, f);
-        c.btn_pick = mk(h, "Button", "🎯 拾取窗口", ws, ID_PICK, f);
-        c.btn_help = mk(h, "Button", "❓ 如何定位窗口", ws, ID_HELP, f);
+        c.title = mk(h, "Static", &format!("{} · {}", app_title(), lang::s(lang::K::Subtitle)), ws, 0, f);
+        c.btn_pick = mk(h, "Button", lang::s(lang::K::PickWindow), ws, ID_PICK, f);
+        c.btn_help = mk(h, "Button", lang::s(lang::K::HowToLocate), ws, ID_HELP, f);
         c.status = mk(h, "Static", "", ws, ID_STATUS, f);
 
-        c.hdr_rec = mk(h, "Button", "▼ 录制参数", ws, ID_HDR_REC, f);
-        c.lbl_fps = mk(h, "Static", "帧密度", ws, ID_LBL_FPS, f);
+        c.hdr_rec = mk(h, "Button", &format!("▼ {}", lang::s(lang::K::HdrRecording)), ws, ID_HDR_REC, f);
+        c.lbl_fps = mk(h, "Static", lang::s(lang::K::FrameDensity), ws, ID_LBL_FPS, f);
         // 下拉用自绘控件（系统 ComboBox 在深色下会保持白底）
         c.cmb_recfps = dropdown::create(h, ID_CMB_RECFPS, 0, 0, 120, 22);
-        let fps_labels: Vec<&str> = REC_FPS_OPTIONS.iter().map(|(s, _)| *s).collect();
+        let fps_labels: Vec<&str> = REC_FPS_KEYS.iter().map(|(k, _)| lang::s(*k)).collect();
         dropdown::set_items(c.cmb_recfps, &fps_labels);
         dropdown::set_sel(c.cmb_recfps, REC_FPS_DEFAULT);
-        c.lbl_thr = mk(h, "Static", "画面检测灵敏度", ws, ID_LBL_THR, f);
+        c.lbl_thr = mk(h, "Static", lang::s(lang::K::Sensitivity), ws, ID_LBL_THR, f);
         c.cmb_sens = dropdown::create(h, ID_CMB_SENS, 0, 0, 56, 22);
         let sens_labels: Vec<String> = (1..=SENS_LEVELS.len()).map(|i| i.to_string()).collect();
         let sens_refs: Vec<&str> = sens_labels.iter().map(|s| s.as_str()).collect();
         dropdown::set_items(c.cmb_sens, &sens_refs);
         dropdown::set_sel(c.cmb_sens, SENS_DEFAULT);
-        c.hint_sens = mk(h, "Static", "画布越大，要求越高。", ws, ID_HINT_SENS, f);
+        c.hint_sens = mk(h, "Static", lang::s(lang::K::SensHint), ws, ID_HINT_SENS, f);
 
-        c.hdr_exp = mk(h, "Button", "▶ 导出视频参数", ws, ID_HDR_EXP, f);
-        c.chk_clean = mk(h, "Button", "合成成功自动清理缓存", ws | 0x0000_0003, ID_CHK_CLEAN, f);
+        c.hdr_exp = mk(h, "Button", &format!("▶ {}", lang::s(lang::K::HdrExport)), ws, ID_HDR_EXP, f);
+        c.chk_clean = mk(h, "Button", lang::s(lang::K::AutoClean), ws | 0x0000_0003, ID_CHK_CLEAN, f);
         SendMessageW(c.chk_clean, 0x00F1, 1, 0); // BM_SETCHECK = BST_CHECKED
 
-        c.hdr_hist = mk(h, "Button", "▶ 历史缓存会话", ws, ID_HDR_HIST, f);
+        c.hdr_hist = mk(h, "Button", &format!("▶ {}", lang::s(lang::K::HdrHistory)), ws, ID_HDR_HIST, f);
         c.list = mk(h, "ListBox", "", ws | 0x0001 | 0x0020_0000 | 0x0080_0000, ID_LIST, f); // LBS_NOTIFY|WS_VSCROLL|WS_BORDER
-        c.btn_reexport = mk(h, "Button", "重新导出", ws, ID_REEXPORT, f);
-        c.btn_open = mk(h, "Button", "打开文件夹", ws, ID_OPEN_DIR, f);
-        c.btn_open_out = mk(h, "Button", "打开视频文件夹", ws, ID_OPEN_OUT_DIR, f);
-        c.btn_delete = mk(h, "Button", "删除", ws, ID_DELETE, f);
+        c.btn_reexport = mk(h, "Button", lang::s(lang::K::Reexport), ws, ID_REEXPORT, f);
+        c.btn_open = mk(h, "Button", lang::s(lang::K::OpenFolder), ws, ID_OPEN_DIR, f);
+        c.btn_open_out = mk(h, "Button", lang::s(lang::K::OpenVideoFolder), ws, ID_OPEN_OUT_DIR, f);
+        c.btn_delete = mk(h, "Button", lang::s(lang::K::Delete), ws, ID_DELETE, f);
 
         // 【开始录制】用 Static 而非常规按钮：带视觉主题的按钮会忽略 WM_CTLCOLORBTN，
         // 而静态控件认 WM_CTLCOLORSTATIC，才能可靠地画成绿底白字。
@@ -548,14 +549,14 @@ impl App {
         c.btn_record = mk(
             h,
             "Static",
-            "开始录制",
+            lang::s(lang::K::StartRecording),
             ws | 0x0000_0001 | 0x0000_0100 | 0x0000_0200,
             ID_RECORD,
             f,
         );
         c.progress = mk(h, "msctls_progress32", "", ws, ID_PROGRESS, f);
-        c.btn_cancel = mk(h, "Button", "取消合成", ws, ID_CANCEL, f);
-        c.btn_clean = mk(h, "Button", "手动清理缓存", ws, ID_BTN_CLEAN, f);
+        c.btn_cancel = mk(h, "Button", lang::s(lang::K::CancelExport), ws, ID_CANCEL, f);
+        c.btn_clean = mk(h, "Button", lang::s(lang::K::CleanCache), ws, ID_BTN_CLEAN, f);
         SendMessageW(c.progress, PBM_SETRANGE32, 0, 100);
 
         // 深色主题：按钮/复选框/进度条自绘；下拉框与输入框交给系统深色主题
@@ -603,7 +604,7 @@ impl App {
         let c = &self.ctl;
         if !c.cmb_recfps.is_null() {
             let i = dropdown::get_sel(c.cmb_recfps);
-            if let Some((_, v)) = REC_FPS_OPTIONS.get(i) {
+            if let Some((_, v)) = REC_FPS_KEYS.get(i) {
                 self.fps = *v;
             }
         }
@@ -678,7 +679,7 @@ impl App {
         let lb = self.ctl.list;
         SendMessageW(lb, 0x0184, 0, 0); // LB_RESETCONTENT
         for s in &self.sessions {
-            let text = format!("{} ｜ {} 帧", s.name, s.frames);
+            let text = lang::f(lang::K::SessionItem, &[&s.name, &s.frames]);
             let w = win::wide(&text);
             SendMessageW(lb, 0x0180, 0, w.as_ptr() as isize); // LB_ADDSTRING
         }
@@ -765,9 +766,9 @@ impl App {
             let t = win::wide(&format!("{} {}", if open { "▼" } else { "▶" }, text));
             SetWindowTextW(h, t.as_ptr());
         };
-        set(self.ctl.hdr_rec, self.rec_open, "录制参数");
-        set(self.ctl.hdr_exp, self.exp_open, "导出视频参数");
-        set(self.ctl.hdr_hist, self.hist_open, "历史缓存会话");
+        set(self.ctl.hdr_rec, self.rec_open, lang::s(lang::K::HdrRecording));
+        set(self.ctl.hdr_exp, self.exp_open, lang::s(lang::K::HdrExport));
+        set(self.ctl.hdr_hist, self.hist_open, lang::s(lang::K::HdrHistory));
     }
 
     unsafe fn do_pick(&mut self) {
@@ -795,11 +796,11 @@ impl App {
         ShowWindow(self.hwnd, SW_MINIMIZE);
         logline!("[pick] 主窗口已最小化，进入拾取");
         // 说明清楚：拾取时 CanLapse 已最小化到任务栏（点不到），唯一该点的是画布边框。
-        let t = win::wide("请点击画布边框；Esc 取消");
+        let t = win::wide(lang::s(lang::K::PickInstr));
         SetWindowTextW(self.ctl.status, t.as_ptr());
         UpdateWindow(self.hwnd);
 
-        let hint = win::pick_hint_create("请点击画布边框");
+        let hint = win::pick_hint_create(lang::s(lang::K::PickHint));
         let picked = win::pick_window_interactive(self.hwnd, Some(hint));
         win::pick_hint_destroy(hint);
 
@@ -816,7 +817,7 @@ impl App {
         let Some(hwnd) = picked else {
             logline!("[pick] 拾取取消（Esc / 主窗口被恢复 / 点在本程序窗口上）");
             self.refresh_labels();
-            let t = win::wide("已取消拾取，请重新拾取");
+            let t = win::wide(lang::s(lang::K::PickCanceled));
             SetWindowTextW(self.ctl.status, t.as_ptr());
             return;
         };
@@ -858,7 +859,7 @@ impl App {
                 //    用户会以为拾取成功了（实测踩过）。
                 logline!("[pick] 建抓帧器失败：{e}");
                 self.preview = None;
-                let t = win::wide(&format!("无法抓取该窗口：{e}　请重新拾取"));
+                let t = win::wide(&lang::f(lang::K::GrabFailed, &[&e]));
                 SetWindowTextW(self.ctl.status, t.as_ptr());
                 InvalidateRect(self.hwnd, &self.preview_rect, 0);
                 return;
@@ -874,9 +875,9 @@ impl App {
         // 点到的是边框还是画面（参考实现的 6px 判定，用于状态栏/日志）
         self.pick_where = win::last_click_point().map(|pt| {
             if win::border_hit(hwnd, pt, win::BORDER_PX) {
-                "边框"
+                lang::s(lang::K::WhereBorder)
             } else {
-                "画面"
+                lang::s(lang::K::WhereSurface)
             }
         });
         logline!("[pick] 点击位置：{:?}", self.pick_where);
@@ -898,7 +899,7 @@ impl App {
     unsafe fn show_help(&self) {
         message(
             self.hwnd,
-            "如何定位画布窗口",
+            lang::s(lang::K::HelpTitle),
             "想要只录制画布，需要把画布拆成独立浮动窗口，再使用【拾取窗口】选中画布。\n\n\
              SAI2：视图 → 新建浮动视图\n\
              Photoshop：拖拽画布标签向外拉出，脱离主框架\n\
@@ -914,11 +915,11 @@ impl App {
 
     unsafe fn start_recording(&mut self) {
         let Some(target) = &self.target else {
-            message(self.hwnd, "提示", "请先点【🎯 拾取窗口】选择要录制的画布窗口。");
+            message(self.hwnd, lang::s(lang::K::Notice), lang::s(lang::K::PickFirst));
             return;
         };
         if !crate::capture::composition_enabled() {
-            message(self.hwnd, "无法录制", "桌面合成（DWM）未开启，缩略图抓帧不可用。");
+            message(self.hwnd, lang::s(lang::K::CannotRecord), lang::s(lang::K::NoDwm));
             return;
         }
         self.preview_cap = None; // 录制期间由录制线程独占抓帧
@@ -935,7 +936,7 @@ impl App {
             hwnd: target.hwnd as isize,
             root: default_cache_root(),
             name: if target.process.is_empty() {
-                "画布".to_string()
+                lang::s(lang::K::CanvasFallback).to_string()
             } else {
                 target.process.clone()
             },
@@ -985,7 +986,7 @@ impl App {
         // （【开始录制】藏起来、状态栏还写着"录制中…"）—— 实测踩过。
         if let Some(e) = failed {
             self.ui_set_idle();
-            message(self.hwnd, "录制失败", &e);
+            message(self.hwnd, lang::s(lang::K::RecordingFailed), &e);
             return;
         }
         let Some(dir) = dir else {
@@ -995,10 +996,10 @@ impl App {
         let frames = shared.as_ref().map(|s| s.frames()).unwrap_or(0);
         if frames == 0 {
             self.ui_set_idle();
-            message(self.hwnd, "录制结束", "这次没有保存到任何帧（画面可能始终没有变化）。");
+            message(self.hwnd, lang::s(lang::K::RecordingEnded), lang::s(lang::K::NoFrames));
             return;
         }
-        // 规格：停止录制 → 进入视频合成流程（这条路径才适用"合成成功自动清理缓存"）
+        // 规格：停止录制 → 进入视频合成流程（这条路径才适用lang::s(lang::K::AutoClean)）
         let out = self.out_path.clone();
         let clean = self.auto_clean;
         self.start_encoding(dir, out, clean);
@@ -1067,7 +1068,7 @@ impl App {
             }
             finished.store(true, Ordering::SeqCst);
         });
-        let t = win::wide("正在准备合成…");
+        let t = win::wide(lang::s(lang::K::Preparing));
         SetWindowTextW(self.ctl.status, t.as_ptr());
         self.ui_set_encoding();
         SetTimer(self.hwnd, TIMER_UI, 200, None);
@@ -1075,7 +1076,7 @@ impl App {
 
     unsafe fn reexport_selected(&mut self) {
         let Some(s) = self.selected_session() else {
-            message(self.hwnd, "提示", "请先在列表里选择一个会话。");
+            message(self.hwnd, lang::s(lang::K::Notice), lang::s(lang::K::SelectFirst));
             return;
         };
         let dir = s.dir.clone();
@@ -1092,7 +1093,7 @@ impl App {
 
     unsafe fn delete_selected(&mut self) {
         let Some(s) = self.selected_session() else {
-            message(self.hwnd, "提示", "请先在列表里选择一个会话。");
+            message(self.hwnd, lang::s(lang::K::Notice), lang::s(lang::K::SelectFirst));
             return;
         };
         let dir = s.dir.clone();
@@ -1108,11 +1109,11 @@ impl App {
                 .map(|e| !e.finished.load(Ordering::SeqCst))
                 .unwrap_or(false);
         if busy {
-            message(self.hwnd, "无法删除", "正在录制或正在合成中的会话不能删除。");
+            message(self.hwnd, lang::s(lang::K::CannotDelete), lang::s(lang::K::BusyDelete));
             return;
         }
         // 规格：删除会话会删除整个会话缓存目录
-        if !confirm(self.hwnd, &format!("确定删除会话「{name}」及其全部 PNG 帧吗？")) {
+        if !confirm(self.hwnd, &lang::f(lang::K::DeleteConfirm, &[&name])) {
             return;
         }
         match Session::delete(&dir) {
@@ -1120,7 +1121,7 @@ impl App {
                 self.refresh_session_list();
                 self.relayout(false);
             }
-            Err(e) => message(self.hwnd, "删除失败", &e),
+            Err(e) => message(self.hwnd, lang::s(lang::K::DeleteFailed), &e),
         }
     }
 
@@ -1146,10 +1147,7 @@ impl App {
             let total = e.total.load(Ordering::SeqCst);
             let pct = if total > 0 { (done * 100 / total) as isize } else { 0 };
             SendMessageW(self.ctl.progress, PBM_SETPOS, pct as usize, 0);
-            let t = win::wide(&format!(
-                "视频合成中… 已处理：{} / {} 帧",
-                done, total
-            ));
+            let t = win::wide(&lang::f(lang::K::ExportingStatus, &[&done, &total]));
             SetWindowTextW(self.ctl.status, t.as_ptr());
             if e.finished.load(Ordering::SeqCst) {
                 let outcome = e.outcome.lock().ok().and_then(|mut o| o.take());
@@ -1167,25 +1165,26 @@ impl App {
                                 self.refresh_session_list();
                             }
                         }
-                        let msg = format!(
-                            "合成完成：{} 帧 · {:.2} MB · {}x{}\n{}",
-                            s.frames,
-                            s.bytes as f64 / 1048576.0,
-                            s.width,
-                            s.height,
-                            out.display()
+                        let msg = lang::fill(
+                            lang::s(lang::K::DlgDoneText),
+                            &[
+                                &s.frames,
+                                &(s.bytes as f64 / 1048576.0),
+                                &s.width,
+                                &s.height,
+                                &out.display(),
+                            ],
                         );
                         // 结果直接写进合成弹窗，1.6 秒后自动关闭（不再弹【确定】）
                         finish_enc_dialog(&msg);
                     }
                     Some(Ok(EncodeOutcome::Cancelled(s))) => {
-                        finish_enc_dialog(&format!(
-                            "已取消合成：写入 {} 帧，文件仍可播放\n{}",
-                            s.frames,
-                            out.display()
+                        finish_enc_dialog(&lang::f(
+                            lang::K::DlgCanceledText,
+                            &[&s.frames, &out.display()],
                         ));
                     }
-                    Some(Err(err)) => finish_enc_dialog(&format!("合成失败：{err}")),
+                    Some(Err(err)) => finish_enc_dialog(&lang::f(lang::K::DlgFailedText, &[&err])),
                     None => {}
                 }
             }
@@ -1287,7 +1286,7 @@ impl App {
         ShowWindow(self.ctl.btn_record, 0);
         ShowWindow(self.ctl.progress, 0);
         ShowWindow(self.ctl.btn_cancel, 0);
-        let t = win::wide("录制中…用悬浮条：暂停 / 标记 / 停止");
+        let t = win::wide(lang::s(lang::K::RecordingHint));
         SetWindowTextW(self.ctl.status, t.as_ptr());
     }
 
@@ -1380,7 +1379,7 @@ impl App {
             let old = SelectObject(hdc, self.font);
             SetBkMode(hdc, 1); // TRANSPARENT
             windows_sys::Win32::Graphics::Gdi::SetTextColor(hdc, theme::MUTED);
-            let t = win::wide("预览区域\n拾取窗口后显示");
+            let t = win::wide(lang::s(lang::K::PreviewEmpty));
             // 先量出两行文字的实际高度，再垂直居中 —— 固定 top 偏移在高 DPI 下会偏上。
             // ⚠️ DT_CALCRECT 会**改写矩形**（把 right/bottom 收到文字实际大小），
             //    所以必须用单独的 measure 矩形量，否则后面的居中会按被收窄的框算，
@@ -1483,7 +1482,7 @@ unsafe fn message(owner: HWND, title: &str, text: &str) {
 }
 
 unsafe fn confirm(owner: HWND, text: &str) -> bool {
-    let t = win::wide("请确认");
+    let t = win::wide(lang::s(lang::K::ConfirmTitle));
     let b = win::wide(text);
     // MB_YESNO | MB_ICONQUESTION
     windows_sys::Win32::UI::WindowsAndMessaging::MessageBoxW(owner, b.as_ptr(), t.as_ptr(), 4 | 0x20)
@@ -1535,7 +1534,7 @@ pub fn run(initial_target: Option<isize>) -> i32 {
                 message(
                     std::ptr::null_mut(),
                     "CanLapse",
-                    "CanLapse 已经在运行（可能被最小化到任务栏）。",
+                    lang::s(lang::K::AlreadyRunning),
                 );
             }
         }
@@ -1754,7 +1753,7 @@ unsafe fn enc_dlg_paint(hwnd: HWND) {
 
     SetBkMode(dc, 1);
     let old = SelectObject(dc, theme::heading_font());
-    let title = if dlg.done.is_some() { "合成完成" } else { "视频合成中" };
+    let title = if dlg.done.is_some() { lang::s(lang::K::DlgDone) } else { lang::s(lang::K::DlgExporting) };
     let title_rc = RECT {
         left: 18,
         top: 14,
@@ -1799,7 +1798,7 @@ unsafe fn enc_dlg_paint(hwnd: HWND) {
     let old2 = SelectObject(dc, small);
     let info = match &dlg.done {
         Some((t, _)) => t.clone(),
-        None => format!("已处理：{done} / {total} 帧"),
+        None => lang::f(lang::K::DlgFrames, &[&done, &total]),
     };
     let info_rc = RECT {
         left: 18,
@@ -1821,7 +1820,7 @@ unsafe fn enc_dlg_paint(hwnd: HWND) {
         SelectObject(dc, op);
         SelectObject(dc, ob);
         DeleteObject(border);
-        theme::text(dc, "取消合成", cb, theme::TEXT, 0x0000_0001 | 0x0000_0004);
+        theme::text(dc, lang::s(lang::K::CancelExport), cb, theme::TEXT, 0x0000_0001 | 0x0000_0004);
     }
 
     SelectObject(dc, old);
@@ -1961,7 +1960,7 @@ pub unsafe fn show_enc_dialog(
         .clamp(work.top + 8, (work.bottom - dh - 8).max(work.top + 8));
 
     let c = cls(ENC_DLG_CLASS);
-    let t = win::wide("合成进度");
+    let t = win::wide(lang::s(lang::K::DlgTitle));
     let hwnd = CreateWindowExW(
         0x0000_0008,                                 // WS_EX_TOPMOST
         c.as_ptr(),

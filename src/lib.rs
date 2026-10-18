@@ -14,6 +14,7 @@ pub mod encode;
 pub mod frame;
 pub mod log;
 pub mod img_io;
+pub mod lang;
 pub mod recorder;
 pub mod session;
 pub mod ui;
