@@ -18,7 +18,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, Ellipse, EndPaint, FillRect,
-    FrameRect, GetStockObject, RoundRect, ScreenToClient, SelectObject, SetBkMode, SetTextColor, DEFAULT_GUI_FONT,
+    FrameRect, GetMonitorInfoW, GetStockObject, MonitorFromWindow, RoundRect, ScreenToClient, SelectObject,
+    SetBkMode, SetTextColor, DEFAULT_GUI_FONT, MONITOR_DEFAULTTONEAREST, MONITORINFO,
     FW_NORMAL, HDC, HGDIOBJ, NULL_PEN,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -108,6 +109,21 @@ fn hit_button(px: i32, py: i32) -> usize {
 /// 把控制条的 x 夹在工作区内（只允许左右移动，不越界）
 fn clamp_bar_x(work: RECT, x: i32) -> i32 {
     x.clamp(work.left, (work.right - BAR_W).max(work.left))
+}
+
+/// 目标窗口所在显示器的工作区（避开任务栏）。失败返回 None，由调用方回退主屏。
+unsafe fn monitor_work_area(target: Option<HWND>) -> Option<RECT> {
+    let hwnd = target?;
+    let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    if mon.is_null() {
+        return None;
+    }
+    let mut mi: MONITORINFO = std::mem::zeroed();
+    mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+    if GetMonitorInfoW(mon, &mut mi) == 0 {
+        return None;
+    }
+    Some(mi.rcWork)
 }
 
 unsafe fn work_area() -> RECT {
@@ -518,8 +534,8 @@ unsafe fn polish_frame(hwnd: HWND) {
     );
 }
 
-/// 创建录制控制条（默认放在屏幕左上偏下位置）
-pub fn create(shared: Arc<Shared>) -> Option<HWND> {
+/// 创建录制控制条（默认放在画布所在显示器的右上角）
+pub fn create(shared: Arc<Shared>, target: Option<HWND>) -> Option<HWND> {
     if let Ok(mut g) = BAR_SHARED.lock() {
         *g = Some(shared);
     }
@@ -529,8 +545,9 @@ pub fn create(shared: Arc<Shared>) -> Option<HWND> {
         ensure_class();
         let cls = win::wide(BAR_CLASS);
         let title = win::wide("CanLapse");
-        // 默认吸附在**右上角**（用户要求）；之后只能在上边缘左右拖
-        let work = work_area();
+        // 默认吸附在**画布所在显示器**的右上角（用户要求 v1.3）；之后只能在上边缘左右拖。
+        // 找不到目标窗口所在显示器时回退主屏工作区。
+        let work = monitor_work_area(target).unwrap_or_else(|| work_area());
         let x = clamp_bar_x(work, work.right - BAR_W - BAR_MARGIN);
         let y = work.top + BAR_MARGIN;
         let hwnd = CreateWindowExW(

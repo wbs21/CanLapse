@@ -6,7 +6,7 @@ Pick a canvas window once, and CanLapse quietly captures it on a schedule, keeps
 actually changed, and exports a 30 fps MP4 when you stop. Built for digital painters using SAI2,
 Photoshop, CLIP STUDIO PAINT or Krita.
 
-`v1.2.1` · single-file executable · no DLLs · English / 中文 UI (follows system language)
+`v1.3.0` · single-file executable · no DLLs · English / 中文 UI (follows system language)
 
 ![Main window](docs/evidence/ui-main-en.png)
 
@@ -19,8 +19,9 @@ Photoshop, CLIP STUDIO PAINT or Krita.
 - **Canvas-only capture.** Click the canvas border once; CanLapse records that window, not your desktop.
 - **Differential frames.** A frame is saved only when the picture changes — an hour of painting becomes
   a few hundred frames instead of 100k screenshots.
-- **Floating control bar.** Dark, rounded, snapped to the top-right corner; drag it left/right along the
-  top edge. Pause / mark / stop, with live `00:12 · 3 frames` status.
+- **Floating control bar.** Dark, rounded, snapped to the top-right corner of the monitor where the
+  canvas lives; drag it left/right along the top edge. Pause / mark / stop, with live `00:12 · 3 frames`
+  status.
 - **Encoding you can watch (and cancel).** Stopping restores the main window instantly and opens a small
   progress dialog; it closes itself when the MP4 is done.
 - **Bilingual UI**, English by default on non-Chinese systems, 中文 on Chinese systems — no language switch.
@@ -34,13 +35,13 @@ Photoshop, CLIP STUDIO PAINT or Krita.
 
 ## Quick start
 
-1. Extract `CanLapse-v1.2.1-win64.zip` to any writable folder (for example `D:\Tools\CanLapse`).
+1. Extract `CanLapse-v1.3.0-win64.zip` to any writable folder (for example `D:\Tools\CanLapse`).
 2. Run `CanLapse.exe`.
 3. Click **Pick Window** — CanLapse minimizes itself and shows *“Click the canvas border”*.
    Click the canvas (its border or its content; `Esc`/right-click cancels).
 4. Choose **Frame density** and **Change sensitivity**, then click **Start Recording**.
 5. Work. Use the floating bar to **Pause**, **Mark** (remember this moment) or **Stop**.
-6. The MP4 lands in `output\timelapse.mp4` next to the exe. **Open Video Folder** takes you there.
+6. The MP4 lands in `output\timelapse_YYYYMMDD-HHMMSS.mp4` next to the exe. **Open Video Folder** takes you there.
 
 > The first captured frame defines the video resolution. If you resize the canvas mid-session, frames are
 > scaled proportionally and letterboxed.
@@ -77,7 +78,7 @@ canvas HWND ──► DWM thumbnail (DwmRegisterThumbnail + rcSource crop)
    static ffmpeg 9.0.2 (libavformat + libopenh264)  →  H.264 High, 30 fps, 2 s GOP
                      │
                      ▼
-              output\timelapse.mp4
+              output\timelapse_YYYYMMDD-HHMMSS.mp4
 ```
 
 - Capture uses the **DWM thumbnail** of the target window, read back through
@@ -107,7 +108,7 @@ frame. Large canvases need higher sensitivity (5–8).
 
 | Path | Content |
 |---|---|
-| `output\timelapse.mp4` | exported video (fixed name — **a new export overwrites it**) |
+| `output\timelapse_YYYYMMDD-HHMMSS.mp4` | exported video, timestamped at stop time (no overwrites) |
 | `cache\<timestamp>_<process>\` | JPEG/PNG frames of one session + `markers.json` |
 | `canlapse.log` | startup / pick / record / encode diagnostics |
 | `crash.log` | only if the app crashed (panic or unhandled exception) |
@@ -180,8 +181,8 @@ tests/                integration tests
 - Session frames are lossy JPEG (q85); re-exporting decodes once, without compounding loss.
 - Encoding is single-threaded: roughly 8–9 frames/s at 982×812 on a typical desktop CPU
   (hardware encoders are on the v1.3 list).
-- Output filename is fixed (`timelapse.mp4`); rename or move the file to keep several exports.
-- The floating bar position is not persisted (it snaps back to the top-right each session).
+
+- The floating bar position is not persisted between sessions (it re-snaps to the canvas monitor, top-right).
 
 ---
 

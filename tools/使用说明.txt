@@ -1,4 +1,4 @@
-CanLapse v1.2.1 —— 画布窗口缩时录屏（Windows 10/11 x64）
+CanLapse v1.3.0 —— 画布窗口缩时录屏（Windows 10/11 x64）
 Canvas Timelapse Recorder for drawing apps
 ==========================================================
 
@@ -10,7 +10,7 @@ Canvas Timelapse Recorder for drawing apps
 1. 点【Pick Window】→ 主窗口最小化，屏幕上方出现提示条「Click the canvas border」
 2. 用鼠标点一下画布（边框或画面都行；右键 / Esc 取消）
 3. 选【Frame density】和【Change sensitivity】，点【Start Recording】
-4. 录制中可用右上角悬浮条：Pause / Mark / Stop；Esc 也能停止
+4. 录制中可用画布所在屏幕右上角的悬浮条：Pause / Mark / Stop；Esc 也能停止
 5. 停止后主窗口立刻回来，并弹出合成进度窗；完成后自动关闭，
    视频在 **程序所在目录\output\timelapse.mp4**（位置固定），可点【Open Video Folder】直达
 
@@ -31,8 +31,7 @@ Canvas Timelapse Recorder for drawing apps
 三、文件都在哪 / Where files live
 ---------------------------------
 cache\    会话帧缓存（录制时生成）。可在界面点【Clean Cache】打开并清理。
-output\   合成好的 MP4。文件名固定 timelapse.mp4，**重复导出会覆盖**，
-          需要保留请自己改名或先拷走。
+output\   合成好的 MP4，文件名带时间戳：timelapse_20261018-120334.mp4（不会互相覆盖）。
 
 四、出问题 / Troubleshooting
 ----------------------------

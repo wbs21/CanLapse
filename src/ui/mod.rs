@@ -193,7 +193,6 @@ struct App {
     fps: f64,
     threshold: f32,
     auto_clean: bool,
-    out_path: PathBuf,
     target: Option<win::WindowInfo>,
     preview: Option<Frame>,
     preview_rect: RECT,
@@ -485,7 +484,6 @@ impl App {
             threshold: SENS_LEVELS[SENS_DEFAULT],
             auto_clean: true,
             // 默认导出到"程序所在目录\output"（不再放在缓存目录里）
-            out_path: default_output_dir().join("timelapse.mp4"),
             target: None,
             preview: None,
             preview_rect: rect(0, 0, 0, 0),
@@ -950,7 +948,7 @@ impl App {
         let worker = recorder::spawn(cfg, shared.clone());
         self.shared = Some(shared.clone());
         self.worker = Some(worker);
-        self.bar = floatbar::create(shared).unwrap_or(std::ptr::null_mut());
+        self.bar = floatbar::create(shared, Some(target.hwnd)).unwrap_or(std::ptr::null_mut());
         // 规格：开始录制后主窗口自动最小化，只留悬浮条
         self.ui_set_recording();
         ShowWindow(self.hwnd, SW_MINIMIZE);
@@ -999,8 +997,9 @@ impl App {
             message(self.hwnd, lang::s(lang::K::RecordingEnded), lang::s(lang::K::NoFrames));
             return;
         }
-        // 规格：停止录制 → 进入视频合成流程（这条路径才适用lang::s(lang::K::AutoClean)）
-        let out = self.out_path.clone();
+        // 规格：停止录制 → 进入视频合成流程（这条路径才适用"合成成功自动清理缓存"）
+        // 输出文件名带本地时间戳：同名不会互相覆盖（v1.3 起）
+        let out = export_out_path();
         let clean = self.auto_clean;
         self.start_encoding(dir, out, clean);
     }
@@ -1473,6 +1472,12 @@ unsafe fn activate_existing() -> bool {
     ShowWindow(h, SW_RESTORE);
     SetForegroundWindow(h);
     true
+}
+
+/// 默认导出路径：`<程序目录>\output\timelapse_YYYYMMDD-HHMMSS.mp4`
+fn export_out_path() -> PathBuf {
+    let stamp = win::stamp_compact(&win::local_now());
+    default_output_dir().join(format!("timelapse_{stamp}.mp4"))
 }
 
 unsafe fn message(owner: HWND, title: &str, text: &str) {

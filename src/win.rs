@@ -810,6 +810,14 @@ pub fn stamp_folder(st: &SYSTEMTIME) -> String {
     )
 }
 
+/// 导出文件名用的时间：`20261018-120530`（紧凑、可排序、可直接做文件名）
+pub fn stamp_compact(st: &SYSTEMTIME) -> String {
+    format!(
+        "{:04}{:02}{:02}-{:02}{:02}{:02}",
+        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond
+    )
+}
+
 /// markers.json 里用的时间：`2026-02-14T13:20:51.123`
 pub fn stamp_iso(st: &SYSTEMTIME) -> String {
     format!(
