@@ -1,138 +1,207 @@
 # CanLapse
 
-> 面向手绘创作者（SAI2 > Photoshop > CLIP STUDIO PAINT > Krita）的 **Windows 画布窗口缩时录屏工具**。
+**Timelapse recorder for drawing-app canvas windows** — Windows 10/11 x64.
 
-当前状态：**v1.0 功能完整、四款软件实测通过** —— 拾取窗口 → 差分 → 帧缓存（JPEG/PNG）→ 合成 MP4 全链路可用；
-深色单页 GUI（330×366，自绘按钮/下拉/复选框）、深色录制控制条、历史会话面板与两个弹窗均已完成。
-SAI2 / CLIP STUDIO PAINT / Photoshop / Krita 均实测可迅速锁定画布窗口，
-明细见 [docs/verification-log.md](docs/verification-log.md)。
+Pick a canvas window once, and CanLapse quietly captures it on a schedule, keeps only the frames that
+actually changed, and exports a 30 fps MP4 when you stop. Built for digital painters using SAI2,
+Photoshop, CLIP STUDIO PAINT or Krita.
 
-> 📌 **v1.2.1 已发布（单文件 + 中英双语）**：交付包只有 `CanLapse.exe`（3.8 MB，静态链接 ffmpeg/openh264 与静态 CRT）+ 使用说明；静态库已随仓库（`deps/ffmpeg-static`）。
->
-> 📌 **v1.0.0 封存记录**：[完工日志.md](完工日志.md) —— **封存版**：交付物与 SHA256、最终功能、增补记录、验证矩阵、已知限制、封存规则与验收步骤。
->
-> 📌 **先读这个**：[项目总结.md](项目总结.md) —— 一页纸讲清现状、架构、实测数据、坑与后续计划。
+`v1.2.1` · single-file executable · no DLLs · English / 中文 UI (follows system language)
 
-## 它怎么工作
+![Main window](docs/evidence/ui-main-en.png)
 
-1. 用户用鼠标**拾取画布窗口**（HWND），不做自动识别；
-2. 通过 **DWM 窗口缩略图**持续取该窗口的画面；画面差分后按需把帧存进会话缓存目录（有内容存 JPEG q85，近空白存 PNG）
-   —— 静止画面不存帧，这就是"缩时"的来源；
-3. 录制结束后用**自编译的最小 OpenH264 编码器**批量合成 MP4；
-4. 录制帧密度四档（1 帧/5 秒、1 帧/2 秒、1 帧/秒、2 帧/秒，默认 1 帧/5 秒）；导出固定 **30fps、画质中**。
+---
 
-设计约束（v1.0）：**单页面小巧主窗口（330×366，窄屏/多窗口并列时更省地方）**，
-无独立设置面板；录制时主窗口最小化，只保留一条深色录制控制条（自绘、圆角、无灰边，默认吸附屏幕右上角、可沿上边缘左右拖动）；**无自动画布识别**。
-完整需求见 [docs/requirements.md](docs/requirements.md)。
+## Highlights
 
-## 当前进度
+- **One file, no installation.** `CanLapse.exe` is 3.8 MB and statically links ffmpeg + libopenh264
+  and the MSVC runtime. No DLLs, no .NET, no VC++ redistributable. Copy it anywhere and run.
+- **Canvas-only capture.** Click the canvas border once; CanLapse records that window, not your desktop.
+- **Differential frames.** A frame is saved only when the picture changes — an hour of painting becomes
+  a few hundred frames instead of 100k screenshots.
+- **Floating control bar.** Dark, rounded, snapped to the top-right corner; drag it left/right along the
+  top edge. Pause / mark / stop, with live `00:12 · 3 frames` status.
+- **Encoding you can watch (and cancel).** Stopping restores the main window instantly and opens a small
+  progress dialog; it closes itself when the MP4 is done.
+- **Bilingual UI**, English by default on non-Chinese systems, 中文 on Chinese systems — no language switch.
+- **Zero UI framework.** Plain Win32 + GDI, hand-drawn widgets, dark theme.
 
-| 模块 | 状态 | 证据 |
+| Floating bar | Encoding dialog |
+|---|---|
+| ![Bar](docs/evidence/floatbar-en.png) | ![Dialog](docs/evidence/enc-dialog.png) |
+
+---
+
+## Quick start
+
+1. Extract `CanLapse-v1.2.1-win64.zip` to any writable folder (for example `D:\Tools\CanLapse`).
+2. Run `CanLapse.exe`.
+3. Click **Pick Window** — CanLapse minimizes itself and shows *“Click the canvas border”*.
+   Click the canvas (its border or its content; `Esc`/right-click cancels).
+4. Choose **Frame density** and **Change sensitivity**, then click **Start Recording**.
+5. Work. Use the floating bar to **Pause**, **Mark** (remember this moment) or **Stop**.
+6. The MP4 lands in `output\timelapse.mp4` next to the exe. **Open Video Folder** takes you there.
+
+> The first captured frame defines the video resolution. If you resize the canvas mid-session, frames are
+> scaled proportionally and letterboxed.
+
+`cache\` (session frames) and `output\` (videos) are created automatically next to the executable, so a
+USB-stick copy stays self-contained.
+
+---
+
+## Requirements
+
+| Item | Requirement |
+|---|---|
+| OS | Windows 10 / 11, 64-bit (x64). ARM64 works through emulation. |
+| Desktop composition | DWM must be enabled (default on Windows 10/11). |
+| Runtime | **None.** No DLLs, no .NET, no Visual C++ redistributable, no installer. |
+| Drawing apps | Any app with a floating canvas window: SAI2, Photoshop, CLIP STUDIO PAINT, Krita… |
+
+---
+
+## How it works
+
+```
+canvas HWND ──► DWM thumbnail (DwmRegisterThumbnail + rcSource crop)
+                     │
+                     ▼
+              BGRA frame ──► pixel diff (threshold by changed-pixel ratio)
+                     │                 │
+             changed │                 │ nearly blank
+                     ▼                 ▼
+              JPEG q85 frame      PNG frame      → cache\<session>\frame_NNNN.*
+                     │
+                     ▼
+   static ffmpeg 9.0.2 (libavformat + libopenh264)  →  H.264 High, 30 fps, 2 s GOP
+                     │
+                     ▼
+              output\timelapse.mp4
+```
+
+- Capture uses the **DWM thumbnail** of the target window, read back through
+  `PrintWindow(host, PW_RENDERFULLCONTENT)`, so it works for GPU-composited apps and never steals focus.
+- Recording **auto-pauses when another app is in the foreground** (you are not painting) and resumes when
+  you return to the canvas.
+- Encoding is a hand-written FFI layer over avcodec/avformat; no `ffmpeg.exe`, no subprocess.
+
+---
+
+## Settings
+
+| Setting | Options | Default |
 |---|---|---|
-| 抓帧（DWM 缩略图宿主 + `PrintWindow`） | ✅ 端到端跑通 | [FINDINGS](spikes/dwm-capture/FINDINGS.md) |
-| 帧差分（静止画面不存帧） | ✅ 已实测 | 4fps×6s：变化目标存 24 帧，静止目标存 1 帧 |
-| 分辨率统一（等比+居中+黑边） | ✅ 已实测 | 录制中途 480×320→640×400，32 帧全为 480×320，后段 480×300 居中+上下各 10 行黑边 |
-| 会话缓存 `frame_xxxx.jpg` / `.png` + `markers.json` | ✅ 有单测覆盖 | `cargo test`（29 项全过） |
-| 录制容错（目标窗口消失 / 单帧失败跳过） | ✅ 已实测 | 目标关闭后自动停止并写 `completed:false` |
-| 视频合成（H.264 MP4） | ✅ 已接入并端到端实测 | 24 帧 → 480×320 / 2.4s，`ffprobe -count_frames` = 24 |
-| 取消合成（部分文件仍可播放） | ✅ 已实测 | `--frames 8` → 8 帧 / 0.8s，解码退出码 0 |
-| 单页 GUI + 悬浮操作条 | ✅ 全流程实测 | 330×366；暂停/标记/停止、进度条、取消合成逐项点过 |
-| 历史会话面板（重新导出/删除） | ✅ 已实测 | 名称+帧数列表；重新导出产出 `<名称>_<帧率>fps.mp4` |
-| 帮助弹窗 / 预览大图 | ✅ 已实测 | 大图弹窗修正"创建在绘画软件后面" |
-| 打包（图标 / 版本信息 / 清单） | ✅ 已实测 | `tools\build.ps1` 构建后注入；版本信息读出 `1.0.0.0` |
+| Frame density | 1 frame / 5 s · 1 frame / 2 s · 1 frame / s · 2 frames / s | **1 frame / 5 s** |
+| Change sensitivity | 1 = 0.08 · 2 = 0.04 · 3 = 0.02 · **4 = 0.01** · 5 = 0.008 · 6 = 0.004 · 7 = 0.002 · 8 = 0.001 | **4** |
+| Playback rate | fixed 30 fps | — |
+| Quality | fixed medium (H.264, ~0.06 bpp) | — |
+| Auto-clean cache | delete session frames after a successful export | on |
 
-编码走**导入库静态链接**：`build.rs` 会按 `CANLAPSE_FFMPEG_MIN`（默认 `D:\CapLite\ffmpeg-min`）
-输出链接参数，并把 6 个运行时 DLL（5 个 `av*` + `libwinpthread-1.dll`）自动复制到
-`target/<profile>` 与 `target/<profile>/deps`。**DLL 必须与 exe 同目录**——导入表在进程启动时
-就要解析，那时 `main()` 还没运行，在代码里 `SetDllDirectory` 来不及。
+*Frame density* is how often the canvas is checked; *sensitivity* decides whether the change is worth a
+frame. Large canvases need higher sensitivity (5–8).
 
-`src/encode.rs` 相对原型多做了三件生产代码才需要的事：FFI 对象 RAII 释放、
-合成可中途取消（取消后仍写 trailer，产出**可播放的部分视频**）、
-会话里混有不同尺寸帧时（录制中用户改了画布窗口大小）自动统一缩放。
+---
 
-## 关键决策
+## Files and logs
 
-| 决策 | 内容 | 记录 |
-|---|---|---|
-| 技术栈 | Rust（`x86_64-pc-windows-msvc`）+ `windows-sys`，不用第三方 UI 框架 | [ADR 0002](docs/decisions/0002-rust-and-dwm-thumbnail-capture.md) |
-| 抓帧 | **DWM 缩略图宿主 + `PrintWindow(宿主, PW_RENDERFULLCONTENT)`** | 同上 |
-| 编码 | 手写 FFI 直链自编译最小 ffmpeg（libopenh264），编码 crate 零依赖 | [ADR 0003](docs/decisions/0003-video-encoding-ffmpeg-min-openh264.md) |
-| UI | 原生 Win32（对比 egui 后选定；GUI 进程 25 MB vs 175 MB） | [ADR 0004](docs/decisions/0004-ui-stack-comparison.md) |
-| Qt 类软件 | 无画布子窗口（alien widgets）→ 只能录整个窗口，建议 Canvas-only 模式 | [ADR 0005](docs/decisions/0005-qt-apps-no-canvas-child.md) |
+| Path | Content |
+|---|---|
+| `output\timelapse.mp4` | exported video (fixed name — **a new export overwrites it**) |
+| `cache\<timestamp>_<process>\` | JPEG/PNG frames of one session + `markers.json` |
+| `canlapse.log` | startup / pick / record / encode diagnostics |
+| `crash.log` | only if the app crashed (panic or unhandled exception) |
 
-抓帧这一项是产品的技术核心，已用原型严格实测（跨进程 + 遮挡 + 最小化三态，逐像素自证）：
+Both logs live next to the executable; a copy is also written to `%LOCALAPPDATA%\CanLapse\` for support.
 
-* **可用**：宿主窗口 + `PrintWindow(宿主, PW_RENDERFULLCONTENT)` ——
-  目标**可见 / 被完全遮挡 / 已最小化**三种状态下都能取到正确画面；
-* **不可用**：`BitBlt` 读缩略图（恒为宿主自绘底色）；屏幕抓取（被遮挡即失效）；
-  直接 `PrintWindow` 源窗口（在 Chromium 上直接返回失败，应用相关性太强）；
-* 额外收益：抓到的**只有目标窗口自身的内容**，压在它上面的其他窗口不会进入画面。
+Optional environment variables: `CANLAPSE_CACHE` (cache root), `CANLAPSE_LANG=en|zh` (force UI language,
+mainly for testing).
 
-## 用法
+---
+
+## Build from source
+
+Prerequisites: Rust (MSVC toolchain), Visual Studio Build Tools with the Windows SDK.
+**The static ffmpeg/openh264 libraries are vendored** in `deps/ffmpeg-static/`, so a plain build produces
+the same single-file executable — no external SDK required.
 
 ```powershell
-# 推荐：一键构建（cargo build + 构建后注入图标/版本信息）
-pwsh -File tools\build.ps1                  # debug
-pwsh -File tools\build.ps1 -Profile release # release
+# debug build + icon/version injection
+pwsh -File tools\build.ps1
 
-# ⚠️ 直接 cargo build 不会注入图标与版本信息（资源是构建后注入的，见下文）
-cargo build --offline
+# release build (what ships)
+pwsh -File tools\build.ps1 -Profile release
 
-.\target\debug\CanLapse.exe                                       # 图形界面（双击这个；无控制台）
-.\target\debug\canlapse-cli.exe list                              # 列出可见顶层窗口
-.\target\debug\canlapse-cli.exe pick                              # 鼠标拾取画布窗口
-.\target\debug\canlapse-cli.exe doctor                            # 自检：抓帧/编码/运行时 DLL/缓存
-.\target\debug\canlapse-cli.exe record --pick --fps 2 --threshold 0.01 # 录制（Esc 停止，F8 打标记）
-.\target\debug\canlapse-cli.exe record --title SAI --duration 30 --name 下雨天
-.\target\debug\canlapse-cli.exe sessions                          # 历史缓存会话
-.\target\debug\canlapse-cli.exe encode --session "<会话目录>" --fps 10 --quality high
-cargo test --offline                                              # 单元测试
+# assemble dist\CanLapse-v<version>-win64.zip (exe + 使用说明.txt only)
+pwsh -File tools\package.ps1 -Version 1.2.1
+
+# tests (34)
+cargo test --offline
 ```
 
-缓存默认在 `%LOCALAPPDATA%\CanLapse\cache`，可用 `--out` 或环境变量 `CANLAPSE_CACHE` 覆盖。
+Notes:
 
-**构建依赖**：自编译最小 ffmpeg 的位置按以下顺序解析 ——
-`CANLAPSE_FFMPEG_MIN` → `tools\ffmpeg-min.path`（一行路径）→ 本机已知位置
-（`D:\CapLite\ffmpeg-min`、`D:\ffmpeg各版本\CapLite_c\ffmpeg-min` 等）。
-本机 `D:\CapLite` 被整体挪到 `D:\ffmpeg各版本\CapLite_c` 后，`build.rs` 与 `doctor` 都会自动找到。
+- `.cargo/config.toml` sets `-C target-feature=+crt-static`; `build.rs` statically links
+  `avformat/avcodec/swscale/swresample/avutil/openh264` plus the Windows system libraries, and finds the
+  vendored libs automatically (override with `CANLAPSE_FFMPEG_STATIC`).
+- Resource injection (icon + version info) happens **after** linking via `tools\embed-resources.ps1`;
+  run the build and the injection script as a pair (that is what `build.ps1` does).
+- Rebuilding the static libraries themselves (only needed when bumping ffmpeg/openh264) is documented in
+  [`deps/ffmpeg-static/README.md`](deps/ffmpeg-static/README.md).
 
-**排查日志**：默认开启 —— 主日志 `%LOCALAPPDATA%\CanLapse\canlapse.log`，
-并在 **exe 同目录**留一份 `canlapse.log` 镜像（沙箱/只读环境下也能拿到）。
-`CANLAPSE_LOG=<路径>` 可指定主日志，`CANLAPSE_NOLOG=1` 关闭；超过 4MB 自动轮转为 `.old`。
-拾取过程会记录光标经过的窗口层级、点击结果、抓帧器输出尺寸与失败原因 ——
-遇到"点不上/预览不对"直接把日志发出来即可定位。
-
-## 目录结构
+### Project layout
 
 ```
-CanLapse/
-├─ src/                 产品代码（抓帧 / 差分 / 会话 / 图像编解码 / 编码 / 原生 Win32 GUI）
-├─ tools/               构建与打包脚本（build.ps1 一键构建；embed-resources.ps1 资源注入）
-├─ docs/
-│  ├─ requirements.md   v1.0 需求基线
-│  ├─ verification-log.md 验证台账（只记跑出来的事实）
-│  └─ decisions/        架构决策记录（ADR 0001~0005）
-├─ spikes/              技术验证原型（保留作为依据，不属于产品代码）
-│  ├─ dwm-capture/      DWM 抓帧可行性原型 + FINDINGS.md + 实测截图
-│  └─ encode-mp4/       离线 H.264/MP4 编码原型 + FINDINGS.md + out.mp4
-└─ ...
+src/                  Rust sources (ui/, capture.rs, recorder.rs, encode/, session.rs, lang.rs, …)
+deps/ffmpeg-static/   vendored MSVC static libs + licenses + rebuild notes
+tools/                build.ps1, package.ps1, embed-resources.ps1, ResInject.cs, 使用说明.txt
+docs/evidence/        screenshots used in this README and in the logs
+tests/                integration tests
 ```
 
-## 已知风险
+---
 
-1. **⚠️ 授权**：libopenh264 是**自己编译的静态库**，
-   Cisco 代付 MPEG-LA 版税的承诺只覆盖官方二进制下载 → **H.264 版税责任在发布方**。
-   发布前必须处理。详见 [ADR 0003](docs/decisions/0003-video-encoding-ffmpeg-min-openh264.md)。
-2. **DLL 部署**：`avcodec-63.dll` 依赖 `libwinpthread-1.dll`，而 `ffmpeg-min\bin` 里没有它；
-   发错版本会以 `0xC0000139` 启动失败。
-3. **超大画布**：产品路径实测 3840×2160 可抓可编码，但**桌面之外的部分是黑的**
-   —— 窗口比桌面大时，屏幕外区域源窗口从未绘制，DWM 缩略图拿不到内容。
-   这是"缩略图 = 屏幕合成结果"的固有边界。
-4. **依赖实现行为**：`缩略图 + PW_RENDERFULLCONTENT` 没有微软的明确文档承诺，
-   代码里已有纯色画面告警作为兜底。
-5. **目标应用差异**：SAI2 / CSP / Photoshop / Krita 均已实测可拾取（Qt 类软件无画布子窗口，
-   只能录整个窗口，见 ADR 0005；建议按 `Tab` 进 Canvas-only 模式）。
+## Troubleshooting
 
-## 许可
+| Symptom | Cause / fix |
+|---|---|
+| Preview shows toolbars and layer panels | The canvas is not a floating window. Click **How to Locate** for per-app steps. |
+| “Desktop composition (DWM) is off” | DWM is disabled on this machine/session; thumbnail capture is unavailable. |
+| Recorded area is black outside the screen | The DWM thumbnail only contains on-screen pixels; keep the canvas on a visible monitor. |
+| No frames at all | The canvas never changed during the recording — the session is discarded with a notice. |
+| Video is short | Playback is fixed at 30 fps; `seconds = frames / 30`. Raise frame density for more frames. |
 
-[MIT](LICENSE)。注意第三方组件的许可与版税义务见上方"已知风险"。
+---
+
+## Known limitations
+
+- Canvas picking is manual by design (no auto-detection of “the canvas”).
+- Only the on-screen part of a window is captured.
+- Session frames are lossy JPEG (q85); re-exporting decodes once, without compounding loss.
+- Encoding is single-threaded: roughly 8–9 frames/s at 982×812 on a typical desktop CPU
+  (hardware encoders are on the v1.3 list).
+- Output filename is fixed (`timelapse.mp4`); rename or move the file to keep several exports.
+- The floating bar position is not persisted (it snaps back to the top-right each session).
+
+---
+
+## Documentation
+
+- [CHANGELOG.md](CHANGELOG.md) — version history (English + Chinese).
+- [完工日志.md](完工日志.md) — Chinese completion/seal log: deliverables, verification matrix, build
+  archaeology, per-version supplements (v1.1 i18n, v1.2 single-file).
+- [项目总结.md](项目总结.md) — Chinese design notes: architecture, measured numbers, pitfalls.
+- [使用说明.txt](tools/使用说明.txt) — bilingual end-user guide shipped in the zip.
+
+---
+
+## License
+
+- **CanLapse source code**: MIT — see [LICENSE](LICENSE).
+- **ffmpeg 9.0.2**: LGPL-2.1-or-later, statically linked (no GPL components enabled) —
+  see [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
+- **OpenH264 2.6.0**: BSD-2-Clause, statically linked — see [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
+
+The release executable embeds LGPL-licensed ffmpeg code. If you redistribute the binary, keep this README
+and the notices with it, and note that relinking against a modified ffmpeg is possible by following the
+build instructions above.

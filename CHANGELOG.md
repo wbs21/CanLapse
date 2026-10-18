@@ -1,5 +1,18 @@
 # 变更日志
 
+## v1.2.2 — 2026-10-18
+
+### 文档
+
+- **README 重写为英文为主**：定位、亮点、快速上手、系统要求、工作原理图、参数表、文件与日志、
+  从源码构建（静态库已随仓库）、项目结构、故障排查、已知限制、文档索引、许可。
+- **新增 `THIRD-PARTY-NOTICES.md`**：ffmpeg 9.0.2（LGPL-2.1+，静态链接，已说明 §6 relink 途径）、
+  OpenH264 2.6.0（BSD-2）、MSVC 静态 CRT、Windows 系统库、Rust crates 许可清单。
+- **交付包内补许可文件**：`LICENSE`、`THIRD-PARTY-NOTICES.md`、`licenses/` 下 ffmpeg LGPLv2.1
+  与 openh264 BSD 全文（LGPL/BSD 要求随二进制分发）。
+- 版本号 1.2.1 → **1.2.2**（exe 资源 1.2.2.0）。
+
+
 ## v1.2.1 — 2026-10-18
 
 ### 变更
