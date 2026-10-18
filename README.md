@@ -7,7 +7,7 @@
 SAI2 / CLIP STUDIO PAINT / Photoshop / Krita 均实测可迅速锁定画布窗口，
 明细见 [docs/verification-log.md](docs/verification-log.md)。
 
-> 📌 **v1.2.0 已发布（单文件 + 中英双语）**：`CanLapse.exe` 3.8 MB，**静态链接 ffmpeg/openh264 与静态 CRT**，不需要任何 DLL；界面文案跟随系统语言。
+> 📌 **v1.2.1 已发布（单文件 + 中英双语）**：交付包只有 `CanLapse.exe`（3.8 MB，静态链接 ffmpeg/openh264 与静态 CRT）+ 使用说明；静态库已随仓库（`deps/ffmpeg-static`）。
 >
 > 📌 **v1.0.0 封存记录**：[完工日志.md](完工日志.md) —— **封存版**：交付物与 SHA256、最终功能、增补记录、验证矩阵、已知限制、封存规则与验收步骤。
 >

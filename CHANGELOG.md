@@ -1,5 +1,18 @@
 # 变更日志
 
+## v1.2.1 — 2026-10-18
+
+### 变更
+
+- **静态库进仓库**：`deps/ffmpeg-static/lib/*.lib`（ffmpeg 5 个 + openh264，共 35.6 MB）随仓库走，
+  `build.rs` 优先使用它 —— 任何机器 clone 后即可编出单文件 release，不再依赖某台机器的 `D:\tools`。
+  目录内附 `README.md`（构建参数）与 `licenses/`（ffmpeg LGPLv2.1、openh264 BSD）。
+- **release 包不再附带 `canlapse-cli.exe`**：GUI 是唯一交付物（CLI 仅开发/排障用，源码里仍保留），
+  `tools/package.ps1` 固定只打 `CanLapse.exe + 使用说明.txt`。
+- `使用说明.txt` 重写为中英双语、单文件版（去掉了“必须带 DLL”的过时说法），改在 `tools/` 维护。
+- 版本号 1.2.0 → **1.2.1**（exe 资源 1.2.1.0）。
+
+
 ## v1.2.0 — 2026-10-18
 
 ### 新增 / 变更

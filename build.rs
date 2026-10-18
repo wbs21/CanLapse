@@ -111,6 +111,10 @@ fn find_ffmpeg_static() -> Option<PathBuf> {
             }
         }
     }
+    // 仓库内自带的静态库最优先：clone 下来就能编，不依赖某台机器的外部目录
+    if let Ok(dir) = env::var("CARGO_MANIFEST_DIR") {
+        cands.push(PathBuf::from(&dir).join("deps").join("ffmpeg-static"));
+    }
     cands.push(PathBuf::from(r"D:\tools\ffmpeg-static-msvc"));
 
     for c in cands {
