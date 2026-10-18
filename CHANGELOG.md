@@ -1,5 +1,28 @@
 # 变更日志
 
+## v1.2.0 — 2026-10-18
+
+### 新增 / 变更
+
+- **单文件分发：ffmpeg 改为静态链接，CRT 改为静态，交付物只剩一个 exe**
+  - 根因：之前用的 `ffmpeg-min` 是 **shared（动态）构建**，只有导入库
+    `avcodec.lib`（127 KB）+ `avcodec-63.dll` 等 6 个 DLL，运行时必须带 DLL；
+    另有 MSVC 动态 CRT（`vcruntime140.dll`）与 MinGW 线程库（`libwinpthread-1.dll`）。
+  - 现在用 **MSVC 静态构建** ffmpeg 9.0.2（`--enable-static --disable-shared`，
+    仅保留 avcodec/avformat/avutil/swscale/swresample + libopenh264 编码 + mp4 封装），
+    以及 openh264 2.6.0 的 MSVC 静态库。
+  - Rust 侧加 `.cargo/config.toml`：`-C target-feature=+crt-static`（去掉 vcruntime140）。
+  - `build.rs` 改成**双模式**：检测到静态库（`lib\avcodec.lib` > 1 MB）就静态链接 ffmpeg
+    + 21 个 Windows 系统库并跳过 DLL 部署；否则回退旧动态模式。
+  - 结果：`CanLapse.exe` **3.79 MB，单文件**，导入表只剩系统 DLL
+    （user32/gdi32/kernel32/dwmapi/comctl32/bcrypt…），`doctor` 显示
+    「静态链接 ✓ 不需要任何 ffmpeg/VC 运行库 DLL」。
+- 静态库位置：`D:\tools\ffmpeg-static-msvc\lib\`（可用 `CANLAPSE_FFMPEG_STATIC`
+  或 `tools\ffmpeg-static.path` 改），源码/构建脚本见 `docs/` 与完工日志第十节。
+- 新增 `tools/package.ps1`：固定"只打 exe + 使用说明"，防止历史 DLL 被误拷回去。
+- 版本号 1.1.0 → **1.2.0**（exe 版本资源 1.2.0.0，标题栏 v1.2.0）。
+
+
 ## v1.1.0 — 2026-10-18
 
 ### 新增

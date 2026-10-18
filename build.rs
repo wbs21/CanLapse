@@ -1,4 +1,13 @@
-//! 链接「自编译最小 ffmpeg（libopenh264）」并把运行时 DLL 部署到 exe 同目录。
+//! 链接 ffmpeg（libopenh264 编码器）：**优先静态链接**，退化为动态链接 + 部署 DLL。
+//!
+//! ## 两种模式
+//!
+//! * **静态（单文件分发，推荐）**：找到 MSVC 静态库（`<dir>\lib\avcodec.lib` 等，
+//!   体积 >1MB 的是静态库、127KB 的是导入库）时，全部 `+crt-static` 链进 exe，
+//!   产物是**单个 exe、零 DLL**。库目录由 `CANLAPSE_FFMPEG_STATIC` /
+//!   `tools\ffmpeg-static.path` / `D:\tools\ffmpeg-static-msvc` 决定。
+//! * **动态（回退）**：只有导入库时，照旧链 `*.lib` 导入表并把运行时 DLL 拷到
+//!   exe 同目录（那时进程启动就要解析 DLL，`main()` 里的 SetDllDirectory 来不及）。
 //!
 //! 为什么必须部署 DLL：我们用的是**导入库静态链接**，`avcodec-63.dll` 等会在
 //! **进程启动时**由加载器解析 —— 那时 `main()` 还没执行，
@@ -65,7 +74,65 @@ fn find_ffmpeg_min() -> PathBuf {
     PathBuf::from(r"D:\CapLite\ffmpeg-min")
 }
 
+/// 静态库清单（顺序：依赖方在前）
+const AV_STATIC_LIBS: [&str; 6] = [
+    "avformat", "avcodec", "swscale", "swresample", "avutil", "openh264",
+];
+
+/// 静态链接 ffmpeg 时需要一起链进来的 Windows 系统库。
+/// 多写几个不存在的库会报 LNK1181，所以只留 ffmpeg/openh264 实际用到的这一组。
+const SYSTEM_LIBS: [&str; 21] = [
+    "bcrypt", "secur32", "ws2_32", "ole32", "oleaut32", "uuid", "shlwapi", "shell32",
+    "advapi32", "user32", "gdi32", "winmm", "strmiids", "mfuuid", "mfplat", "version",
+    "psapi", "crypt32", "uxtheme", "dwmapi", "comdlg32",
+];
+
+/// 找 MSVC 静态库目录（`<dir>\lib\avcodec.lib`）
+///
+/// 判断"是不是静态库"用体积：导入库约 127KB，静态库 6–8MB。
+fn find_ffmpeg_static() -> Option<PathBuf> {
+    let mut cands: Vec<PathBuf> = Vec::new();
+    for key in ["CANLAPSE_FFMPEG_STATIC", "FFMPEG_STATIC_DIR"] {
+        if let Ok(v) = env::var(key) {
+            if !v.trim().is_empty() {
+                cands.push(PathBuf::from(v));
+            }
+        }
+    }
+    if let Ok(dir) = env::var("CARGO_MANIFEST_DIR") {
+        let hint = PathBuf::from(&dir).join("tools").join("ffmpeg-static.path");
+        if let Ok(txt) = fs::read_to_string(&hint) {
+            if let Some(line) = txt
+                .lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty() && !l.starts_with('#'))
+            {
+                cands.push(PathBuf::from(line.trim_matches('"')));
+            }
+        }
+    }
+    cands.push(PathBuf::from(r"D:\tools\ffmpeg-static-msvc"));
+
+    for c in cands {
+        let lib = c.join("lib");
+        let probe = lib.join("avcodec.lib");
+        if let Ok(meta) = fs::metadata(&probe) {
+            if meta.len() > 1_000_000 {
+                return Some(c);
+            }
+        }
+    }
+    None
+}
+
 fn main() {
+    if let Some(dir) = find_ffmpeg_static() {
+        link_static(&dir);
+        embed_manifest();
+        compile_resources();
+        // 单文件分发：不再部署任何 DLL
+        return;
+    }
     let root = find_ffmpeg_min();
     let bin = root.join("bin");
 
@@ -146,44 +213,17 @@ fn compile_resources() {
         }
     }
 
-    // 关键一步：把 .res 打成**静态库**再链接。
+    // 资源（图标 + 版本信息）不在这里链入 exe。
     //
-    // 为什么不能直接把 .res 当链接输入：
-    //   * `cargo:rustc-link-arg=<res>`      —— 裸路径没进链接命令行（实测）
-    //   * `cargo:rustc-link-arg-bins=<res>` —— 进了，但 link.exe 报 LNK1123
-    //     （它把 .res 当对象文件去做 COFF 转换，失败了）
-    // 走"资源库 + /WHOLEARCHIVE"这条路：link-lib / link-search 是 rustc 的
-    // 常规能力，/WHOLEARCHIVE 是标准 flag（flag 形式的 link-arg 实测可达链接器），
-    // 而 /WHOLEARCHIVE 同时解决了"资源库里没有符号、可能被整体丢弃"的问题。
-    let Some(lib_exe) = find_tool("lib.exe") else {
-        println!("cargo:warning=找不到 lib.exe，资源未链入 exe");
-        return;
-    };
-    let res_lib = PathBuf::from(&out_dir).join("CanLapse_res.lib");
-    let lib_status = std::process::Command::new(&lib_exe)
-        .arg("/nologo")
-        .arg(format!("/out:{}", res_lib.display()))
-        .arg(&res)
-        .status();
-    match lib_status {
-        Ok(s) if s.success() && res_lib.is_file() => {
-            // 两个都要：
-            //   * link-lib 让该库**成为链接输入**（否则 /WHOLEARCHIVE:名字 找不到它）
-            //   * /WHOLEARCHIVE 强制包含全部成员 —— 资源库里没有符号，
-            //     不强制的话链接器会认为"没人引用"而整体丢弃
-            println!("cargo:rustc-link-search=native={out_dir}");
-            println!("cargo:rustc-link-lib=static=CanLapse_res");
-            println!("cargo:rustc-link-arg=/WHOLEARCHIVE:CanLapse_res.lib");
-            println!(
-                "cargo:warning=资源库已生成（{} 字节）并已作为链接输入请求 /WHOLEARCHIVE，\
-                 但实测**未生效**（exe 的版本信息仍为空、图标仍是默认）——\
-                 详见本函数顶部关于三种尝试的注释",
-                std::fs::metadata(&res_lib).map(|m| m.len()).unwrap_or(0)
-            );
-        }
-        Ok(s) => println!("cargo:warning=lib.exe 退出码 {s}，资源未链入"),
-        Err(e) => println!("cargo:warning=调用 lib.exe 失败：{e}，资源未链入"),
-    }
+    // 试过三种方式，全都不行：`rustc-link-arg=<res>`（裸路径没进链接命令行）、
+    // `rustc-link-arg-bins=<res>`（link.exe 报 LNK1123，把 .res 当 COFF）、
+    // 「lib.exe 打成静态库 + /WHOLEARCHIVE」（lib.exe 退出码 1109）。
+    // 现在统一由 `tools\embed-resources.ps1` 在构建后把资源**注入** exe，
+    // 这条路径实测可靠（见 build.ps1）。
+    println!(
+        "cargo:warning=已生成 {}（资源注入由 tools\\embed-resources.ps1 完成）",
+        res.display()
+    );
 }
 
 /// 在 Windows SDK / MSVC 工具链目录里找工具（取版本号最大的那个）。
@@ -361,4 +401,21 @@ fn find_winpthread(root: &Path) -> Option<PathBuf> {
         r"D:\tools\msys64\mingw64\bin\libwinpthread-1.dll",
     ));
     candidates.into_iter().find(|p| p.is_file())
+}
+
+/// 静态链接：把 ffmpeg/openh264 静态库和系统库一起链进 exe（配合 `+crt-static`）
+fn link_static(dir: &Path) {
+    let lib = dir.join("lib");
+    println!("cargo:warning=静态链接 ffmpeg：{}", lib.display());
+    println!("cargo:rustc-cfg=ffmpeg_static");
+    println!("cargo:rustc-link-search=native={}", lib.display());
+    for l in AV_STATIC_LIBS {
+        println!("cargo:rustc-link-lib=static={l}");
+    }
+    for l in SYSTEM_LIBS {
+        println!("cargo:rustc-link-lib={l}");
+    }
+    println!("cargo:rerun-if-env-changed=CANLAPSE_FFMPEG_STATIC");
+    println!("cargo:rerun-if-env-changed=FFMPEG_STATIC_DIR");
+    println!("cargo:rerun-if-changed=tools/ffmpeg-static.path");
 }

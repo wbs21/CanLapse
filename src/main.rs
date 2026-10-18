@@ -440,6 +440,10 @@ fn cmd_doctor() -> i32 {
     );
     println!("  avcodec 构建配置：{}", encode::backend_info());
 
+    if cfg!(ffmpeg_static) {
+        println!("\n[运行时 DLL]");
+        println!("  静态链接 ✓ 单个 exe，不需要任何 ffmpeg/VC 运行库 DLL");
+    } else {
     println!("\n[运行时 DLL]（导入表在进程启动时就要解析，必须在 exe 同目录）");
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
@@ -462,6 +466,7 @@ fn cmd_doctor() -> i32 {
                 }
             }
         }
+    }
     }
 
     println!("\n[缓存]");
