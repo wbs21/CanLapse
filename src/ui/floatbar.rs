@@ -11,6 +11,8 @@
 //! * `WS_EX_NOACTIVATE` 保证点击不把焦点从绘画软件抢走。
 
 use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
+
+use crate::lang;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
@@ -259,9 +261,9 @@ unsafe fn paint(hwnd: HWND) {
 
     // 三个扁平按钮（悬停/按下才画底，平时完全透明，避免"灰边"观感）
     let labels = [
-        if shared.is_paused() { "继续" } else { "暂停" },
-        "标记",
-        "停止",
+        if shared.is_paused() { lang::s(lang::K::ResumeBtn) } else { lang::s(lang::K::PauseBtn) },
+        lang::s(lang::K::MarkBtn),
+        lang::s(lang::K::StopBtn),
     ];
     let hover = HOVER.load(Ordering::Relaxed);
     let pressed = PRESSED.load(Ordering::Relaxed);
@@ -304,18 +306,18 @@ unsafe fn paint(hwnd: HWND) {
     DeleteObject(dv as _);
 
     // 信息文案："00:12 · 3 帧"（暂停时补一句原因，缩短到能放下）
-    let mut info = format!(
-        "{} · {} 帧",
-        recorder::format_duration(shared.elapsed_ms()),
-        shared.frames()
+    let frames_key = if shared.frames() == 1 { lang::K::BarFrameOne } else { lang::K::BarFrames };
+    let mut info = lang::f(
+        frames_key,
+        &[&recorder::format_duration(shared.elapsed_ms()), &shared.frames()],
     );
     if shared.markers() > 0 {
-        info.push_str(&format!(" · {} 标记", shared.markers()));
+        info.push_str(&format!(" · {}", lang::f(lang::K::BarMarked, &[&shared.markers()])));
     }
     if shared.fg_paused() {
-        info = format!("{} · 回到画布继续", recorder::format_duration(shared.elapsed_ms()));
+        info = format!("{} · {}", recorder::format_duration(shared.elapsed_ms()), lang::s(lang::K::BarBackToCanvas));
     } else if shared.is_paused() {
-        info.push_str(" · 已暂停");
+        info.push_str(&format!(" · {}", lang::s(lang::K::BarPaused)));
     }
     let rc = RECT {
         left: info_x,
@@ -466,12 +468,15 @@ unsafe fn invalidate(hwnd: HWND) {
 unsafe fn update_title(hwnd: HWND) {
     let Ok(guard) = BAR_SHARED.lock() else { return };
     let Some(shared) = guard.as_ref() else { return };
-    let t = win::wide(&format!(
-        "{} · {} 帧{}",
-        recorder::format_duration(shared.elapsed_ms()),
-        shared.frames(),
-        if shared.is_paused() { " · 已暂停" } else { "" }
-    ));
+    let frames_key = if shared.frames() == 1 { lang::K::BarFrameOne } else { lang::K::BarFrames };
+    let mut title = lang::f(
+        frames_key,
+        &[&recorder::format_duration(shared.elapsed_ms()), &shared.frames()],
+    );
+    if shared.is_paused() {
+        title.push_str(&format!(" · {}", lang::s(lang::K::BarPaused)));
+    }
+    let t = win::wide(&title);
     SetWindowTextW(hwnd, t.as_ptr());
 }
 

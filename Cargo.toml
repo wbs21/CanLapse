@@ -1,6 +1,6 @@
 [package]
 name = "canlapse"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 rust-version = "1.75"
 description = "面向手绘创作者的 Windows 画布窗口缩时录屏工具"
@@ -23,6 +23,7 @@ path = "src/bin/canlapse-gui.rs"
 [dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_Globalization",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
     "Win32_Storage_Xps",

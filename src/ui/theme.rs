@@ -80,7 +80,7 @@ fn with_state<R>(f: impl FnOnce(&mut HashMap<isize, State>) -> R) -> R {
 
 pub fn font() -> HGDIOBJ {
     let f = *FONT.get_or_init(|| unsafe {
-        let face = win::wide("Microsoft YaHei UI");
+        let face = win::wide(crate::lang::ui_font_face());
         let mut f = CreateFontW(-11, 0, 0, 0, FW_NORMAL as i32, 0, 0, 0, 1, 0, 0, 0, 0, face.as_ptr())
             as isize;
         if f == 0 {
@@ -100,7 +100,7 @@ pub fn bg_brush() -> HBRUSH {
 /// 15px 标题字体：合成遮罩的"视频合成中"用
 pub fn heading_font() -> HGDIOBJ {
     let f = *HEADING.get_or_init(|| unsafe {
-        let face = win::wide("Microsoft YaHei UI");
+        let face = win::wide(crate::lang::ui_font_face());
         let v = CreateFontW(-15, 0, 0, 0, FW_NORMAL as i32, 0, 0, 0, 1, 0, 0, 0, 0, face.as_ptr())
             as isize;
         if v == 0 {
@@ -115,7 +115,7 @@ pub fn heading_font() -> HGDIOBJ {
 /// 9px 小字体：窄按钮放不下时自动降一档
 pub fn small_font() -> HGDIOBJ {
     let f = *SMALL_FONT.get_or_init(|| unsafe {
-        let face = win::wide("Microsoft YaHei UI");
+        let face = win::wide(crate::lang::ui_font_face());
         let v = CreateFontW(-9, 0, 0, 0, FW_NORMAL as i32, 0, 0, 0, 1, 0, 0, 0, 0, face.as_ptr())
             as isize;
         if v == 0 {
