@@ -6,7 +6,7 @@ Pick a canvas window once, and CanLapse quietly captures it on a schedule, keeps
 actually changed, and exports a 30 fps MP4 when you stop. Built for digital painters using SAI2,
 Photoshop, CLIP STUDIO PAINT or Krita.
 
-`v1.3.0` · single-file executable · no DLLs · English / 中文 UI (follows system language)
+`v1.3.1` · single-file executable · no DLLs · English / 中文 UI (follows system language)
 
 ![Main window](docs/evidence/ui-main-en.png)
 
@@ -35,7 +35,7 @@ Photoshop, CLIP STUDIO PAINT or Krita.
 
 ## Quick start
 
-1. Extract `CanLapse-v1.3.0-win64.zip` to any writable folder (for example `D:\Tools\CanLapse`).
+1. Extract `CanLapse-v1.3.1-win64.zip` to any writable folder (for example `D:\Tools\CanLapse`).
 2. Run `CanLapse.exe`.
 3. Click **Pick Window** — CanLapse minimizes itself and shows *“Click the canvas border”*.
    Click the canvas (its border or its content; `Esc`/right-click cancels).
@@ -75,7 +75,7 @@ canvas HWND ──► DWM thumbnail (DwmRegisterThumbnail + rcSource crop)
               JPEG q85 frame      PNG frame      → cache\<session>\frame_NNNN.*
                      │
                      ▼
-   static ffmpeg 9.0.2 (libavformat + libopenh264)  →  H.264 High, 30 fps, 2 s GOP
+   static ffmpeg 9.0.2 (libavformat + libopenh264)  →  H.264 High, 30 fps, 1 s GOP
                      │
                      ▼
               output\timelapse_YYYYMMDD-HHMMSS.mp4
@@ -134,9 +134,9 @@ pwsh -File tools\build.ps1
 pwsh -File tools\build.ps1 -Profile release
 
 # assemble dist\CanLapse-v<version>-win64.zip (exe + 使用说明.txt only)
-pwsh -File tools\package.ps1 -Version 1.2.1
+pwsh -File tools\package.ps1 -Version 1.3.0
 
-# tests (34)
+# tests (48 unit + 4 integration)
 cargo test --offline
 ```
 
@@ -157,7 +157,7 @@ src/                  Rust sources (ui/, capture.rs, recorder.rs, encode/, sessi
 deps/ffmpeg-static/   vendored MSVC static libs + licenses + rebuild notes
 tools/                build.ps1, package.ps1, embed-resources.ps1, ResInject.cs, 使用说明.txt
 docs/evidence/        screenshots used in this README and in the logs
-tests/                integration tests
+spikes/               diagnostic prototypes and capture/encode evidence
 ```
 
 ---
@@ -206,3 +206,4 @@ tests/                integration tests
 The release executable embeds LGPL-licensed ffmpeg code. If you redistribute the binary, keep this README
 and the notices with it, and note that relinking against a modified ffmpeg is possible by following the
 build instructions above.
+

@@ -22,10 +22,9 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetDlgCtrlID, GetParent,
     GetWindowLongPtrW, GetWindowRect, PostMessageW, RegisterClassW, SendMessageW,
-    SetWindowLongPtrW, ShowWindow, GWLP_USERDATA, SW_SHOWNOACTIVATE, WM_COMMAND,
-    WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT,
-    WM_SETFONT, WNDCLASSW, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
+    SetWindowLongPtrW, ShowWindow, GWLP_USERDATA, SW_SHOWNOACTIVATE, WM_COMMAND, WM_DESTROY,
+    WM_ERASEBKGND, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_SETFONT, WNDCLASSW,
+    WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
 };
 
 use windows_sys::Win32::UI::Controls::WM_MOUSELEAVE;
@@ -56,7 +55,9 @@ static FIELDS: Mutex<Option<HashMap<isize, FieldData>>> = Mutex::new(None);
 static OPEN: AtomicIsize = AtomicIsize::new(0);
 
 fn with_field<R>(hwnd: HWND, f: impl FnOnce(&mut FieldData) -> R) -> Option<R> {
-    let mut g = FIELDS.lock().ok()?;
+    let mut g = FIELDS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let map = g.get_or_insert_with(HashMap::new);
     let st = map.get_mut(&(hwnd as isize))?;
     Some(f(st))
@@ -132,7 +133,9 @@ pub unsafe fn set_items(hwnd: HWND, items: &[&str]) {
 }
 
 pub unsafe fn set_sel(hwnd: HWND, idx: usize) {
-    with_field(hwnd, |st| st.sel = idx.min(st.items.len().saturating_sub(1)));
+    with_field(hwnd, |st| {
+        st.sel = idx.min(st.items.len().saturating_sub(1))
+    });
     InvalidateRect(hwnd, std::ptr::null(), 0);
 }
 
@@ -161,10 +164,7 @@ unsafe fn paint_field(hwnd: HWND) {
     let (w, h) = (rc.right, rc.bottom);
 
     let (text, hover) = with_field(hwnd, |st| {
-        (
-            st.items.get(st.sel).cloned().unwrap_or_default(),
-            st.hover,
-        )
+        (st.items.get(st.sel).cloned().unwrap_or_default(), st.hover)
     })
     .unwrap_or_default();
     let open = OPEN.load(Ordering::SeqCst) != 0;
@@ -199,7 +199,7 @@ unsafe fn paint_field(hwnd: HWND) {
         right: w - 24,
         bottom: h,
     };
-    theme::text(dc, &text, text_rc, theme::TEXT, 0x0000_0000 | 0x0000_0004);
+    theme::text(dc, &text, text_rc, theme::TEXT, 0x0000_0004);
 
     // 右侧小箭头
     let cx = w - 14;
@@ -221,7 +221,7 @@ unsafe fn paint_field(hwnd: HWND) {
     SelectObject(dc, op2);
     DeleteObject(pen2);
     SelectObject(dc, old);
-    EndPaint(hwnd, &mut ps);
+    EndPaint(hwnd, &ps);
 }
 
 unsafe extern "system" fn field_proc(
@@ -366,17 +366,21 @@ unsafe fn paint_popup(hwnd: HWND) {
         if d.hover_row == i as isize {
             theme::fill_round(dc, row, theme::HOVER, 8);
         }
-        let color = if d.sel == i { theme::ACCENT } else { theme::TEXT };
+        let color = if d.sel == i {
+            theme::ACCENT
+        } else {
+            theme::TEXT
+        };
         let tr = RECT {
             left: 12,
             top,
             right: w - 8,
             bottom: top + ROW_H,
         };
-        theme::text(dc, item, tr, color, 0x0000_0000 | 0x0000_0004);
+        theme::text(dc, item, tr, color, 0x0000_0004);
     }
     SelectObject(dc, old);
-    EndPaint(hwnd, &mut ps);
+    EndPaint(hwnd, &ps);
 }
 
 unsafe extern "system" fn popup_proc(
@@ -410,7 +414,7 @@ unsafe extern "system" fn popup_proc(
                 let mut field: HWND = std::ptr::null_mut();
                 if let Some(data) = popup_data(hwnd) {
                     let d = &*data;
-                    let row = ((y - 4) / ROW_H) as i32;
+                    let row = (y - 4) / ROW_H;
                     if row >= 0 && (row as usize) < d.items.len() {
                         sel = Some(row as usize);
                     }
@@ -443,6 +447,15 @@ unsafe extern "system" fn popup_proc(
                     if p != 0 {
                         DestroyWindow(p as HWND);
                     }
+                }
+                0
+            }
+            // 鼠标捕获被别的窗口抢走时弹层已经失去交互意义，直接关闭，
+            // 避免留下一个挡住界面的 topmost 窗口。
+            0x0215 => {
+                let p = OPEN.swap(0, Ordering::SeqCst);
+                if p == hwnd as isize {
+                    DestroyWindow(hwnd);
                 }
                 0
             }

@@ -28,7 +28,11 @@ use std::path::{Path, PathBuf};
 /// 运行时需要的 DLL：4 个 av* 由我们的导入表直接引用，
 /// swresample 与 avfilter 没有；libwinpthread 是 avcodec 的依赖。
 const AV_DLL_PREFIXES: [&str; 5] = [
-    "avformat-", "avcodec-", "avutil-", "swscale-", "swresample-",
+    "avformat-",
+    "avcodec-",
+    "avutil-",
+    "swscale-",
+    "swresample-",
 ];
 
 /// 找自编译最小 ffmpeg 的根目录。
@@ -58,33 +62,26 @@ fn find_ffmpeg_min() -> PathBuf {
             }
         }
     }
-    let candidates = [
-        r"D:\CapLite\ffmpeg-min",
-        r"D:\ffmpeg各版本\CapLite_c\ffmpeg-min",
-        r"D:\WorkbuddyWW\CapLite\ffmpeg-min",
-        r"D:\tools\ffmpeg-min-new",
-    ];
-    for c in candidates {
-        let p = PathBuf::from(c);
-        if p.join("bin").join("avformat.lib").is_file() {
-            println!("cargo:warning=使用 ffmpeg-min：{}", p.display());
-            return p;
-        }
-    }
-    PathBuf::from(r"D:\CapLite\ffmpeg-min")
+    // 找不到：返回空路径，让调用方统一 panic 并提示设置环境变量
+    PathBuf::new()
 }
 
 /// 静态库清单（顺序：依赖方在前）
 const AV_STATIC_LIBS: [&str; 6] = [
-    "avformat", "avcodec", "swscale", "swresample", "avutil", "openh264",
+    "avformat",
+    "avcodec",
+    "swscale",
+    "swresample",
+    "avutil",
+    "openh264",
 ];
 
 /// 静态链接 ffmpeg 时需要一起链进来的 Windows 系统库。
 /// 多写几个不存在的库会报 LNK1181，所以只留 ffmpeg/openh264 实际用到的这一组。
 const SYSTEM_LIBS: [&str; 21] = [
-    "bcrypt", "secur32", "ws2_32", "ole32", "oleaut32", "uuid", "shlwapi", "shell32",
-    "advapi32", "user32", "gdi32", "winmm", "strmiids", "mfuuid", "mfplat", "version",
-    "psapi", "crypt32", "uxtheme", "dwmapi", "comdlg32",
+    "bcrypt", "secur32", "ws2_32", "ole32", "oleaut32", "uuid", "shlwapi", "shell32", "advapi32",
+    "user32", "gdi32", "winmm", "strmiids", "mfuuid", "mfplat", "version", "psapi", "crypt32",
+    "uxtheme", "dwmapi", "comdlg32",
 ];
 
 /// 找 MSVC 静态库目录（`<dir>\lib\avcodec.lib`）
@@ -115,7 +112,6 @@ fn find_ffmpeg_static() -> Option<PathBuf> {
     if let Ok(dir) = env::var("CARGO_MANIFEST_DIR") {
         cands.push(PathBuf::from(&dir).join("deps").join("ffmpeg-static"));
     }
-    cands.push(PathBuf::from(r"D:\tools\ffmpeg-static-msvc"));
 
     for c in cands {
         let lib = c.join("lib");
@@ -130,6 +126,9 @@ fn find_ffmpeg_static() -> Option<PathBuf> {
 }
 
 fn main() {
+    // build.rs 会根据是否找到静态库设置 cfg(ffmpeg_static)；显式告诉
+    // rustc 这是一个合法的自定义 cfg，避免 unexpected_cfgs 警告。
+    println!("cargo:rustc-check-cfg=cfg(ffmpeg_static)");
     if let Some(dir) = find_ffmpeg_static() {
         link_static(&dir);
         embed_manifest();
@@ -301,10 +300,7 @@ fn embed_manifest() {
         return;
     }
     println!("cargo:rustc-link-arg=/MANIFEST:EMBED");
-    println!(
-        "cargo:rustc-link-arg=/MANIFESTINPUT:{}",
-        manifest.display()
-    );
+    println!("cargo:rustc-link-arg=/MANIFESTINPUT:{}", manifest.display());
     println!("cargo:rerun-if-changed=CanLapse.manifest");
 }
 
@@ -358,7 +354,9 @@ fn deploy_runtime_dlls(bin: &Path, root: &Path) {
 
     for dir in &targets {
         for src in &wanted {
-            let Some(name) = src.file_name() else { continue };
+            let Some(name) = src.file_name() else {
+                continue;
+            };
             let dst = dir.join(name);
             let same = match (fs::metadata(src), fs::metadata(&dst)) {
                 (Ok(a), Ok(b)) => a.len() == b.len(),
@@ -387,7 +385,10 @@ fn find_winpthread(root: &Path) -> Option<PathBuf> {
         if p.is_file() {
             return Some(p);
         }
-        println!("cargo:warning=CANLAPSE_WINPTHREAD={} 不是文件，忽略", p.display());
+        println!(
+            "cargo:warning=CANLAPSE_WINPTHREAD={} 不是文件，忽略",
+            p.display()
+        );
     }
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Some(parent) = root.parent() {
@@ -401,9 +402,6 @@ fn find_winpthread(root: &Path) -> Option<PathBuf> {
                 .join("libwinpthread-1.dll"),
         );
     }
-    candidates.push(PathBuf::from(
-        r"D:\tools\msys64\mingw64\bin\libwinpthread-1.dll",
-    ));
     candidates.into_iter().find(|p| p.is_file())
 }
 

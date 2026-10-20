@@ -36,9 +36,7 @@ fn detect() -> Lang {
         }
     }
     // 2) 系统 UI 语言：中文（简/繁）→ 中文，其余 → 英文
-    let id = unsafe {
-        windows_sys::Win32::Globalization::GetUserDefaultUILanguage()
-    } as u32;
+    let id = unsafe { windows_sys::Win32::Globalization::GetUserDefaultUILanguage() } as u32;
     let primary = id & 0x3FF; // LANGID 低 10 位为主语言
     if primary == 0x04 {
         Lang::Zh
@@ -119,13 +117,15 @@ keys! {
     CannotDelete    => ("Cannot delete", "无法删除"),
     DeleteFailed    => ("Delete failed", "删除失败"),
     PanelWarnTitle  => ("Check the canvas window", "检查画布窗口"),
+    ExportInProgress => ("An export is still in progress. Please wait.", "视频合成仍在进行中，请稍候。"),
 
     PickFirst       => ("Pick a canvas window first (🎯 Pick Window).", "请先点【🎯 拾取窗口】选择要录制的画布窗口。"),
     NoDwm           => ("Desktop composition (DWM) is off — thumbnail capture is unavailable.", "桌面合成（DWM）未开启，缩略图抓帧不可用。"),
     NoFrames        => ("No frames were saved this time (the picture may never have changed).", "这次没有保存到任何帧（画面可能始终没有变化）。"),
     SelectFirst     => ("Select a session in the list first.", "请先在列表里选择一个会话。"),
     BusyDelete      => ("A session that is recording or exporting cannot be deleted.", "正在录制或正在合成中的会话不能删除。"),
-    DeleteConfirm   => ("Delete session “{}” and all of its PNG frames?", "确定删除会话「{}」及其全部 PNG 帧吗？"),
+    BarFailed       => ("Cannot create the floating control bar. Recording was cancelled.", "无法创建悬浮控制条，录制已取消。"),
+    DeleteConfirm   => ("Delete session “{}” and all of its cached frames?", "确定删除会话「{}」及其全部缓存帧吗？"),
 
     // 帮助正文
     HelpTitle       => ("How to locate the canvas window", "如何定位画布窗口"),
@@ -144,9 +144,9 @@ keys! {
          CSP / 优动漫 PAINT：拖拽画布标签分离，或 视图 → 新建视图\n\
          Krita：窗口 → 新建窗口\n\n\
          💡提示：拾取后看左上角的预览缩略图，如果画面包含工具栏 / 图层面板，说明画布没有浮动。\n\n\
-         ℹ️ 关于遮挡：绘画软件**自己的**浮动面板（SAI2 的「颜色」等）若压在画布上，\n\
-         会照原样录进画面 —— 这是正常的，**不做裁切、也不提示**。\n\
-         而当你切到**其他软件**时，说明此刻没有在画画，录制会**自动暂停**，切回画布即继续。",
+         ℹ️ 关于遮挡：绘画软件自己的浮动面板（SAI2 的「颜色」等）若压在画布上，\n\
+         会照原样录进画面 —— 这是正常的，不做裁切、也不提示。\n\
+         而当你切到其他软件时，说明此刻没有在画画，录制会自动暂停，切回画布即继续。",
     ),
 
     // ---- 合成弹窗 ----
@@ -154,7 +154,7 @@ keys! {
     DlgExporting    => ("Exporting video", "视频合成中"),
     DlgDone         => ("Export complete", "合成完成"),
     DlgFrames       => ("Processed: {} / {} frames", "已处理：{} / {} 帧"),
-    DlgDoneText     => ("Done: {} frames · {:.2} MB · {}x{}\n{}", "合成完成：{} 帧 · {:.2} MB · {}x{}\n{}"),
+    DlgDoneText     => ("Done: {} frames · {} MB · {}x{}\n{}", "合成完成：{} 帧 · {} MB · {}x{}\n{}"),
     DlgCanceledText => ("Cancelled: {} frames written, the file is still playable\n{}", "已取消合成：写入 {} 帧，文件仍可播放\n{}"),
     DlgFailedText   => ("Export failed: {}", "合成失败：{}"),
 
@@ -166,6 +166,8 @@ keys! {
     BarFrames       => ("{} · {} frames", "{} · {} 帧"),
     BarFrameOne     => ("{} · 1 frame", "{} · 1 帧"),
     BarMarked       => ("{} marks", "{} 标记"),
+    BarDropped      => ("{} dropped", "丢帧 {}"),
+    BarBlank        => ("blank capture? check preview", "纯色抓帧？看预览"),
     BarPaused       => ("Paused", "已暂停"),
     BarBackToCanvas => ("Back to canvas to resume", "回到画布继续"),
 
@@ -243,5 +245,29 @@ mod tests {
             assert!(!zh.is_empty());
             assert_ne!(en, zh);
         }
+    }
+
+    #[test]
+    fn 带参数文案只使用顺序占位符() {
+        // lang::fill 只认识 "{}"。模板里一旦出现 "{:.2}" 之类的格式说明，
+        // 参数就会整体错位（v1.3 的导出完成弹窗踩过）。
+        for k in [K::DlgDoneText, K::DlgCanceledText, K::DlgFailedText] {
+            let (en, zh) = k.pair();
+            for t in [en, zh] {
+                assert!(!t.contains("{:"), "模板含不支持的格式占位符: {t}");
+            }
+        }
+        let s = f(
+            K::DlgDoneText,
+            &[&12, &"1.25", &1920, &1080, &"D:\\out.mp4"],
+        );
+        assert!(s.contains("12") && s.contains("1.25") && s.contains("1920"));
+        assert!(s.contains("out.mp4"));
+    }
+
+    #[test]
+    fn 帮助正文不使用消息框不支持的标记() {
+        let (en, zh) = K::HelpBody.pair();
+        assert!(!en.contains("**") && !zh.contains("**"));
     }
 }

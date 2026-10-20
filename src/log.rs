@@ -15,25 +15,27 @@
 //!
 //! 日志里**不写**任何用户画面内容，只写窗口句柄、类名、尺寸、错误串这类诊断信息。
 
+use std::fs::{File, OpenOptions};
+use std::io::{BufWriter, Cursor, Write};
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 /// 实际启用的日志文件（第一个是主日志，第二个通常是 exe 目录的镜像）。
-static SINKS: OnceLock<Vec<PathBuf>> = OnceLock::new();
+/// 存为 `(PathBuf, Mutex<BufWriter<File>>)` —— 句柄持久打开，避免每次 `line()` 都 open+close。
+static SINKS: OnceLock<Vec<(PathBuf, Mutex<BufWriter<File>>)>> = OnceLock::new();
+/// 预打开的崩溃日志句柄。未处理异常回调里不能可靠地做路径解析/分配，
+/// 因此启动时打开好文件，异常时只做一次固定缓冲写入。
+static CRASH: OnceLock<File> = OnceLock::new();
 
 /// 单个日志文件上限：超过就轮转成 `.old`（只留一份），避免长期开着越写越大。
 const MAX_BYTES: u64 = 4 * 1024 * 1024;
 
-/// 尝试打开（必要时创建目录和文件）；成功即认为这个位置可写。
-fn writable(p: &PathBuf) -> bool {
+/// 尝试打开（必要时创建目录和文件）；成功返回打开的文件。
+fn open_log(p: &PathBuf) -> Option<File> {
     if let Some(dir) = p.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(p)
-        .is_ok()
+    OpenOptions::new().create(true).append(true).open(p).ok()
 }
 
 fn rotate(p: &PathBuf) {
@@ -74,12 +76,12 @@ pub fn init() -> Option<PathBuf> {
                 return Vec::new();
             }
             let cands = candidates();
-            let mut sinks: Vec<PathBuf> = Vec::new();
+            let mut sinks: Vec<(PathBuf, Mutex<BufWriter<File>>)> = Vec::new();
             // 主日志 = 第一个可写的位置
             for p in &cands {
-                if writable(p) {
-                    rotate(p);
-                    sinks.push(p.clone());
+                rotate(p);
+                if let Some(f) = open_log(p) {
+                    sinks.push((p.clone(), Mutex::new(BufWriter::new(f))));
                     break;
                 }
             }
@@ -87,21 +89,34 @@ pub fn init() -> Option<PathBuf> {
             if let Ok(exe) = std::env::current_exe() {
                 if let Some(dir) = exe.parent() {
                     let mirror = dir.join("canlapse.log");
-                    if !sinks.contains(&mirror) && writable(&mirror) {
+                    if !sinks.iter().any(|(path, _)| path == &mirror) {
                         rotate(&mirror);
-                        sinks.push(mirror);
+                        if let Some(f) = open_log(&mirror) {
+                            sinks.push((mirror, Mutex::new(BufWriter::new(f))));
+                        }
+                    }
+                }
+            }
+            // 预打开 crash.log
+            if let Some((primary, _)) = sinks.first() {
+                if let Some(dir) = primary.parent() {
+                    if let Some(f) = open_log(&dir.join("crash.log")) {
+                        let _ = CRASH.set(f);
                     }
                 }
             }
             sinks
         })
         .first()
-        .cloned()
+        .map(|(p, _)| p.clone())
 }
 
 /// 当前启用的全部日志路径（主日志在前）。
 pub fn sinks() -> Vec<PathBuf> {
-    SINKS.get().cloned().unwrap_or_default()
+    SINKS
+        .get()
+        .map(|s| s.iter().map(|(p, _)| p.clone()).collect())
+        .unwrap_or_default()
 }
 
 pub fn path() -> Option<PathBuf> {
@@ -113,6 +128,7 @@ pub fn enabled() -> bool {
 }
 
 /// 写一行日志（自动加毫秒级时间戳）。未初始化 / 未开启时是空操作。
+/// 句柄是持久打开的 BufWriter —— 这里只做一次 Mutex 加锁 + 一次 BufWriter 写入。
 pub fn line(msg: &str) {
     let Some(sinks) = SINKS.get() else {
         return;
@@ -121,16 +137,42 @@ pub fn line(msg: &str) {
         return;
     }
     let st = crate::win::local_now();
-    use std::io::Write;
     let text = format!(
         "[{:02}:{:02}:{:02}.{:03}] {}\n",
         st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, msg
     );
-    for p in sinks {
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
-            let _ = f.write_all(text.as_bytes());
+    for (path, writer) in sinks {
+        let mut w = match writer.lock() {
+            Ok(g) => g,
+            Err(_) => continue,
+        };
+        // 轮转检查：如果文件已超过 MAX_BYTES，先 flush 再 rename 并重新打开
+        let _ = w.flush();
+        let needs_rotate = std::fs::metadata(path)
+            .map(|m| m.len() > MAX_BYTES)
+            .unwrap_or(false);
+        if needs_rotate {
+            let _ = std::fs::rename(path, path.with_extension("log.old"));
+            if let Some(new_file) = open_log(path) {
+                *w = BufWriter::new(new_file);
+            }
         }
+        let _ = w.write_all(text.as_bytes());
     }
+}
+
+/// 未处理异常专用：固定栈缓冲 + 预打开句柄，避免在堆可能损坏时分配。
+pub fn crash_line(code: u32, addr: usize) {
+    let Some(file) = CRASH.get() else {
+        return;
+    };
+    let mut buf = [0u8; 192];
+    let mut cursor = Cursor::new(&mut buf[..]);
+    let _ = writeln!(cursor, "[fatal] code=0x{code:08X} addr=0x{addr:X}");
+    let n = cursor.position() as usize;
+    let mut f = file;
+    let _ = f.write_all(&buf[..n]);
+    let _ = f.flush();
 }
 
 /// `logline!` 与 `log::line(&format!(..))` 等价，只是少打一层括号

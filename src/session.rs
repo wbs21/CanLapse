@@ -85,7 +85,8 @@ impl Session {
             dir = root.join(format!("{stamp}_{clean}_{n}"));
             n += 1;
         }
-        fs::create_dir_all(&dir).map_err(|e| format!("创建缓存目录 {} 失败: {e}", dir.display()))?;
+        fs::create_dir_all(&dir)
+            .map_err(|e| format!("创建缓存目录 {} 失败: {e}", dir.display()))?;
         let meta = SessionMeta {
             version: 1,
             name: clean,
@@ -102,7 +103,11 @@ impl Session {
             duration_ms: 0,
             completed: false,
         };
-        Ok(Session { dir, meta, markers: Vec::new() })
+        Ok(Session {
+            dir,
+            meta,
+            markers: Vec::new(),
+        })
     }
 
     pub fn dir(&self) -> &Path {
@@ -163,7 +168,12 @@ impl Session {
     }
 
     /// 收尾：写入最终的 markers.json（含会话元信息）
-    pub fn finish(&mut self, dropped: u32, duration_ms: u64, completed: bool) -> Result<(), String> {
+    pub fn finish(
+        &mut self,
+        dropped: u32,
+        duration_ms: u64,
+        completed: bool,
+    ) -> Result<(), String> {
         self.meta.dropped = dropped;
         self.meta.duration_ms = duration_ms;
         self.meta.completed = completed;
@@ -171,11 +181,15 @@ impl Session {
     }
 
     fn write_markers(&self) -> Result<(), String> {
-        let payload = MarkersFile { session: self.meta.clone(), markers: self.markers.clone() };
+        let payload = MarkersFile {
+            session: self.meta.clone(),
+            markers: self.markers.clone(),
+        };
         let text = serde_json::to_string_pretty(&payload)
             .map_err(|e| format!("序列化 markers.json 失败: {e}"))?;
         let path = self.dir.join("markers.json");
-        fs::write(&path, text).map_err(|e| format!("写入 {} 失败: {e}", path.display()))
+        crate::fsutil::write_atomic(&path, text.as_bytes())
+            .map_err(|e| format!("写入 {} 失败: {e}", path.display()))
     }
 
     /// 列出某个根目录下的所有会话（历史缓存会话面板用）
@@ -189,10 +203,14 @@ impl Session {
             if !dir.is_dir() {
                 continue;
             }
-            let frames = count_frames(&dir);
-            let (name, created) = read_markers_meta(&dir);
+            let (name, created, meta_frames) = read_markers_meta(&dir);
+            let frames = meta_frames
+                .filter(|n| *n > 0)
+                .unwrap_or_else(|| count_frames(&dir));
             let name = name.unwrap_or_else(|| {
-                dir.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()
+                dir.file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default()
             });
             out.push(SessionSummary {
                 dir,
@@ -210,6 +228,22 @@ impl Session {
     pub fn delete(dir: &Path) -> Result<(), String> {
         fs::remove_dir_all(dir).map_err(|e| format!("删除 {} 失败: {e}", dir.display()))
     }
+
+    /// 只允许删除缓存根目录的**直接子目录**。删除是递归的，必须防止
+    /// CANLAPSE_CACHE 被指向别处、或缓存目录里出现 junction 时误删外部内容。
+    pub fn delete_in(root: &Path, dir: &Path) -> Result<(), String> {
+        let root = fs::canonicalize(root)
+            .map_err(|e| format!("解析缓存根目录 {} 失败: {e}", root.display()))?;
+        let target = fs::canonicalize(dir)
+            .map_err(|e| format!("解析会话目录 {} 失败: {e}", dir.display()))?;
+        if target.parent() != Some(root.as_path()) {
+            return Err(format!(
+                "拒绝删除缓存根目录之外的路径：{}",
+                target.display()
+            ));
+        }
+        fs::remove_dir_all(&target).map_err(|e| format!("删除 {} 失败: {e}", target.display()))
+    }
 }
 
 fn count_frames(dir: &Path) -> u32 {
@@ -219,20 +253,34 @@ fn count_frames(dir: &Path) -> u32 {
     entries
         .flatten()
         .filter(|e| {
+            let is_file = e.file_type().map(|t| t.is_file()).unwrap_or(false);
+            if !is_file {
+                return false;
+            }
             let n = e.file_name().to_string_lossy().to_ascii_lowercase();
-            n.starts_with("frame_") && (n.ends_with(".png") || n.ends_with(".jpg") || n.ends_with(".jpeg"))
+            n.starts_with("frame_")
+                && (n.ends_with(".png") || n.ends_with(".jpg") || n.ends_with(".jpeg"))
         })
         .count() as u32
 }
 
-fn read_markers_meta(dir: &Path) -> (Option<String>, Option<String>) {
+fn read_markers_meta(dir: &Path) -> (Option<String>, Option<String>, Option<u32>) {
     let path = dir.join("markers.json");
+    if let Ok(meta) = fs::metadata(&path) {
+        if meta.len() > 4 * 1024 * 1024 {
+            return (None, None, None);
+        }
+    }
     let Ok(text) = fs::read_to_string(&path) else {
-        return (None, None);
+        return (None, None, None);
     };
     match serde_json::from_str::<MarkersFile>(&text) {
-        Ok(m) => (Some(m.session.name), Some(m.session.created)),
-        Err(_) => (None, None),
+        Ok(m) => (
+            Some(m.session.name),
+            Some(m.session.created),
+            Some(m.session.frames),
+        ),
+        Err(_) => (None, None, None),
     }
 }
 
@@ -246,9 +294,11 @@ mod tests {
     fn tmp_root(tag: &str) -> PathBuf {
         // 用**工作区内**的目录而不是 std::env::temp_dir()：
         // 系统临时目录在受限令牌/被清理的环境下会建不了目录，导致测试假失败（实测踩过）。
-        let p = PathBuf::from("target")
-            .join("test-tmp")
-            .join(format!("canlapse-test-{}-{}", std::process::id(), tag));
+        let p = PathBuf::from("target").join("test-tmp").join(format!(
+            "canlapse-test-{}-{}",
+            std::process::id(),
+            tag
+        ));
         let _ = fs::remove_dir_all(&p);
         fs::create_dir_all(&p).unwrap();
         p
@@ -261,8 +311,18 @@ mod tests {
             class_name: "TestClass".into(),
             pid: 0,
             process: "test.exe".into(),
-            rect: RECT { left: 0, top: 0, right: 4, bottom: 4 },
-            client: RECT { left: 0, top: 0, right: 4, bottom: 4 },
+            rect: RECT {
+                left: 0,
+                top: 0,
+                right: 4,
+                bottom: 4,
+            },
+            client: RECT {
+                left: 0,
+                top: 0,
+                right: 4,
+                bottom: 4,
+            },
             minimized: false,
         }
     }
@@ -336,5 +396,16 @@ mod tests {
         assert_ne!(a.dir(), b.dir());
         assert_eq!(Session::list(&root).len(), 2);
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn 拒绝删除缓存根目录之外的目录() {
+        let root = tmp_root("delete-root");
+        let outside = tmp_root("delete-outside");
+        let err = Session::delete_in(&root, &outside).unwrap_err();
+        assert!(err.contains("缓存根目录之外"));
+        assert!(outside.exists());
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&outside);
     }
 }

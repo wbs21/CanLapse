@@ -109,7 +109,10 @@ fn help() {
 
 fn cmd_list() -> i32 {
     let ws = win::list_windows();
-    println!("{:<12} {:<22} {:<26} {:>10}  {}", "HWND", "进程", "类名", "客户区", "标题");
+    println!(
+        "{:<12} {:<22} {:<26} {:>10}  标题",
+        "HWND", "进程", "类名", "客户区"
+    );
     for w in &ws {
         let (cw, ch) = w.client_size();
         println!(
@@ -133,7 +136,11 @@ fn cmd_pick() -> i32 {
             println!("  HWND      = 0x{:X}", h as isize);
             println!("  进程      = {}", info.process);
             println!("  类名      = {}", info.class_name);
-            println!("  客户区    = {}x{}", info.client_size().0, info.client_size().1);
+            println!(
+                "  客户区    = {}x{}",
+                info.client_size().0,
+                info.client_size().1
+            );
             println!("  已最小化  = {}", info.minimized);
             0
         }
@@ -141,13 +148,13 @@ fn cmd_pick() -> i32 {
     }
 }
 
-fn cmd_sessions(root: &PathBuf) -> i32 {
+fn cmd_sessions(root: &std::path::Path) -> i32 {
     let list = Session::list(root);
     if list.is_empty() {
         println!("缓存根目录 {} 下还没有会话。", root.display());
         return 0;
     }
-    println!("{:<28} {:>8}  {}", "会话", "帧数", "目录");
+    println!("{:<28} {:>8}  目录", "会话", "帧数");
     for s in &list {
         println!("{:<28} {:>8}  {}", s.name, s.frames, s.dir.display());
     }
@@ -202,10 +209,13 @@ fn cmd_record(a: RecordArgs) -> i32 {
     println!("目标: {}", info.label());
 
     let root = a.out.clone().unwrap_or_else(cache_root);
-    let name = a
-        .name
-        .clone()
-        .unwrap_or_else(|| if info.process.is_empty() { "画布".into() } else { info.process.clone() });
+    let name = a.name.clone().unwrap_or_else(|| {
+        if info.process.is_empty() {
+            "画布".into()
+        } else {
+            info.process.clone()
+        }
+    });
     println!(
         "录制参数: 帧密度 {}/s，差异阈值 {:.3}。按 Esc 停止{}。",
         a.fps,
@@ -239,7 +249,7 @@ fn cmd_record(a: RecordArgs) -> i32 {
 
     loop {
         win::pump();
-        if !stop_sent && win::escape_pressed() {
+        if !stop_sent && win::escape_pressed_once() {
             println!("\n收到 Esc，结束录制。");
             shared.request_stop();
             stop_sent = true;
@@ -308,8 +318,6 @@ fn cmd_record(a: RecordArgs) -> i32 {
     0
 }
 
-
-
 fn cmd_encode(args: &[String]) -> i32 {
     let mut dir: Option<PathBuf> = None;
     let mut fps = 10.0f64;
@@ -364,7 +372,11 @@ fn cmd_encode(args: &[String]) -> i32 {
         }
     };
     let output = out.unwrap_or_else(|| dir.join("timelapse.mp4"));
-    let opts = encode::EncodeOptions { fps, quality, output: output.clone() };
+    let opts = encode::EncodeOptions {
+        fps,
+        quality,
+        output: output.clone(),
+    };
     println!(
         "开始合成：{} fps，画质 {}，输出 {}",
         fps,
@@ -428,8 +440,12 @@ fn cmd_doctor() -> i32 {
     );
 
     println!("\n[编码]");
-    let ffdir = canlapse::ffmpeg_min_dir();
-    println!("  ffmpeg-min 目录：{}", ffdir.display());
+    if cfg!(ffmpeg_static) {
+        println!("  ffmpeg：静态链接（构建时使用 deps/ffmpeg-static）");
+    } else {
+        let ffdir = canlapse::ffmpeg_min_dir();
+        println!("  ffmpeg-min 目录：{}", ffdir.display());
+    }
     println!(
         "  libopenh264 编码器：{}",
         if encode::encoder_available() {
@@ -444,29 +460,35 @@ fn cmd_doctor() -> i32 {
         println!("\n[运行时 DLL]");
         println!("  静态链接 ✓ 单个 exe，不需要任何 ffmpeg/VC 运行库 DLL");
     } else {
-    println!("\n[运行时 DLL]（导入表在进程启动时就要解析，必须在 exe 同目录）");
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            println!("  exe 目录：{}", dir.display());
-            let names: Vec<String> = std::fs::read_dir(dir)
-                .map(|rd| {
-                    rd.flatten()
-                        .map(|e| e.file_name().to_string_lossy().to_string())
-                        .filter(|n| n.to_ascii_lowercase().ends_with(".dll"))
-                        .collect()
-                })
-                .unwrap_or_default();
-            for prefix in ["avcodec-", "avformat-", "avutil-", "swscale-", "libwinpthread"] {
-                let hit = names
-                    .iter()
-                    .find(|n| n.to_ascii_lowercase().starts_with(prefix));
-                match hit {
-                    Some(n) => println!("  {prefix:<14} ✓ {n}"),
-                    None => println!("  {prefix:<14} ✗ 缺失"),
+        println!("\n[运行时 DLL]（导入表在进程启动时就要解析，必须在 exe 同目录）");
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                println!("  exe 目录：{}", dir.display());
+                let names: Vec<String> = std::fs::read_dir(dir)
+                    .map(|rd| {
+                        rd.flatten()
+                            .map(|e| e.file_name().to_string_lossy().to_string())
+                            .filter(|n| n.to_ascii_lowercase().ends_with(".dll"))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                for prefix in [
+                    "avcodec-",
+                    "avformat-",
+                    "avutil-",
+                    "swscale-",
+                    "libwinpthread",
+                ] {
+                    let hit = names
+                        .iter()
+                        .find(|n| n.to_ascii_lowercase().starts_with(prefix));
+                    match hit {
+                        Some(n) => println!("  {prefix:<14} ✓ {n}"),
+                        None => println!("  {prefix:<14} ✗ 缺失"),
+                    }
                 }
             }
         }
-    }
     }
 
     println!("\n[缓存]");

@@ -67,6 +67,7 @@ pub const AVMEDIA_TYPE_VIDEO: c_int = 0;
 pub const AV_PIX_FMT_YUV420P: c_int = 0;
 pub const AV_PIX_FMT_BGRA: c_int = 28;
 pub const SWS_BILINEAR: c_int = 2;
+pub const SWS_POINT: c_int = 0x10;
 pub const AV_CODEC_FLAG_GLOBAL_HEADER: c_int = 0x0040_0000;
 pub const AV_CODEC_ID_H264: c_int = 27;
 pub const AV_OPT_SEARCH_CHILDREN: c_int = 0x0002;
@@ -241,6 +242,8 @@ pub unsafe fn cstr(p: *const c_char) -> String {
 extern "C" {
     pub fn av_log_set_level(level: c_int);
     pub fn av_strerror(errnum: c_int, errbuf: *mut c_char, errbuf_size: usize) -> c_int;
+    pub fn avcodec_version() -> u32;
+    pub fn avutil_version() -> u32;
     pub fn avutil_configuration() -> *const c_char;
     pub fn avcodec_configuration() -> *const c_char;
     pub fn avformat_configuration() -> *const c_char;
@@ -253,8 +256,12 @@ extern "C" {
 
     pub fn av_rescale_q(a: i64, bq: AVRational, cq: AVRational) -> i64;
 
-    pub fn av_opt_set(obj: *mut c_void, name: *const c_char, val: *const c_char, flags: c_int)
-        -> c_int;
+    pub fn av_opt_set(
+        obj: *mut c_void,
+        name: *const c_char,
+        val: *const c_char,
+        flags: c_int,
+    ) -> c_int;
     pub fn av_opt_set_int(obj: *mut c_void, name: *const c_char, val: i64, flags: c_int) -> c_int;
 }
 
@@ -311,10 +318,7 @@ extern "C" {
         filename: *const c_char,
     ) -> c_int;
     pub fn avformat_new_stream(oc: *mut AVFormatContext, c: *const AVCodec) -> *mut AVStream;
-    pub fn avformat_write_header(
-        oc: *mut AVFormatContext,
-        options: *mut *mut c_void,
-    ) -> c_int;
+    pub fn avformat_write_header(oc: *mut AVFormatContext, options: *mut *mut c_void) -> c_int;
     pub fn av_interleaved_write_frame(oc: *mut AVFormatContext, pkt: *mut AVPacket) -> c_int;
     pub fn av_write_trailer(oc: *mut AVFormatContext) -> c_int;
     pub fn avformat_free_context(oc: *mut AVFormatContext);
