@@ -10,30 +10,29 @@
 //! * 点按钮 → 暂停/继续、标记、停止；
 //! * `WS_EX_NOACTIVATE` 保证点击不把焦点从绘画软件抢走。
 
-use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicU32, AtomicUsize, Ordering};
 
 use crate::lang;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, Ellipse, EndPaint, FillRect,
-    FrameRect, GetMonitorInfoW, GetStockObject, MonitorFromWindow, RoundRect, ScreenToClient, SelectObject,
-    SetBkMode, SetTextColor, DEFAULT_GUI_FONT, MONITOR_DEFAULTTONEAREST, MONITORINFO,
-    FW_NORMAL, HDC, HGDIOBJ, NULL_PEN,
+    BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, Ellipse, EndPaint,
+    FillRect, FrameRect, GetStockObject, RoundRect, ScreenToClient, SelectObject, SetBkMode,
+    SetTextColor, DEFAULT_GUI_FONT, FW_NORMAL, HDC, HGDIOBJ, NULL_PEN,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetCursorPos, GetWindowRect,
-    LoadCursorW, RegisterClassW,
-    SetCursor, SetTimer, SetWindowPos, SetWindowTextW, ShowWindow, SystemParametersInfoW,
-    HWND_TOPMOST, IDC_HAND, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_SHOWNOACTIVATE,
-    WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEMOVE, WM_NCHITTEST, WM_PAINT, WM_SETCURSOR, WM_TIMER, WNDCLASSW,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    LoadCursorW, RegisterClassW, SetCursor, SetTimer, SetWindowPos, SetWindowTextW, ShowWindow,
+    HWND_TOPMOST, IDC_HAND, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_SHOWNOACTIVATE, WM_DESTROY,
+    WM_ERASEBKGND, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCHITTEST, WM_PAINT,
+    WM_SETCURSOR, WM_TIMER, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 use windows_sys::Win32::UI::Controls::WM_MOUSELEAVE;
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture,TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+};
 
 use crate::recorder::{self, Shared};
 use crate::win;
@@ -50,6 +49,22 @@ const BTN_W: i32 = 66;
 const BTN_H: i32 = 30;
 const BTN_GAP: i32 = 6;
 
+/// 悬浮条是独立顶层窗口，可能和主窗不在同一块屏；使用它自己的 DPI。
+static BAR_DPI: AtomicU32 = AtomicU32::new(96);
+
+fn bar_px(value: i32) -> i32 {
+    let dpi = BAR_DPI.load(Ordering::Relaxed) as i64;
+    ((value as i64 * dpi + 48) / 96) as i32
+}
+
+fn bar_w() -> i32 {
+    bar_px(BAR_W)
+}
+
+fn bar_h() -> i32 {
+    bar_px(BAR_H)
+}
+
 /// 按钮索引
 const BTN_PAUSE: usize = 0;
 const BTN_MARK: usize = 1;
@@ -63,7 +78,7 @@ static HOVER: AtomicUsize = AtomicUsize::new(NONE);
 static PRESSED: AtomicUsize = AtomicUsize::new(NONE);
 /// 跟踪鼠标离开（没有它，鼠标移出后按钮会一直保持悬停高亮）
 static TRACKING: AtomicIsize = AtomicIsize::new(0);
-static FONT: OnceLock<isize> = OnceLock::new();
+static FONT: Mutex<Option<(u32, isize)>> = Mutex::new(None);
 /// 拖动状态：只在**上边缘左右拖动**（y 固定）
 static DRAGGING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static DRAG_CURSOR_X: AtomicIsize = AtomicIsize::new(0);
@@ -87,11 +102,13 @@ const C_STOP: u32 = 0x008A_8AF0; // #F08A8A 停止按钮文字
 
 /// 按钮客户区矩形（3 个）
 fn button_rects() -> [(i32, i32, i32, i32); 3] {
-    let y = (BAR_H - BTN_H) / 2;
+    let btn_w = bar_px(BTN_W);
+    let btn_h = bar_px(BTN_H);
+    let y = (bar_h() - btn_h) / 2;
     let mut out = [(0, 0, 0, 0); 3];
     for (i, slot) in out.iter_mut().enumerate() {
-        let x = PAD + 18 + (BTN_W + BTN_GAP) * i as i32; // 18 = 左侧状态圆点占位
-        *slot = (x, y, BTN_W, BTN_H);
+        let x = bar_px(PAD) + bar_px(18) + (btn_w + bar_px(BTN_GAP)) * i as i32; // 18 = 左侧状态圆点占位
+        *slot = (x, y, btn_w, btn_h);
     }
     out
 }
@@ -105,39 +122,9 @@ fn hit_button(px: i32, py: i32) -> usize {
     NONE
 }
 
-/// 主显示器工作区（避开任务栏）
 /// 把控制条的 x 夹在工作区内（只允许左右移动，不越界）
 fn clamp_bar_x(work: RECT, x: i32) -> i32 {
-    x.clamp(work.left, (work.right - BAR_W).max(work.left))
-}
-
-/// 目标窗口所在显示器的工作区（避开任务栏）。失败返回 None，由调用方回退主屏。
-unsafe fn monitor_work_area(target: Option<HWND>) -> Option<RECT> {
-    let hwnd = target?;
-    let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-    if mon.is_null() {
-        return None;
-    }
-    let mut mi: MONITORINFO = std::mem::zeroed();
-    mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
-    if GetMonitorInfoW(mon, &mut mi) == 0 {
-        return None;
-    }
-    Some(mi.rcWork)
-}
-
-unsafe fn work_area() -> RECT {
-    let mut r: RECT = std::mem::zeroed();
-    let ok = SystemParametersInfoW(0x0030, 0, &mut r as *mut _ as *mut _, 0); // SPI_GETWORKAREA
-    if ok == 0 || r.right <= r.left {
-        r = RECT {
-            left: 0,
-            top: 0,
-            right: 1920,
-            bottom: 1080,
-        };
-    }
-    r
+    x.clamp(work.left, (work.right - bar_w()).max(work.left))
 }
 
 unsafe fn cursor_client(hwnd: HWND) -> (i32, i32) {
@@ -149,10 +136,16 @@ unsafe fn cursor_client(hwnd: HWND) -> (i32, i32) {
 
 /// 小字号 UI 字体（只创建一次，进程生命周期内复用；不删句柄，量很小）
 unsafe fn ui_font() -> HGDIOBJ {
-    let h = *FONT.get_or_init(|| {
+    let dpi = BAR_DPI.load(Ordering::Relaxed);
+    if let Ok(mut slot) = FONT.lock() {
+        if let Some((cached_dpi, f)) = *slot {
+            if cached_dpi == dpi {
+                return f as HGDIOBJ;
+            }
+        }
         let face = win::wide("Microsoft YaHei UI");
         let mut f = CreateFontW(
-            -11, // 字高（像素）
+            -bar_px(11),
             0,
             0,
             0,
@@ -169,15 +162,30 @@ unsafe fn ui_font() -> HGDIOBJ {
         ) as isize;
         if f == 0 {
             let seg = win::wide("Segoe UI");
-            f = CreateFontW(-11, 0, 0, 0, FW_NORMAL as i32, 0, 0, 0, 1, 0, 0, 0, 0, seg.as_ptr())
-                as isize;
+            f = CreateFontW(
+                -bar_px(11),
+                0,
+                0,
+                0,
+                FW_NORMAL as i32,
+                0,
+                0,
+                0,
+                1,
+                0,
+                0,
+                0,
+                0,
+                seg.as_ptr(),
+            ) as isize;
         }
         if f == 0 {
             f = GetStockObject(DEFAULT_GUI_FONT) as isize;
         }
-        f
-    });
-    h as HGDIOBJ
+        *slot = Some((dpi, f));
+        return f as HGDIOBJ;
+    }
+    GetStockObject(DEFAULT_GUI_FONT) as HGDIOBJ
 }
 
 unsafe fn bar_font() -> HGDIOBJ {
@@ -247,11 +255,17 @@ unsafe fn paint(hwnd: HWND) {
     SetBkMode(dc, 1); // TRANSPARENT
 
     // 左侧状态圆点：录制=红、暂停/前台他窗=琥珀
-    let (Ok(guard), true) = (BAR_SHARED.lock(), true) else {
-        EndPaint(hwnd, &ps);
-        return;
-    };
-    let Some(shared) = guard.as_ref() else {
+    let shared = BAR_SHARED
+        .lock()
+        .ok()
+        .and_then(|guard| guard.as_ref().cloned());
+    let Some(shared) = shared else {
+        // 走到这里说明控制条正在销毁或锁被毒化。前面的 brush 已经创建，
+        // 必须在这里显式释放，不能直接 EndPaint 返回。
+        DeleteObject(bg as _);
+        DeleteObject(br as _);
+        DeleteObject(border as _);
+        SelectObject(dc, old_font);
         EndPaint(hwnd, &ps);
         return;
     };
@@ -266,18 +280,22 @@ unsafe fn paint(hwnd: HWND) {
         C_REC_DIM
     };
     let dot = CreateSolidBrush(color(dot_color));
-    let (dx, dy) = (PAD + 4, h / 2 - 4);
+    let (dx, dy) = (bar_px(PAD) + bar_px(4), h / 2 - bar_px(4));
     let dot_rc = RECT {
         left: dx,
         top: dy,
-        right: dx + 8,
-        bottom: dy + 8,
+        right: dx + bar_px(8),
+        bottom: dy + bar_px(8),
     };
     fill_ellipse(dc, dot_rc, dot);
 
     // 三个扁平按钮（悬停/按下才画底，平时完全透明，避免"灰边"观感）
     let labels = [
-        if shared.is_paused() { lang::s(lang::K::ResumeBtn) } else { lang::s(lang::K::PauseBtn) },
+        if shared.is_paused() {
+            lang::s(lang::K::ResumeBtn)
+        } else {
+            lang::s(lang::K::PauseBtn)
+        },
         lang::s(lang::K::MarkBtn),
         lang::s(lang::K::StopBtn),
     ];
@@ -310,38 +328,61 @@ unsafe fn paint(hwnd: HWND) {
     }
 
     // 右侧信息区：先画一条 1px 分隔线，让"控件"和"状态"分开
-    let info_x = PAD + 18 + (BTN_W + BTN_GAP) * 3 + 12;
+    let info_x = bar_px(PAD) + bar_px(18) + (bar_px(BTN_W) + bar_px(BTN_GAP)) * 3 + bar_px(12);
     let dv_rc = RECT {
-        left: info_x - 8,
-        top: 12,
-        right: info_x - 7,
-        bottom: h - 12,
+        left: info_x - bar_px(8),
+        top: bar_px(12),
+        right: info_x - bar_px(7),
+        bottom: h - bar_px(12),
     };
     let dv = CreateSolidBrush(color(C_DIVIDER));
     FillRect(dc, &dv_rc, dv);
     DeleteObject(dv as _);
 
     // 信息文案："00:12 · 3 帧"（暂停时补一句原因，缩短到能放下）
-    let frames_key = if shared.frames() == 1 { lang::K::BarFrameOne } else { lang::K::BarFrames };
+    let frames_key = if shared.frames() == 1 {
+        lang::K::BarFrameOne
+    } else {
+        lang::K::BarFrames
+    };
     let mut info = lang::f(
         frames_key,
-        &[&recorder::format_duration(shared.elapsed_ms()), &shared.frames()],
+        &[
+            &recorder::format_duration(shared.elapsed_ms()),
+            &shared.frames(),
+        ],
     );
     if shared.markers() > 0 {
-        info.push_str(&format!(" · {}", lang::f(lang::K::BarMarked, &[&shared.markers()])));
+        info.push_str(&format!(
+            " · {}",
+            lang::f(lang::K::BarMarked, &[&shared.markers()])
+        ));
+    }
+    if shared.dropped() > 0 {
+        info.push_str(&format!(
+            " · {}",
+            lang::f(lang::K::BarDropped, &[&shared.dropped()])
+        ));
+    }
+    if shared.blank_warned() {
+        info.push_str(&format!(" · {}", lang::s(lang::K::BarBlank)));
     }
     if shared.fg_paused() {
-        info = format!("{} · {}", recorder::format_duration(shared.elapsed_ms()), lang::s(lang::K::BarBackToCanvas));
+        info = format!(
+            "{} · {}",
+            recorder::format_duration(shared.elapsed_ms()),
+            lang::s(lang::K::BarBackToCanvas)
+        );
     } else if shared.is_paused() {
         info.push_str(&format!(" · {}", lang::s(lang::K::BarPaused)));
     }
     let rc = RECT {
         left: info_x,
         top: 0,
-        right: w - PAD,
+        right: w - bar_px(PAD),
         bottom: h,
     };
-    text(dc, &info, rc, color(C_MUTED), 0x0000_0000 | 0x0000_0004); // DT_LEFT | DT_VCENTER
+    text(dc, &info, rc, color(C_MUTED), 0x0000_0004); // DT_LEFT | DT_VCENTER
 
     SelectObject(dc, old_font);
     DeleteObject(bg as _);
@@ -351,7 +392,12 @@ unsafe fn paint(hwnd: HWND) {
     EndPaint(hwnd, &ps);
 }
 
-unsafe extern "system" fn bar_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+unsafe extern "system" fn bar_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
     win::guard(|| bar_proc_inner(hwnd, msg, wparam, lparam))
 }
 
@@ -385,7 +431,9 @@ unsafe fn bar_proc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
             if DRAGGING.load(Ordering::Relaxed) {
                 let mut p: windows_sys::Win32::Foundation::POINT = std::mem::zeroed();
                 GetCursorPos(&mut p);
-                let work = work_area();
+                // 必须用「控制条当前所在显示器」的工作区。SPI_GETWORKAREA
+                // 永远返回主屏，副屏上的条子第一次拖动就会跳回主屏。
+                let work = win::monitor_work_area(hwnd);
                 let dx = p.x - DRAG_CURSOR_X.load(Ordering::Relaxed) as i32;
                 let nx = clamp_bar_x(work, DRAG_WIN_X.load(Ordering::Relaxed) as i32 + dx);
                 let mut wr: RECT = std::mem::zeroed();
@@ -462,6 +510,15 @@ unsafe fn bar_proc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
             }
             0
         }
+        // 拖动/按钮按下期间被 Alt+Tab 等抢走鼠标捕获时，必须清掉状态，
+        // 否则鼠标回到条子上会继续“粘着”拖动。
+        0x0215 => {
+            DRAGGING.store(false, Ordering::Relaxed);
+            PRESSED.store(NONE, Ordering::Relaxed);
+            ReleaseCapture();
+            invalidate(hwnd);
+            0
+        }
         WM_TIMER => {
             if wparam == TIMER_REFRESH {
                 TICK.fetch_add(1, Ordering::Relaxed);
@@ -484,10 +541,17 @@ unsafe fn invalidate(hwnd: HWND) {
 unsafe fn update_title(hwnd: HWND) {
     let Ok(guard) = BAR_SHARED.lock() else { return };
     let Some(shared) = guard.as_ref() else { return };
-    let frames_key = if shared.frames() == 1 { lang::K::BarFrameOne } else { lang::K::BarFrames };
+    let frames_key = if shared.frames() == 1 {
+        lang::K::BarFrameOne
+    } else {
+        lang::K::BarFrames
+    };
     let mut title = lang::f(
         frames_key,
-        &[&recorder::format_duration(shared.elapsed_ms()), &shared.frames()],
+        &[
+            &recorder::format_duration(shared.elapsed_ms()),
+            &shared.frames(),
+        ],
     );
     if shared.is_paused() {
         title.push_str(&format!(" · {}", lang::s(lang::K::BarPaused)));
@@ -547,9 +611,13 @@ pub fn create(shared: Arc<Shared>, target: Option<HWND>) -> Option<HWND> {
         let title = win::wide("CanLapse");
         // 默认吸附在**画布所在显示器**的右上角（用户要求 v1.3）；之后只能在上边缘左右拖。
         // 找不到目标窗口所在显示器时回退主屏工作区。
-        let work = monitor_work_area(target).unwrap_or_else(|| work_area());
-        let x = clamp_bar_x(work, work.right - BAR_W - BAR_MARGIN);
-        let y = work.top + BAR_MARGIN;
+        BAR_DPI.store(
+            win::dpi_of(target.unwrap_or(std::ptr::null_mut())),
+            Ordering::Relaxed,
+        );
+        let work = win::monitor_work_area(target.unwrap_or(std::ptr::null_mut()));
+        let x = clamp_bar_x(work, work.right - bar_w() - bar_px(BAR_MARGIN));
+        let y = work.top + bar_px(BAR_MARGIN);
         let hwnd = CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
             cls.as_ptr(),
@@ -557,8 +625,8 @@ pub fn create(shared: Arc<Shared>, target: Option<HWND>) -> Option<HWND> {
             WS_POPUP,
             x,
             y,
-            BAR_W,
-            BAR_H,
+            bar_w(),
+            bar_h(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             win::module_handle(),
@@ -578,7 +646,8 @@ pub fn create(shared: Arc<Shared>, target: Option<HWND>) -> Option<HWND> {
             0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
         );
-        SetTimer(hwnd, TIMER_REFRESH, 200, None);
+        // 500ms 足够刷新秒级计时和呼吸点；Stop/Mark/Pause 由鼠标消息即时处理。
+        SetTimer(hwnd, TIMER_REFRESH, 500, None);
         update_title(hwnd);
         invalidate(hwnd);
         Some(hwnd)
@@ -595,7 +664,6 @@ pub fn destroy(hwnd: HWND) {
         *g = None;
     }
 }
-
 
 #[cfg(test)]
 mod tests {

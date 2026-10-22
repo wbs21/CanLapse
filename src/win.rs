@@ -1,4 +1,9 @@
 //! Win32 基础封装：窗口枚举、进程名、鼠标拾取、消息泵、本地时间。
+//!
+//! 这里的公共函数几乎都接收 `HWND`（裸指针句柄）。调用者本身就在 unsafe 的
+//! Win32 上下文中，逐个函数标 unsafe 只会把噪声扩散到 UI 层，因此在模块级别
+//! 接受 clippy 的该项检查；真正的内存安全边界仍是各 `unsafe` 块。
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::c_void;
 use std::ptr::{null, null_mut};
@@ -15,25 +20,24 @@ use windows_sys::Win32::Foundation::{
 // 注意：ClientToScreen 在 Graphics::Gdi 下，不在 WindowsAndMessaging（实测踩过）。
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, ClientToScreen, CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint,
-    FillRect, FrameRect, SelectObject, SetBkMode, SetTextColor, DEFAULT_CHARSET, HGDIOBJ,
-    PAINTSTRUCT,
+    FillRect, FrameRect, GetMonitorInfoW, MonitorFromWindow, SelectObject, SetBkMode, SetTextColor,
+    DEFAULT_CHARSET, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT,
 };
+use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::System::SystemInformation::GetLocalTime;
+use windows_sys::Win32::System::SystemInformation::{GetLocalTime, GetWindowsDirectoryW};
 use windows_sys::Win32::System::Threading::{
     CreateMutexW, OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
 };
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, VK_ESCAPE, VK_F8,
-};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_ESCAPE, VK_F8};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EnumChildWindows, EnumWindows,
-    GetAncestor, GetClassNameW, GetClientRect, GetCursorPos, GetForegroundWindow, GetParent,
-    GetSystemMetrics, GetWindow, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId,
-    IsIconic, IsWindow, IsWindowVisible, MSG, PM_REMOVE, PeekMessageW,
-    RegisterClassW, SetLayeredWindowAttributes, SetWindowPos, ShowWindow,
-    TranslateMessage, WindowFromPoint, GA_ROOT, GW_OWNER,
-    SW_HIDE, SW_SHOWNOACTIVATE, WM_LBUTTONDOWN, WM_PAINT, WM_RBUTTONDOWN, WNDCLASSW, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EnumChildWindows,
+    EnumWindows, GetAncestor, GetClassNameW, GetClientRect, GetCursorPos, GetForegroundWindow,
+    GetParent, GetSystemMetrics, GetWindow, GetWindowRect, GetWindowTextW,
+    GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, PeekMessageW, RegisterClassW,
+    SetLayeredWindowAttributes, SetWindowPos, ShowWindow, SystemParametersInfoW, TranslateMessage,
+    WindowFromPoint, GA_ROOT, GW_OWNER, MSG, PM_REMOVE, SW_HIDE, SW_SHOWNOACTIVATE, WM_LBUTTONDOWN,
+    WM_PAINT, WM_RBUTTONDOWN, WNDCLASSW, WS_POPUP,
 };
 
 pub fn wide(s: &str) -> Vec<u16> {
@@ -84,14 +88,21 @@ impl WindowInfo {
             "{}{} [{}] {}x{}",
             t,
             if is_child { "（子窗口）" } else { "" },
-            if self.process.is_empty() { "?" } else { &self.process },
+            if self.process.is_empty() {
+                "?"
+            } else {
+                &self.process
+            },
             self.client.right - self.client.left,
             self.client.bottom - self.client.top
         )
     }
 
     pub fn client_size(&self) -> (i32, i32) {
-        (self.client.right - self.client.left, self.client.bottom - self.client.top)
+        (
+            self.client.right - self.client.left,
+            self.client.bottom - self.client.top,
+        )
     }
 }
 
@@ -155,15 +166,17 @@ pub fn describe(hwnd: HWND) -> WindowInfo {
 /// 注意：HWND 是裸指针，不能放进 `static Mutex<..>`（不满足 Sync）。
 /// 所以结果通过 EnumWindows 的 lparam 用栈上的 Vec 收集，而不是全局静态。
 unsafe extern "system" fn enum_cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
-    if IsWindowVisible(hwnd) == 0 {
-        return 1;
-    }
-    let out = &mut *(lparam as *mut Vec<WindowInfo>);
-    let info = describe(hwnd);
-    if info.title.is_empty() && info.class_name.is_empty() {
-        return 1;
-    }
-    out.push(info);
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if IsWindowVisible(hwnd) == 0 {
+            return;
+        }
+        let out = &mut *(lparam as *mut Vec<WindowInfo>);
+        let info = describe(hwnd);
+        if info.title.is_empty() && info.class_name.is_empty() {
+            return;
+        }
+        out.push(info);
+    }));
     1
 }
 
@@ -184,13 +197,11 @@ pub fn list_windows() -> Vec<WindowInfo> {
 /// 按标题子串 / 类名 / 进程名查找（用于命令行指定目标）
 pub fn find_window(spec: &str) -> Option<WindowInfo> {
     let low = spec.to_lowercase();
-    list_windows()
-        .into_iter()
-        .find(|w| {
-            w.title.to_lowercase().contains(&low)
-                || w.class_name.to_lowercase().contains(&low)
-                || w.process.to_lowercase().contains(&low)
-        })
+    list_windows().into_iter().find(|w| {
+        w.title.to_lowercase().contains(&low)
+            || w.class_name.to_lowercase().contains(&low)
+            || w.process.to_lowercase().contains(&low)
+    })
 }
 
 pub fn is_window_alive(hwnd: HWND) -> bool {
@@ -251,8 +262,12 @@ pub fn settle(ms: u64) {
 // 鼠标拾取窗口
 // ---------------------------------------------------------------------------
 
+fn key_state(vk: u16) -> u16 {
+    unsafe { GetAsyncKeyState(vk as i32) as u16 }
+}
+
 fn key_down(vk: u16) -> bool {
-    unsafe { (GetAsyncKeyState(vk as i32) as u16) & 0x8000 != 0 }
+    key_state(vk) & 0x8000 != 0
 }
 
 /// 拾取时跟随鼠标的提示条 —— **自绘的置顶小窗**。
@@ -268,7 +283,7 @@ const HINT_W: i32 = 240;
 const HINT_H: i32 = 40;
 
 unsafe extern "system" fn hint_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-    match msg {
+    guard(|| match msg {
         WM_PAINT => {
             let mut ps: PAINTSTRUCT = std::mem::zeroed();
             let hdc = BeginPaint(hwnd, &mut ps);
@@ -285,23 +300,46 @@ unsafe extern "system" fn hint_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             if n > 0 {
                 let face = wide("Microsoft YaHei UI");
                 let font = CreateFontW(
-                    -15, 0, 0, 0, 500, 0, 0, 0, DEFAULT_CHARSET as u32, 0, 0, 0, 0, face.as_ptr(),
+                    -15,
+                    0,
+                    0,
+                    0,
+                    500,
+                    0,
+                    0,
+                    0,
+                    DEFAULT_CHARSET as u32,
+                    0,
+                    0,
+                    0,
+                    0,
+                    face.as_ptr(),
                 );
                 let old = SelectObject(hdc, font as HGDIOBJ);
                 SetBkMode(hdc, 1); // TRANSPARENT
                 SetTextColor(hdc, 0x00F0_F0F0);
-                let mut trc =
-                    RECT { left: 10, top: 6, right: rc.right - 10, bottom: rc.bottom - 4 };
+                let mut trc = RECT {
+                    left: 10,
+                    top: 6,
+                    right: rc.right - 10,
+                    bottom: rc.bottom - 4,
+                };
                 // DT_CENTER | DT_VCENTER | DT_SINGLELINE
-                DrawTextW(hdc, buf.as_ptr(), n, &mut trc, 0x0000_0001 | 0x0000_0004 | 0x0000_0020);
+                DrawTextW(
+                    hdc,
+                    buf.as_ptr(),
+                    n,
+                    &mut trc,
+                    0x0000_0001 | 0x0000_0004 | 0x0000_0020,
+                );
                 SelectObject(hdc, old);
                 DeleteObject(font as HGDIOBJ);
             }
-            EndPaint(hwnd, &mut ps);
+            EndPaint(hwnd, &ps);
             0
         }
         _ => DefWindowProcW(hwnd, msg, wp, lp),
-    }
+    })
 }
 
 /// 提示条相对光标的落点，贴到屏幕边缘时翻到另一侧
@@ -399,6 +437,16 @@ pub fn pick_hint_destroy(tip: HWND) {
     }
 }
 
+/// 拾取提示条的 RAII 包装：即使拾取流程里发生 panic，也不会把 topmost
+/// 提示条永久留在桌面上。
+pub struct PickHintGuard(pub HWND);
+
+impl Drop for PickHintGuard {
+    fn drop(&mut self) {
+        pick_hint_destroy(self.0);
+    }
+}
+
 fn cursor_position() -> (i32, i32) {
     unsafe {
         let mut p: POINT = std::mem::zeroed();
@@ -407,20 +455,31 @@ fn cursor_position() -> (i32, i32) {
     }
 }
 
-/// 录制循环里用：是否按下了 Esc（请求停止录制）
-pub fn escape_pressed() -> bool {
-    key_down(VK_ESCAPE)
-}
-
 static MARK_KEY_DOWN: AtomicBool = AtomicBool::new(false);
+static ESC_KEY_DOWN: AtomicBool = AtomicBool::new(false);
 
 /// 录制循环里用：F8 是否**刚被按下**（边沿触发，按住不会连打标记）。
 ///
 /// 规格里的 🏷 标记按钮在悬浮操作条上；命令行切片阶段用 F8 作为等价入口。
 pub fn marker_key_pressed() -> bool {
-    let down = key_down(VK_F8);
+    let state = key_state(VK_F8);
+    let down = state & 0x8000 != 0;
+    // 低 bit 表示“自上次查询以来按下过”，可捕获两次 UI tick 之间的短按。
+    let pressed = state & 0x0001 != 0;
     let was = MARK_KEY_DOWN.swap(down, Ordering::SeqCst);
-    down && !was
+    pressed || (down && !was)
+}
+
+/// 与 [`marker_key_pressed`] 相同的边沿触发语义：只在**刚按下** Esc 时返回 true。
+///
+/// GUI 的主窗口在录制时是最小化的，键盘消息不会送到这里，所以只能在 UI 定时器里
+/// 轮询 `GetAsyncKeyState`。用边沿触发可以避免按住 Esc 时每个 200ms tick 都请求停止。
+pub fn escape_pressed_once() -> bool {
+    let state = key_state(VK_ESCAPE);
+    let down = state & 0x8000 != 0;
+    let pressed = state & 0x0001 != 0;
+    let was = ESC_KEY_DOWN.swap(down, Ordering::SeqCst);
+    pressed || (down && !was)
 }
 
 // ---------------------------------------------------------------------------
@@ -461,7 +520,7 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
         WM_LBUTTONDOWN => {
             let (vx, vy, _, _) = virtual_screen();
             let x = vx + ((lp as i32) & 0xffff);
-            let y = vy + (((lp as isize) >> 16) as i32);
+            let y = vy + ((lp >> 16) as i32);
             OVERLAY_X.store(x as isize, Ordering::SeqCst);
             OVERLAY_Y.store(y as isize, Ordering::SeqCst);
             OVERLAY_HIT.store(true, Ordering::SeqCst);
@@ -528,6 +587,18 @@ unsafe fn overlay_create() -> HWND {
     h
 }
 
+struct OverlayGuard(HWND);
+
+impl Drop for OverlayGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                DestroyWindow(self.0);
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 点击目标归位（借鉴 add/chose.rs 的"候选画布"思路，但只用于归位）
 // ---------------------------------------------------------------------------
@@ -545,6 +616,7 @@ unsafe fn overlay_create() -> HWND {
 const CAND_MIN: i32 = 100;
 pub const BORDER_PX: i32 = 6;
 
+#[cfg(test)]
 fn point_in_rect(pt: POINT, rc: &RECT) -> bool {
     pt.x >= rc.left && pt.x < rc.right && pt.y >= rc.top && pt.y < rc.bottom
 }
@@ -566,18 +638,20 @@ fn point_near_edge(pt: POINT, rc: &RECT, px: i32) -> bool {
 }
 
 unsafe extern "system" fn cand_cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
-    let out = &mut *(lparam as *mut Vec<HWND>);
-    if IsWindowVisible(hwnd) == 0 {
-        return 1;
-    }
-    let mut rc: RECT = std::mem::zeroed();
-    if GetWindowRect(hwnd, &mut rc) == 0 {
-        return 1;
-    }
-    if rc.right - rc.left < CAND_MIN || rc.bottom - rc.top < CAND_MIN {
-        return 1;
-    }
-    out.push(hwnd);
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let out = &mut *(lparam as *mut Vec<HWND>);
+        if IsWindowVisible(hwnd) == 0 {
+            return;
+        }
+        let mut rc: RECT = std::mem::zeroed();
+        if GetWindowRect(hwnd, &mut rc) == 0 {
+            return;
+        }
+        if rc.right - rc.left < CAND_MIN || rc.bottom - rc.top < CAND_MIN {
+            return;
+        }
+        out.push(hwnd);
+    }));
     1
 }
 
@@ -598,7 +672,9 @@ fn rect_of(h: HWND) -> Option<RECT> {
 
 /// 点是否在窗口边框 `px` 像素内（写状态栏/日志用）
 pub fn border_hit(h: HWND, pt: POINT, px: i32) -> bool {
-    rect_of(h).map(|rc| point_near_edge(pt, &rc, px)).unwrap_or(false)
+    rect_of(h)
+        .map(|rc| point_near_edge(pt, &rc, px))
+        .unwrap_or(false)
 }
 
 /// 点击归位：返回最终目标 + 一句说明（写日志/状态栏用）
@@ -608,7 +684,7 @@ pub fn resolve_click(root: HWND, hit: HWND, pt: POINT) -> (HWND, &'static str) {
     }
     let cands = canvas_candidates(root);
     // 1) 直接点中候选
-    if cands.iter().any(|c| *c == hit) {
+    if cands.contains(&hit) {
         return (hit, "直接命中（≥100×100 的子窗口）");
     }
     // 2) 内层子窗 → 最近的候选祖先
@@ -618,7 +694,7 @@ pub fn resolve_click(root: HWND, hit: HWND, pt: POINT) -> (HWND, &'static str) {
         if a.is_null() || a == root {
             break;
         }
-        if cands.iter().any(|c| *c == a) {
+        if cands.contains(&a) {
             return (a, "命中内层子窗，上溯到候选窗口");
         }
     }
@@ -656,6 +732,7 @@ pub fn pick_window_interactive(owner: HWND, hint: Option<HWND>) -> Option<HWND> 
     if overlay.is_null() {
         return None;
     }
+    let _overlay_guard = OverlayGuard(overlay);
     let mut ticks = 0u32;
     let mut result: Option<HWND> = None;
     logline!("[pick] 进入拾取（覆盖层捕获点击；Esc / 右键取消）");
@@ -730,9 +807,6 @@ pub fn pick_window_interactive(owner: HWND, hint: Option<HWND>) -> Option<HWND> 
         }
         std::thread::sleep(Duration::from_millis(60));
     }
-    unsafe {
-        DestroyWindow(overlay);
-    }
     result
 }
 
@@ -749,7 +823,11 @@ pub fn ancestor_chain(hwnd: HWND) -> String {
         parts.push(format!(
             "0x{:X} {} {}x{}",
             h as isize,
-            if info.class_name.is_empty() { "?" } else { &info.class_name },
+            if info.class_name.is_empty() {
+                "?"
+            } else {
+                &info.class_name
+            },
             w,
             ht
         ));
@@ -761,7 +839,6 @@ pub fn ancestor_chain(hwnd: HWND) -> String {
     }
     parts.join(" <- ")
 }
-
 
 /// 这个窗口是否值得作为拾取目标。
 ///
@@ -781,7 +858,8 @@ fn looks_pickable(h: HWND) -> bool {
     let proc = info.process.to_lowercase();
     if cls.contains("windows.ui.core.corewindow")
         || cls.contains("tooltips_class32")
-        || cls.contains("ime")
+        || cls == "ime"
+        || cls.contains("msctfime")
         || proc.contains("textinputhost")
         || proc.contains("searchhost")
     {
@@ -830,11 +908,27 @@ pub fn stamp_iso(st: &SYSTEMTIME) -> String {
 pub fn sanitize_name(name: &str) -> String {
     let cleaned: String = name
         .chars()
-        .map(|c| if r#"\/:*?"<>|"#.contains(c) { '_' } else { c })
+        .map(|c| {
+            if c.is_control() || r#"\/:*?"<>|"#.contains(c) {
+                '_'
+            } else {
+                c
+            }
+        })
+        .take(80)
         .collect();
     let trimmed = cleaned.trim().trim_matches('.').to_string();
     if trimmed.is_empty() {
-        "未命名".to_string()
+        return "未命名".to_string();
+    }
+    // Windows 设备名（CON/NUL/COM1…）不能直接作为文件名。
+    let stem = trimmed.split('.').next().unwrap_or("").to_ascii_uppercase();
+    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (stem.len() == 4
+            && (stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.as_bytes()[3].is_ascii_digit());
+    if reserved {
+        format!("_{trimmed}")
     } else {
         trimmed
     }
@@ -864,33 +958,43 @@ pub fn covered_ratio(root: HWND, crop: (i32, i32, i32, i32)) -> f32 {
         let mut owned: Vec<RECT> = Vec::new();
         let root_for_cb = root;
         unsafe extern "system" fn cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
-            let out = &mut *(lparam as *mut (HWND, Vec<RECT>));
-            let (root, list) = out;
-            if IsWindowVisible(hwnd) == 0 || IsIconic(hwnd) != 0 {
-                return 1;
-            }
-            // 只看"被 root 拥有"的顶层窗口（GetWindow(GW_OWNER)）
-            let owner = GetWindow(hwnd, GW_OWNER);
-            if owner != *root {
-                return 1;
-            }
-            let mut rc: RECT = std::mem::zeroed();
-            if GetWindowRect(hwnd, &mut rc) == 0 {
-                return 1;
-            }
-            // 转成 root 客户区坐标
-            let mut tl = POINT { x: rc.left, y: rc.top };
-            let mut br = POINT { x: rc.right, y: rc.bottom };
-            windows_sys::Win32::Graphics::Gdi::ScreenToClient(*root, &mut tl);
-            windows_sys::Win32::Graphics::Gdi::ScreenToClient(*root, &mut br);
-            list.push(RECT { left: tl.x, top: tl.y, right: br.x, bottom: br.y });
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let out = &mut *(lparam as *mut (HWND, Vec<RECT>));
+                let (root, list) = out;
+                if IsWindowVisible(hwnd) == 0 || IsIconic(hwnd) != 0 {
+                    return;
+                }
+                // 只看"被 root 拥有"的顶层窗口（GetWindow(GW_OWNER)）
+                let owner = GetWindow(hwnd, GW_OWNER);
+                if owner != *root {
+                    return;
+                }
+                let mut rc: RECT = std::mem::zeroed();
+                if GetWindowRect(hwnd, &mut rc) == 0 {
+                    return;
+                }
+                // 转成 root 客户区坐标
+                let mut tl = POINT {
+                    x: rc.left,
+                    y: rc.top,
+                };
+                let mut br = POINT {
+                    x: rc.right,
+                    y: rc.bottom,
+                };
+                windows_sys::Win32::Graphics::Gdi::ScreenToClient(*root, &mut tl);
+                windows_sys::Win32::Graphics::Gdi::ScreenToClient(*root, &mut br);
+                list.push(RECT {
+                    left: tl.x,
+                    top: tl.y,
+                    right: br.x,
+                    bottom: br.y,
+                });
+            }));
             1
         }
         let mut state = (root_for_cb, owned);
-        EnumWindows(
-            Some(cb),
-            &mut state as *mut (HWND, Vec<RECT>) as LPARAM,
-        );
+        EnumWindows(Some(cb), &mut state as *mut (HWND, Vec<RECT>) as LPARAM);
         owned = state.1;
 
         for rc in &owned {
@@ -940,6 +1044,94 @@ pub fn foreground_pid() -> u32 {
     }
 }
 
+/// 当前窗口所在显示器的工作区（避开任务栏）。
+///
+/// `MonitorFromWindow` 对空句柄会返回主显示器；取不到工作区时退回
+/// `SPI_GETWORKAREA`，再失败才用 1920×1080。所有需要“贴屏幕边缘”的窗口
+/// （悬浮条、合成弹窗）都应使用这个函数，而不是 `SPI_GETWORKAREA` ——
+/// 后者永远只返回主屏，副屏上的窗口会被拉回主屏。
+pub fn monitor_work_area(hwnd: HWND) -> RECT {
+    unsafe {
+        let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        if !mon.is_null() {
+            let mut mi: MONITORINFO = std::mem::zeroed();
+            mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+            if GetMonitorInfoW(mon, &mut mi) != 0
+                && mi.rcWork.right > mi.rcWork.left
+                && mi.rcWork.bottom > mi.rcWork.top
+            {
+                return mi.rcWork;
+            }
+        }
+    }
+    let mut r: RECT = unsafe { std::mem::zeroed() };
+    let ok = unsafe { SystemParametersInfoW(0x0030, 0, &mut r as *mut _ as *mut _, 0) };
+    if ok != 0 && r.right > r.left && r.bottom > r.top {
+        r
+    } else {
+        RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        }
+    }
+}
+
+/// 窗口所在显示器的 DPI（96 = 100%）。失败时退回系统 DPI。
+pub fn dpi_of(hwnd: HWND) -> u32 {
+    let dpi = unsafe {
+        if hwnd.is_null() {
+            0
+        } else {
+            windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd)
+        }
+    };
+    if dpi > 0 {
+        dpi
+    } else {
+        system_dpi()
+    }
+}
+
+/// 系统启动时的主屏 DPI（用于窗口创建前的初始尺寸）。
+pub fn system_dpi() -> u32 {
+    let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForSystem() };
+    if dpi > 0 {
+        dpi
+    } else {
+        96
+    }
+}
+
+/// Windows 目录（通常是 `C:\Windows`）。用于拼出系统程序/库的绝对路径，
+/// 避免依赖 PATH 或 exe 同目录搜索。
+pub fn windows_dir() -> Option<std::path::PathBuf> {
+    let mut buf = [0u16; 260];
+    let n = unsafe { GetWindowsDirectoryW(buf.as_mut_ptr(), buf.len() as u32) };
+    if n == 0 || n as usize >= buf.len() {
+        return None;
+    }
+    Some(std::path::PathBuf::from(String::from_utf16_lossy(
+        &buf[..n as usize],
+    )))
+}
+
+/// 查询指定路径所在卷的可用字节数。路径不存在时返回 None。
+pub fn disk_free_bytes(path: &std::path::Path) -> Option<u64> {
+    let path = path.to_string_lossy();
+    let path = wide(&path);
+    let mut available: u64 = 0;
+    let mut total: u64 = 0;
+    let mut free: u64 = 0;
+    let ok = unsafe { GetDiskFreeSpaceExW(path.as_ptr(), &mut available, &mut total, &mut free) };
+    if ok != 0 {
+        Some(available)
+    } else {
+        None
+    }
+}
+
 /// 供 capture 模块建宿主窗口用
 pub fn module_handle() -> *mut c_void {
     unsafe { GetModuleHandleW(null()) }
@@ -957,7 +1149,7 @@ static INSTANCE_MUTEX: std::sync::OnceLock<isize> = std::sync::OnceLock::new();
 /// 尝试取得单实例锁：`true` = 本进程是唯一实例；`false` = 已有实例在跑。
 pub fn single_instance_acquire() -> bool {
     let name = wide("Local\\CanLapse.SingleInstance");
-    let h = unsafe { CreateMutexW(std::ptr::null(), 1, name.as_ptr()) };
+    let h = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
     if h.is_null() {
         // 创建失败（权限/资源极少见）时不要让用户完全打不开程序，放行并记日志
         logline!(
@@ -967,7 +1159,7 @@ pub fn single_instance_acquire() -> bool {
         return true;
     }
     let already = unsafe { GetLastError() } == 183; // ERROR_ALREADY_EXISTS
-    // 句柄保持到进程结束（不要 CloseHandle，否则锁会提前释放）
+                                                    // 句柄保持到进程结束（不要 CloseHandle，否则锁会提前释放）
     let _ = INSTANCE_MUTEX.set(h as isize);
     !already
 }
@@ -1059,7 +1251,12 @@ mod tests {
     /// 点击归位用到的几何判定（纯函数，便于回归）
     #[test]
     fn 点在矩形内与边框环的判定() {
-        let rc = RECT { left: 100, top: 100, right: 300, bottom: 200 };
+        let rc = RECT {
+            left: 100,
+            top: 100,
+            right: 300,
+            bottom: 200,
+        };
         // 内部
         assert!(point_in_rect(POINT { x: 200, y: 150 }, &rc));
         assert!(!point_near_edge(POINT { x: 200, y: 150 }, &rc, BORDER_PX));
@@ -1078,8 +1275,10 @@ mod tests {
     #[test]
     fn 可拾取尺寸下限() {
         // 这条只验证常量没被改回 0 —— 真实窗口判定依赖系统，不在单测里造窗口
-        assert!(CAND_MIN >= 64);
-        assert!(BORDER_PX > 0 && BORDER_PX < 20);
+        const _: () = {
+            assert!(CAND_MIN >= 64);
+            assert!(BORDER_PX > 0 && BORDER_PX < 20);
+        };
     }
 
     #[test]
@@ -1092,6 +1291,14 @@ mod tests {
     fn 空名字有兜底() {
         assert_eq!(sanitize_name("   "), "未命名");
         assert_eq!(sanitize_name("..."), "未命名");
+    }
+
+    #[test]
+    fn 设备名和控制字符被处理() {
+        assert_eq!(sanitize_name("CON"), "_CON");
+        assert_eq!(sanitize_name("com1.txt"), "_com1.txt");
+        assert_eq!(sanitize_name("a\nb"), "a_b");
+        assert!(sanitize_name(&"长".repeat(200)).chars().count() <= 80);
     }
 
     /// 「画布被自家面板遮挡」的检测：属主窗口覆盖面积比例。
@@ -1125,22 +1332,57 @@ mod tests {
             };
             let pc = mk("CanLapseCovRoot");
             let root = CreateWindowExW(
-                0, pc.as_ptr(), wide("root").as_ptr(), WS_POPUP | WS_VISIBLE,
-                100, 100, 800, 600, null_mut(), null_mut(), hinst, null(),
+                0,
+                pc.as_ptr(),
+                wide("root").as_ptr(),
+                WS_POPUP | WS_VISIBLE,
+                100,
+                100,
+                800,
+                600,
+                null_mut(),
+                null_mut(),
+                hinst,
+                null(),
             );
             let cc = mk("CanLapseCovChild");
             let child = CreateWindowExW(
-                0, cc.as_ptr(), wide("child").as_ptr(), WS_CHILD | WS_VISIBLE,
-                50, 60, 400, 400, root, null_mut(), hinst, null(),
+                0,
+                cc.as_ptr(),
+                wide("child").as_ptr(),
+                WS_CHILD | WS_VISIBLE,
+                50,
+                60,
+                400,
+                400,
+                root,
+                null_mut(),
+                hinst,
+                null(),
             );
             // 被 root 拥有的弹窗，盖在 child 左上 100x200 处
             let oc = mk("CanLapseCovOwned");
             let owned = CreateWindowExW(
-                0, oc.as_ptr(), wide("owned").as_ptr(), WS_POPUP | WS_VISIBLE,
-                150, 160, 100, 200, root, null_mut(), hinst, null(),
+                0,
+                oc.as_ptr(),
+                wide("owned").as_ptr(),
+                WS_POPUP | WS_VISIBLE,
+                150,
+                160,
+                100,
+                200,
+                root,
+                null_mut(),
+                hinst,
+                null(),
             );
             SetWindowPos(
-                owned, null_mut(), 150, 160, 100, 200,
+                owned,
+                null_mut(),
+                150,
+                160,
+                100,
+                200,
                 SWP_NOZORDER | SWP_NOACTIVATE,
             );
             let crop = crop_rect_in_root(child, root).unwrap();

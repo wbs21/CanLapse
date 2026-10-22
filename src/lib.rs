@@ -12,13 +12,22 @@
 pub mod capture;
 pub mod encode;
 pub mod frame;
-pub mod log;
+pub mod fsutil;
 pub mod img_io;
 pub mod lang;
+pub mod log;
 pub mod recorder;
 pub mod session;
 pub mod ui;
 pub mod win;
+
+/// 单帧/单张缓存图片允许的最大像素数（约 8K：7680×4320 = 33.2MP）。
+/// 这是防止异常窗口或损坏缓存导致数 GB 分配的硬上限；正常 4K 画布远低于它。
+pub const MAX_CAPTURE_PIXELS: u64 = 40_000_000;
+/// 单边尺寸上限，防止极端长条窗口产生病态布局/尺寸计算。
+pub const MAX_CAPTURE_DIM: i32 = 16_384;
+/// 单张缓存图片文件大小上限（防止读取异常大的本地文件）。
+pub const MAX_IMAGE_FILE_BYTES: u64 = 128 * 1024 * 1024;
 
 /// 解析自编译最小 ffmpeg 的根目录（doctor 用）。
 ///
@@ -46,18 +55,7 @@ pub fn ffmpeg_min_dir() -> std::path::PathBuf {
             return std::path::PathBuf::from(line.trim_matches('"'));
         }
     }
-    for c in [
-        r"D:\CapLite\ffmpeg-min",
-        r"D:\ffmpeg各版本\CapLite_c\ffmpeg-min",
-        r"D:\WorkbuddyWW\CapLite\ffmpeg-min",
-        r"D:\tools\ffmpeg-min-new",
-    ] {
-        let p = std::path::PathBuf::from(c);
-        if p.join("bin").join("avformat.lib").is_file() {
-            return p;
-        }
-    }
-    std::path::PathBuf::from(r"D:\CapLite\ffmpeg-min")
+    std::path::PathBuf::new()
 }
 
 // ---------------------------------------------------------------------------
@@ -102,7 +100,9 @@ fn preferred_dir(sub: &str) -> std::path::PathBuf {
 /// 会话缓存根目录：`CANLAPSE_CACHE` > `<exe 目录>\cache` > `%LOCALAPPDATA%\CanLapse\cache`
 pub fn default_cache_root() -> std::path::PathBuf {
     if let Ok(p) = std::env::var("CANLAPSE_CACHE") {
-        return std::path::PathBuf::from(p);
+        if !p.trim().is_empty() {
+            return std::path::PathBuf::from(p);
+        }
     }
     preferred_dir("cache")
 }

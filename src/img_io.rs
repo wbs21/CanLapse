@@ -17,15 +17,21 @@ pub const JPEG_QUALITY: u8 = 85;
 
 pub fn write_png(path: &Path, frame: &Frame) -> std::io::Result<()> {
     let rgb = frame.to_rgb();
-    let file = File::create(path)?;
-    let w = BufWriter::new(file);
-    let mut enc = png::Encoder::new(w, frame.width as u32, frame.height as u32);
-    enc.set_color(png::ColorType::Rgb);
-    enc.set_depth(png::BitDepth::Eight);
-    let mut writer = enc.write_header()?;
-    writer.write_image_data(&rgb)?;
-    writer.finish()?;
-    Ok(())
+    let (tmp, file) = crate::fsutil::create_temp(path)?;
+    let result = (|| {
+        let w = BufWriter::new(file);
+        let mut enc = png::Encoder::new(w, frame.width as u32, frame.height as u32);
+        enc.set_color(png::ColorType::Rgb);
+        enc.set_depth(png::BitDepth::Eight);
+        let mut writer = enc.write_header()?;
+        writer.write_image_data(&rgb)?;
+        writer.finish()?;
+        crate::fsutil::replace_file(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 /// 写 JPEG。先编码到内存再落盘：编码失败时不会留下半截文件。
@@ -40,7 +46,8 @@ pub fn write_jpeg(path: &Path, frame: &Frame) -> Result<(), String> {
         image::ExtendedColorType::Rgb8,
     )
     .map_err(|e| format!("JPEG 编码失败: {e}"))?;
-    std::fs::write(path, out).map_err(|e| format!("写入 {} 失败: {e}", path.display()))
+    crate::fsutil::write_atomic(path, &out)
+        .map_err(|e| format!("写入 {} 失败: {e}", path.display()))
 }
 
 /// 读回任意格式的帧为 RGBA（重新导出时用；OpenH264 需要 YUV420，转换在编码模块里做）
@@ -57,20 +64,47 @@ pub fn read_image_rgba(path: &Path) -> Result<(u32, u32, Vec<u8>), String> {
 }
 
 fn read_jpeg_rgba(path: &Path) -> Result<(u32, u32, Vec<u8>), String> {
+    let meta = std::fs::metadata(path).map_err(|e| format!("读取 {} 失败: {e}", path.display()))?;
+    if meta.len() > crate::MAX_IMAGE_FILE_BYTES {
+        return Err(format!(
+            "图片文件过大：{}（{} 字节）",
+            path.display(),
+            meta.len()
+        ));
+    }
     let bytes = std::fs::read(path).map_err(|e| format!("打开 {} 失败: {e}", path.display()))?;
+    // 先只读头部尺寸，避免对超大 JPEG 先完整解码再检查，形成解压炸弹。
+    let dims = image::ImageReader::new(std::io::Cursor::new(&bytes))
+        .with_guessed_format()
+        .map_err(|e| format!("识别 JPEG 格式失败: {e}"))?
+        .into_dimensions()
+        .map_err(|e| format!("读取 JPEG 尺寸失败: {e}"))?;
+    validate_image_size(dims.0, dims.1)?;
     let img = image::load_from_memory_with_format(&bytes, image::ImageFormat::Jpeg)
         .map_err(|e| format!("解析 JPEG 失败: {e}"))?;
-    let rgba = img.to_rgba8();
+    let rgba = img.into_rgba8();
     let (w, h) = (rgba.width(), rgba.height());
     Ok((w, h, rgba.into_raw()))
 }
 
 /// 读回 PNG 为 RGBA（旧会话 / 空白帧；调色板、低位深统一展开）
 pub fn read_png_rgba(path: &Path) -> Result<(u32, u32, Vec<u8>), String> {
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.len() > crate::MAX_IMAGE_FILE_BYTES {
+            return Err(format!(
+                "图片文件过大：{}（{} 字节）",
+                path.display(),
+                meta.len()
+            ));
+        }
+    }
     let file = File::open(path).map_err(|e| format!("打开 {} 失败: {e}", path.display()))?;
     let mut decoder = png::Decoder::new(std::io::BufReader::new(file));
     decoder.set_transformations(png::Transformations::normalize_to_color8());
-    let mut reader = decoder.read_info().map_err(|e| format!("解析 PNG 失败: {e}"))?;
+    let mut reader = decoder
+        .read_info()
+        .map_err(|e| format!("解析 PNG 失败: {e}"))?;
+    validate_image_size(reader.info().width, reader.info().height)?;
     let size = reader
         .output_buffer_size()
         .ok_or_else(|| "无法确定 PNG 输出缓冲大小".to_string())?;
@@ -109,6 +143,24 @@ pub fn read_png_rgba(path: &Path) -> Result<(u32, u32, Vec<u8>), String> {
         }
     };
     Ok((w, h, rgba))
+}
+
+fn validate_image_size(width: u32, height: u32) -> Result<(), String> {
+    if width == 0
+        || height == 0
+        || width > crate::MAX_CAPTURE_DIM as u32
+        || height > crate::MAX_CAPTURE_DIM as u32
+    {
+        return Err(format!("图片尺寸超出限制：{width}x{height}"));
+    }
+    let pixels = (width as u64).saturating_mul(height as u64);
+    if pixels > crate::MAX_CAPTURE_PIXELS {
+        return Err(format!(
+            "图片像素数过大：{width}x{height}（{pixels}，上限 {}）",
+            crate::MAX_CAPTURE_PIXELS
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -158,10 +210,31 @@ mod tests {
         let mid = ((24 * f.width + 32) * 4) as usize;
         let px = &f.bgra[mid..mid + 4];
         let got = &rgba[mid..mid + 4];
-        assert!((got[0] as i32 - px[2] as i32).abs() <= 12, "R: {} vs {}", got[0], px[2]);
-        assert!((got[1] as i32 - px[1] as i32).abs() <= 12, "G: {} vs {}", got[1], px[1]);
-        assert!((got[2] as i32 - px[0] as i32).abs() <= 12, "B: {} vs {}", got[2], px[0]);
+        assert!(
+            (got[0] as i32 - px[2] as i32).abs() <= 12,
+            "R: {} vs {}",
+            got[0],
+            px[2]
+        );
+        assert!(
+            (got[1] as i32 - px[1] as i32).abs() <= 12,
+            "G: {} vs {}",
+            got[1],
+            px[1]
+        );
+        assert!(
+            (got[2] as i32 - px[0] as i32).abs() <= 12,
+            "B: {} vs {}",
+            got[2],
+            px[0]
+        );
         let _ = std::fs::remove_file(&path);
     }
 
+    #[test]
+    fn 超大图片尺寸被拒绝() {
+        assert!(validate_image_size(100_000, 100_000).is_err());
+        assert!(validate_image_size(0, 10).is_err());
+        assert!(validate_image_size(1920, 1080).is_ok());
+    }
 }

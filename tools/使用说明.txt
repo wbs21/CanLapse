@@ -12,7 +12,7 @@ Canvas Timelapse Recorder for drawing apps
 3. 选【Frame density】和【Change sensitivity】，点【Start Recording】
 4. 录制中可用画布所在屏幕右上角的悬浮条：Pause / Mark / Stop；Esc 也能停止
 5. 停止后主窗口立刻回来，并弹出合成进度窗；完成后自动关闭，
-   视频在 **程序所在目录\output\timelapse.mp4**（位置固定），可点【Open Video Folder】直达
+   视频在 **程序所在目录\output\timelapse_YYYYMMDD-HHMMSS.mp4**，可点【Open Video Folder】直达
 
 界面语言跟随系统：中文系统显示中文，其余显示英文（没有语言选择项）。
 

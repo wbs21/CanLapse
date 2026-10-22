@@ -75,7 +75,7 @@ canvas HWND ──► DWM thumbnail (DwmRegisterThumbnail + rcSource crop)
               JPEG q85 frame      PNG frame      → cache\<session>\frame_NNNN.*
                      │
                      ▼
-   static ffmpeg 9.0.2 (libavformat + libopenh264)  →  H.264 High, 30 fps, 2 s GOP
+   static ffmpeg 9.0.2 (libavformat + libopenh264)  →  H.264 High, 30 fps, 1 s GOP
                      │
                      ▼
               output\timelapse_YYYYMMDD-HHMMSS.mp4
@@ -134,9 +134,9 @@ pwsh -File tools\build.ps1
 pwsh -File tools\build.ps1 -Profile release
 
 # assemble dist\CanLapse-v<version>-win64.zip (exe + 使用说明.txt only)
-pwsh -File tools\package.ps1 -Version 1.2.1
+pwsh -File tools\package.ps1 -Version 1.3.0
 
-# tests (34)
+# tests (49 unit + 4 integration)
 cargo test --offline
 ```
 
@@ -157,7 +157,6 @@ src/                  Rust sources (ui/, capture.rs, recorder.rs, encode/, sessi
 deps/ffmpeg-static/   vendored MSVC static libs + licenses + rebuild notes
 tools/                build.ps1, package.ps1, embed-resources.ps1, ResInject.cs, 使用说明.txt
 docs/evidence/        screenshots used in this README and in the logs
-tests/                integration tests
 ```
 
 ---

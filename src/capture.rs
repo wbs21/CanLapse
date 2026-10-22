@@ -33,8 +33,7 @@ use windows_sys::Win32::Graphics::Gdi::{
 use windows_sys::Win32::Storage::Xps::PrintWindow;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetSystemMetrics, ShowWindow,
-    SM_XVIRTUALSCREEN, SW_SHOWNOACTIVATE, WM_DESTROY, WM_ERASEBKGND, WM_PAINT,
-    WNDCLASSW, WS_POPUP,
+    SM_XVIRTUALSCREEN, SW_SHOWNOACTIVATE, WM_DESTROY, WM_ERASEBKGND, WM_PAINT, WNDCLASSW, WS_POPUP,
 };
 
 use crate::frame::Frame;
@@ -135,6 +134,7 @@ struct Dib {
 
 impl Dib {
     fn new(width: i32, height: i32) -> Result<Dib, String> {
+        validate_size(width, height)?;
         unsafe {
             let screen = windows_sys::Win32::Graphics::Gdi::GetDC(null_mut());
             if screen.is_null() {
@@ -159,16 +159,38 @@ impl Dib {
                     biClrUsed: 0,
                     biClrImportant: 0,
                 },
-                bmiColors: [RGBQUAD { rgbBlue: 0, rgbGreen: 0, rgbRed: 0, rgbReserved: 0 }],
+                bmiColors: [RGBQUAD {
+                    rgbBlue: 0,
+                    rgbGreen: 0,
+                    rgbRed: 0,
+                    rgbReserved: 0,
+                }],
             };
             let mut bits: *mut c_void = null_mut();
             let bmp = CreateDIBSection(dc, &bmi, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
-            if bmp.is_null() || bits.is_null() {
+            if bmp.is_null() {
                 DeleteDC(dc);
                 return Err("CreateDIBSection 失败".into());
             }
+            if bits.is_null() {
+                DeleteObject(bmp as HGDIOBJ);
+                DeleteDC(dc);
+                return Err("CreateDIBSection 返回空像素指针".into());
+            }
             let old = SelectObject(dc, bmp as HGDIOBJ);
-            Ok(Dib { dc, bmp, old, bits, width, height })
+            if old.is_null() {
+                DeleteObject(bmp as HGDIOBJ);
+                DeleteDC(dc);
+                return Err("SelectObject(DIB) 失败".into());
+            }
+            Ok(Dib {
+                dc,
+                bmp,
+                old,
+                bits,
+                width,
+                height,
+            })
         }
     }
 
@@ -180,6 +202,24 @@ impl Dib {
             )
         }
     }
+}
+
+fn validate_size(width: i32, height: i32) -> Result<(), String> {
+    if width <= 0
+        || height <= 0
+        || width > crate::MAX_CAPTURE_DIM
+        || height > crate::MAX_CAPTURE_DIM
+    {
+        return Err(format!("画面尺寸超出限制：{width}x{height}"));
+    }
+    let pixels = (width as u64).saturating_mul(height as u64);
+    if pixels > crate::MAX_CAPTURE_PIXELS {
+        return Err(format!(
+            "画面尺寸过大：{width}x{height}（{pixels} 像素，上限 {}）",
+            crate::MAX_CAPTURE_PIXELS
+        ));
+    }
+    Ok(())
 }
 
 impl Drop for Dib {
@@ -247,18 +287,25 @@ impl ThumbnailCapture {
         let root = win::root_of(target);
         let crop = win::crop_rect_in_root(target, root)
             .ok_or_else(|| "无法计算目标窗口在顶层窗口中的位置".to_string())?;
-        if crop.2 <= 0 || crop.3 <= 0 {
+        if crop.2 <= 0
+            || crop.3 <= 0
+            || crop.2 > crate::MAX_CAPTURE_DIM
+            || crop.3 > crate::MAX_CAPTURE_DIM
+        {
             return Err(format!("目标窗口区域尺寸异常（{}x{}）", crop.2, crop.3));
         }
         let out = fit_size(crop, max_w);
+        validate_size(out.0, out.1)?;
         unsafe {
+            // 先建 DIB 再建宿主：如果 DIB 失败，不会留下已注册的 DWM 缩略图和宿主窗口。
+            let dib = Dib::new(out.0, out.1)?;
             let (host, thumb) = Self::create_host_and_register(root, crop, out)?;
             let me = ThumbnailCapture {
                 root,
                 target,
                 host,
                 thumb,
-                dib: Dib::new(out.0, out.1)?,
+                dib,
                 crop,
                 out,
                 max_w,
@@ -310,7 +357,10 @@ impl ThumbnailCapture {
         let hr = DwmRegisterThumbnail(host, root, &mut thumb);
         if hr != 0 {
             DestroyWindow(host);
-            logline!("[capture] DwmRegisterThumbnail 失败 hr=0x{hr:08X} root=0x{:X}", root as isize);
+            logline!(
+                "[capture] DwmRegisterThumbnail 失败 hr=0x{hr:08X} root=0x{:X}",
+                root as isize
+            );
             return Err(format!(
                 "DwmRegisterThumbnail 失败 hr=0x{hr:08X}（顶层窗口可能已失效）"
             ));
@@ -338,8 +388,18 @@ impl ThumbnailCapture {
                 | DWM_TNP_SOURCECLIENTAREAONLY,
             // 目标矩形 = 宿主客户区（可能小于源矩形 => DWM 负责缩放）；
             // 源矩形 = 目标窗口在**源客户区坐标系**里的位置。
-            rcDestination: RECT { left: 0, top: 0, right: ow, bottom: oh },
-            rcSource: RECT { left: cx, top: cy, right: cx + cw, bottom: cy + ch },
+            rcDestination: RECT {
+                left: 0,
+                top: 0,
+                right: ow,
+                bottom: oh,
+            },
+            rcSource: RECT {
+                left: cx,
+                top: cy,
+                right: cx + cw,
+                bottom: cy + ch,
+            },
             opacity: 255,
             fVisible: 1,
             fSourceClientAreaOnly: 1,
@@ -361,7 +421,9 @@ impl ThumbnailCapture {
         props.fVisible = if visible { 1 } else { 0 };
         let hr = unsafe { DwmUpdateThumbnailProperties(self.thumb, &props) };
         if hr != 0 {
-            return Err(format!("DwmUpdateThumbnailProperties(visible) 失败 hr=0x{hr:08X}"));
+            return Err(format!(
+                "DwmUpdateThumbnailProperties(visible) 失败 hr=0x{hr:08X}"
+            ));
         }
         Ok(())
     }
@@ -398,14 +460,20 @@ impl ThumbnailCapture {
         }
         let crop = win::crop_rect_in_root(self.target, self.root)
             .ok_or_else(|| "无法计算目标窗口位置".to_string())?;
-        if crop.2 <= 0 || crop.3 <= 0 {
+        if crop.2 <= 0
+            || crop.3 <= 0
+            || crop.2 > crate::MAX_CAPTURE_DIM
+            || crop.3 > crate::MAX_CAPTURE_DIM
+        {
             return Err(format!("目标窗口区域尺寸异常（{}x{}）", crop.2, crop.3));
         }
         let size_changed = crop.2 != self.crop.2 || crop.3 != self.crop.3;
         let out = fit_size(crop, self.max_w);
         let out_changed = out != self.out;
+        let crop_changed = crop != self.crop;
         if size_changed || out_changed {
             unsafe {
+                let new_dib = Dib::new(out.0, out.1)?;
                 win::pump();
                 if self.thumb != 0 {
                     DwmUnregisterThumbnail(self.thumb);
@@ -419,11 +487,13 @@ impl ThumbnailCapture {
                 self.host = host;
                 self.thumb = thumb;
                 self.out = out;
-                self.dib = Dib::new(out.0, out.1)?;
+                self.dib = new_dib;
             }
         }
         self.crop = crop;
-        unsafe { self.apply_properties()? };
+        if crop_changed || size_changed || out_changed {
+            unsafe { self.apply_properties()? };
+        }
         Ok(size_changed)
     }
 
@@ -437,6 +507,7 @@ impl ThumbnailCapture {
     /// ⚠️ 按用户要求，**当前不用于提醒**：绘画软件自己的浮动面板压在画布上是正常现象，
     /// 照原样录进画面即可（不裁切、不提示）。这个函数保留下来是因为
     /// "画布被遮住多少"仍是可复现的事实，将来若要做"自动裁掉被遮区域"会用到。
+    #[allow(dead_code)]
     pub fn covered_ratio(&self) -> f32 {
         win::covered_ratio(self.root, self.crop)
     }
@@ -446,7 +517,11 @@ impl ThumbnailCapture {
     /// 目标窗口被其他窗口盖住、甚至被最小化时，本方法依然能取到画面（实测）。
     pub fn grab(&self) -> Result<Frame, String> {
         let (w, h) = self.out;
-        let mut f = Frame::new(w, h, vec![0u8; (w as usize).saturating_mul(h as usize).saturating_mul(4)]);
+        let mut f = Frame::new(
+            w,
+            h,
+            vec![0u8; (w as usize).saturating_mul(h as usize).saturating_mul(4)],
+        );
         self.grab_into(&mut f)?;
         Ok(f)
     }
@@ -473,6 +548,37 @@ impl ThumbnailCapture {
             frame.bgra.copy_from_slice(pixels);
         }
         Ok(())
+    }
+
+    /// 只把**发生变化**的 DIB 复制到 `frame`。
+    ///
+    /// 静态画布下 `prev` 与当前 DIB 相同，直接返回 false，不产生几十 MB 的
+    /// DIB→Frame 拷贝；只有确实需要保存时才复制。
+    pub fn grab_if_changed(
+        &self,
+        prev: &Frame,
+        threshold: f32,
+        frame: &mut Frame,
+    ) -> Result<bool, String> {
+        if !self.source_alive() {
+            return Err("目标窗口已关闭".into());
+        }
+        win::pump();
+        let ok = unsafe { PrintWindow(self.host, self.dib.dc, PW_RENDERFULLCONTENT_FLAG) };
+        if ok == 0 {
+            return Err("PrintWindow(宿主, PW_RENDERFULLCONTENT) 返回失败".into());
+        }
+        let (w, h) = self.out;
+        let pixels = self.dib.pixels();
+        if prev.width == w && prev.height == h && !prev.changed_enough_bytes(pixels, threshold) {
+            return Ok(false);
+        }
+        if frame.width != w || frame.height != h || frame.bgra.len() != pixels.len() {
+            *frame = Frame::new(w, h, pixels.to_vec());
+        } else {
+            frame.bgra.copy_from_slice(pixels);
+        }
+        Ok(true)
     }
 
     /// 直接对源窗口抓一帧（`PrintWindow(源, PW_RENDERFULLCONTENT)`）。
@@ -529,7 +635,7 @@ impl Drop for ThumbnailCapture {
 
 #[cfg(test)]
 mod tests {
-    use super::fit_size;
+    use super::{fit_size, validate_size};
 
     #[test]
     fn 预览缩放按宽度等比且不放大() {
@@ -543,5 +649,12 @@ mod tests {
         let (w, h) = fit_size((0, 0, 4000, 10), 480);
         assert_eq!(w, 480);
         assert!(h >= 1);
+    }
+
+    #[test]
+    fn 超大画面尺寸被拒绝() {
+        assert!(validate_size(20_000, 100).is_err());
+        assert!(validate_size(10_000, 10_000).is_err());
+        assert!(validate_size(1920, 1080).is_ok());
     }
 }

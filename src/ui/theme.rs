@@ -13,9 +13,9 @@ use std::sync::{Mutex, OnceLock};
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, CreateFontW, CreateSolidBrush, CreatePen, DeleteObject, DrawTextW, EndPaint,
-    FillRect, GetStockObject, InvalidateRect, RoundRect, SelectObject, SetBkColor, SetBkMode, SetTextColor,
-    DEFAULT_GUI_FONT, FW_NORMAL, HBRUSH, HDC, HGDIOBJ, NULL_BRUSH, PS_SOLID,
+    BeginPaint, CreateFontW, CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint,
+    FillRect, GetStockObject, InvalidateRect, RoundRect, SelectObject, SetBkColor, SetBkMode,
+    SetTextColor, DEFAULT_GUI_FONT, FW_NORMAL, HBRUSH, HDC, HGDIOBJ, NULL_BRUSH, PS_SOLID,
 };
 use windows_sys::Win32::UI::Controls::SetWindowTheme;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
@@ -23,9 +23,8 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetClientRect, WM_ERASEBKGND, WM_ENABLE, WM_GETTEXT,
-    WM_GETTEXTLENGTH, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT,
-    WM_SETFOCUS,
+    GetClientRect, WM_ENABLE, WM_ERASEBKGND, WM_GETTEXT, WM_GETTEXTLENGTH, WM_KILLFOCUS,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_SETFOCUS,
 };
 
 use crate::win;
@@ -67,28 +66,56 @@ struct State {
 }
 
 static STATES: Mutex<Option<HashMap<isize, State>>> = Mutex::new(None);
-static FONT: OnceLock<isize> = OnceLock::new();
 static BG_BRUSH: OnceLock<isize> = OnceLock::new();
-static SMALL_FONT: OnceLock<isize> = OnceLock::new();
-static HEADING: OnceLock<isize> = OnceLock::new();
+/// 字体按“物理像素高度”缓存。DPI 切换后同一个逻辑字号会得到不同高度，
+/// 因此不能只用 OnceLock 缓存一个字体。
+static FONTS: OnceLock<Mutex<HashMap<i32, isize>>> = OnceLock::new();
 
 fn with_state<R>(f: impl FnOnce(&mut HashMap<isize, State>) -> R) -> R {
-    let mut guard = STATES.lock().unwrap();
+    let mut guard = STATES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let map = guard.get_or_insert_with(HashMap::new);
     f(map)
 }
 
-pub fn font() -> HGDIOBJ {
-    let f = *FONT.get_or_init(|| unsafe {
-        let face = win::wide(crate::lang::ui_font_face());
-        let mut f = CreateFontW(-11, 0, 0, 0, FW_NORMAL as i32, 0, 0, 0, 1, 0, 0, 0, 0, face.as_ptr())
-            as isize;
-        if f == 0 {
-            f = GetStockObject(DEFAULT_GUI_FONT) as isize;
+fn font_for(base_px: i32) -> HGDIOBJ {
+    let height = super::scale::px(base_px).max(1);
+    let cache = FONTS.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(mut map) = cache.lock() {
+        if let Some(v) = map.get(&height) {
+            return *v as HGDIOBJ;
         }
-        f
-    });
-    f as HGDIOBJ
+        let face = win::wide(crate::lang::ui_font_face());
+        let mut f = unsafe {
+            CreateFontW(
+                -height,
+                0,
+                0,
+                0,
+                FW_NORMAL as i32,
+                0,
+                0,
+                0,
+                1,
+                0,
+                0,
+                0,
+                0,
+                face.as_ptr(),
+            ) as isize
+        };
+        if f == 0 {
+            f = unsafe { GetStockObject(DEFAULT_GUI_FONT) as isize };
+        }
+        map.insert(height, f);
+        return f as HGDIOBJ;
+    }
+    unsafe { GetStockObject(DEFAULT_GUI_FONT) as HGDIOBJ }
+}
+
+pub fn font() -> HGDIOBJ {
+    font_for(11)
 }
 
 /// 主背景画刷（窗口类背景 + `WM_CTLCOLORSTATIC` 用）
@@ -99,32 +126,12 @@ pub fn bg_brush() -> HBRUSH {
 
 /// 15px 标题字体：合成遮罩的"视频合成中"用
 pub fn heading_font() -> HGDIOBJ {
-    let f = *HEADING.get_or_init(|| unsafe {
-        let face = win::wide(crate::lang::ui_font_face());
-        let v = CreateFontW(-15, 0, 0, 0, FW_NORMAL as i32, 0, 0, 0, 1, 0, 0, 0, 0, face.as_ptr())
-            as isize;
-        if v == 0 {
-            font() as isize
-        } else {
-            v
-        }
-    });
-    f as HGDIOBJ
+    font_for(15)
 }
 
 /// 9px 小字体：窄按钮放不下时自动降一档
 pub fn small_font() -> HGDIOBJ {
-    let f = *SMALL_FONT.get_or_init(|| unsafe {
-        let face = win::wide(crate::lang::ui_font_face());
-        let v = CreateFontW(-9, 0, 0, 0, FW_NORMAL as i32, 0, 0, 0, 1, 0, 0, 0, 0, face.as_ptr())
-            as isize;
-        if v == 0 {
-            font() as isize
-        } else {
-            v
-        }
-    });
-    f as HGDIOBJ
+    font_for(9)
 }
 
 unsafe fn text_width(dc: HDC, s: &str) -> i32 {
@@ -134,7 +141,7 @@ unsafe fn text_width(dc: HDC, s: &str) -> i32 {
     windows_sys::Win32::Graphics::Gdi::GetTextExtentPoint32W(
         dc,
         t.as_ptr(),
-        s.chars().count() as i32,
+        t.len().saturating_sub(1) as i32,
         &mut sz,
     );
     sz.cx
@@ -144,11 +151,7 @@ unsafe fn text_width(dc: HDC, s: &str) -> i32 {
 unsafe fn control_label(dc: HDC, hwnd: HWND, rc: RECT, color: u32, align: u32, max_w: i32) {
     let s = control_text(hwnd);
     let tw = text_width(dc, &s);
-    let f = if tw > max_w {
-        small_font()
-    } else {
-        font()
-    };
+    let f = if tw > max_w { small_font() } else { font() };
     let old = SelectObject(dc, f);
     text(dc, &s, rc, color, align);
     SelectObject(dc, old);
@@ -165,6 +168,15 @@ pub unsafe fn text(dc: HDC, s: &str, rc: RECT, color: u32, align: u32) {
     DrawTextW(dc, t.as_ptr(), -1, &mut r, align | 0x0020); // DT_SINGLELINE
 }
 
+/// 多行文字。`text()` 会强制 `DT_SINGLELINE`，适合按钮和标签；合成结果里的
+/// “统计信息 + 输出路径”必须用这个版本，否则换行后的路径会被整行吞掉。
+pub unsafe fn text_block(dc: HDC, s: &str, rc: RECT, color: u32, align: u32) {
+    SetTextColor(dc, color);
+    let t = win::wide(s);
+    let mut r = rc;
+    DrawTextW(dc, t.as_ptr(), -1, &mut r, align);
+}
+
 pub unsafe fn fill_round(dc: HDC, rc: RECT, color: u32, radius: i32) {
     let br = solid(color);
     let pen = CreatePen(PS_SOLID, 1, color);
@@ -179,12 +191,9 @@ pub unsafe fn fill_round(dc: HDC, rc: RECT, color: u32, radius: i32) {
 
 fn control_text(hwnd: HWND) -> String {
     unsafe {
-        let n = windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW(
-            hwnd,
-            WM_GETTEXTLENGTH,
-            0,
-            0,
-        ) as usize;
+        let n =
+            windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW(hwnd, WM_GETTEXTLENGTH, 0, 0)
+                as usize;
         let mut buf = vec![0u16; n + 1];
         let got = windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW(
             hwnd,
@@ -208,9 +217,7 @@ unsafe fn paint_control(hwnd: HWND, role: Role) {
     let enabled = IsWindowEnabled(hwnd) != 0;
 
     // 背景：先铺主背景色（控件矩形是矩形，父窗口也是同色，所以看不出边界）
-    let bg = solid(BG);
-    FillRect(dc, &rc, bg as _);
-    DeleteObject(bg);
+    FillRect(dc, &rc, bg_brush());
 
     let old_font = SelectObject(dc, font());
     SetBkMode(dc, 1); // TRANSPARENT
@@ -226,10 +233,8 @@ unsafe fn paint_control(hwnd: HWND, role: Role) {
             };
             fill_round(dc, track, BORDER, 6);
             let pos = windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW(
-                hwnd,
-                0x0408, // PBM_GETPOS
-                0,
-                0,
+                hwnd, 0x0408, // PBM_GETPOS
+                0, 0,
             ) as i32;
             let pct = (pos as f64 / 100.0).clamp(0.0, 1.0);
             if pct > 0.0 {
@@ -251,10 +256,8 @@ unsafe fn paint_control(hwnd: HWND, role: Role) {
                 bottom: (h - 15) / 2 + 15,
             };
             let checked = windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW(
-                hwnd,
-                0x00F0, // BM_GETCHECK
-                0,
-                0,
+                hwnd, 0x00F0, // BM_GETCHECK
+                0, 0,
             ) == 1;
             let bgc = if checked {
                 ACCENT
@@ -297,7 +300,7 @@ unsafe fn paint_control(hwnd: HWND, role: Role) {
                 hwnd,
                 text_rc,
                 if enabled { TEXT } else { DISABLED },
-                0x0000_0000 | 0x0000_0004, // DT_LEFT | DT_VCENTER
+                0x0000_0004, // DT_LEFT | DT_VCENTER
                 w - 28,
             );
         }
@@ -329,7 +332,15 @@ unsafe fn paint_control(hwnd: HWND, role: Role) {
                     let border = CreatePen(PS_SOLID, 1, BORDER);
                     let ob = SelectObject(dc, GetStockObject(NULL_BRUSH));
                     let op = SelectObject(dc, border);
-                    RoundRect(dc, rc.left, rc.top, rc.right - 1, rc.bottom - 1, radius, radius);
+                    RoundRect(
+                        dc,
+                        rc.left,
+                        rc.top,
+                        rc.right - 1,
+                        rc.bottom - 1,
+                        radius,
+                        radius,
+                    );
                     SelectObject(dc, op);
                     SelectObject(dc, ob);
                     DeleteObject(border);
@@ -358,7 +369,7 @@ unsafe fn paint_control(hwnd: HWND, role: Role) {
     }
 
     SelectObject(dc, old_font);
-    EndPaint(hwnd, &mut ps);
+    EndPaint(hwnd, &ps);
 }
 
 unsafe extern "system" fn subclass_proc(
@@ -376,7 +387,7 @@ unsafe extern "system" fn subclass_proc(
         4 => Role::Progress,
         _ => Role::Ghost,
     };
-    match msg {
+    win::guard(|| match msg {
         WM_PAINT => {
             paint_control(hwnd, role);
             0
@@ -431,7 +442,7 @@ unsafe extern "system" fn subclass_proc(
             DefSubclassProc(hwnd, msg, wparam, lparam)
         }
         _ => DefSubclassProc(hwnd, msg, wparam, lparam),
-    }
+    })
 }
 
 /// 把一个子控件挂上自绘主题（按钮 / 复选框 / 进度条）
@@ -458,7 +469,13 @@ fn uxtheme() -> isize {
     static H: OnceLock<isize> = OnceLock::new();
     *H.get_or_init(|| unsafe {
         let name = win::wide("uxtheme.dll");
-        windows_sys::Win32::System::LibraryLoader::LoadLibraryW(name.as_ptr()) as isize
+        // 不能使用裸 LoadLibraryW：便携版 exe 常放在可写目录，Windows 会先搜索
+        // exe 所在目录，存在 DLL 搜索路径劫持风险。只允许系统目录。
+        windows_sys::Win32::System::LibraryLoader::LoadLibraryExW(
+            name.as_ptr(),
+            std::ptr::null_mut(),
+            0x0000_0800, // LOAD_LIBRARY_SEARCH_SYSTEM32
+        ) as isize
     })
 }
 
@@ -487,6 +504,7 @@ pub unsafe fn prefer_dark() {
 }
 
 /// 单个窗口：允许深色 + 换成 DarkMode_Explorer 主题
+#[allow(dead_code)]
 pub unsafe fn darken(hwnd: HWND) {
     if hwnd.is_null() {
         return;
@@ -518,7 +536,8 @@ pub unsafe fn dark_window_frame(hwnd: HWND) {
     let pref: u32 = 2;
     let _ = DwmSetWindowAttribute(hwnd, 33, &pref as *const u32 as *const _, 4); // 圆角
     let none: u32 = 0xFFFF_FFFE;
-    let _ = DwmSetWindowAttribute(hwnd, 34, &none as *const u32 as *const _, 4); // 无边框色
+    let _ = DwmSetWindowAttribute(hwnd, 34, &none as *const u32 as *const _, 4);
+    // 无边框色
 }
 
 /// 输入框（Edit）：深色底 + 浅色字。在主窗口 `WM_CTLCOLOREDIT` 里调用。

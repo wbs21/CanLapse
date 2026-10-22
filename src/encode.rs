@@ -74,6 +74,7 @@ pub struct EncodeOptions {
     pub output: PathBuf,
 }
 
+#[derive(Debug)]
 pub struct EncodeStats {
     pub frames: u32,
     pub bytes: u64,
@@ -89,6 +90,7 @@ pub enum Progress {
     Cancel,
 }
 
+#[derive(Debug)]
 pub enum EncodeOutcome {
     Done(EncodeStats),
     /// 用户取消：文件已经写成可播放的部分，统计为已编码帧数
@@ -168,6 +170,10 @@ fn collect_frames(dir: &Path) -> Result<Vec<PathBuf>, String> {
     let entries = fs::read_dir(dir).map_err(|e| format!("读取 {} 失败: {e}", dir.display()))?;
     let mut indexed: Vec<(u32, PathBuf)> = Vec::new();
     for e in entries.flatten() {
+        let is_file = e.file_type().map(|t| t.is_file()).unwrap_or(false);
+        if !is_file {
+            continue;
+        }
         let name = e.file_name().to_string_lossy().to_string();
         let lower = name.to_ascii_lowercase();
         if !lower.starts_with("frame_") {
@@ -189,6 +195,16 @@ fn collect_frames(dir: &Path) -> Result<Vec<PathBuf>, String> {
         indexed.push((idx, e.path()));
     }
     indexed.sort_by_key(|(i, _)| *i);
+    for pair in indexed.windows(2) {
+        if pair[0].0 == pair[1].0 {
+            return Err(format!(
+                "帧号 {} 同时存在多个文件（{} / {}），请先清理缓存",
+                pair[0].0,
+                pair[0].1.display(),
+                pair[1].1.display()
+            ));
+        }
+    }
     Ok(indexed.into_iter().map(|(_, p)| p).collect())
 }
 
@@ -213,6 +229,26 @@ struct Muxer {
     trailer_written: bool,
     total_bytes: u64,
     packets: usize,
+}
+
+/// 手写偏移表只对 FFmpeg 9 的 libavcodec 63 / libavutil 61 布局有效。
+/// 在这里做一次 major 版本校验，避免动态回退时套用错误的结构体偏移。
+fn check_ffi_version() -> Result<(), String> {
+    let codec = unsafe { avcodec_version() };
+    let util = unsafe { avutil_version() };
+    if (codec >> 16) != 63 || (util >> 16) != 61 {
+        return Err(format!(
+            "FFmpeg ABI 不匹配：期望 avcodec 63 / avutil 61，实际 {}.{}.{} / {}.{}.{}；\
+             请使用 deps/ffmpeg-static 或对应的 ffmpeg-min 构建",
+            codec >> 16,
+            (codec >> 8) & 0xff,
+            codec & 0xff,
+            util >> 16,
+            (util >> 8) & 0xff,
+            util & 0xff
+        ));
+    }
+    Ok(())
 }
 
 impl Muxer {
@@ -243,8 +279,12 @@ impl Muxer {
         fps: f64,
         bitrate: i64,
     ) -> Result<Muxer, String> {
+        check_ffi_version()?;
         // 日志级别：默认只报错；排查时可用 CANLAPSE_AV_LOG=info
-        let level = match std::env::var("CANLAPSE_AV_LOG").unwrap_or_default().as_str() {
+        let level = match std::env::var("CANLAPSE_AV_LOG")
+            .unwrap_or_default()
+            .as_str()
+        {
             "info" => AV_LOG_INFO,
             "warning" | "warn" => AV_LOG_WARNING,
             _ => AV_LOG_ERROR,
@@ -301,7 +341,10 @@ impl Muxer {
         set_opt_str(priv_data, "rc_mode", "bitrate");
         set_opt_int(priv_data, "allow_skip_frames", 0);
 
-        ck("avcodec_open2", avcodec_open2(m.ctx, codec, ptr::null_mut()))?;
+        ck(
+            "avcodec_open2",
+            avcodec_open2(m.ctx, codec, ptr::null_mut()),
+        )?;
 
         // ---- 可复用的编码侧 YUV420P 帧 ----
         m.frame = av_frame_alloc();
@@ -400,6 +443,11 @@ impl Muxer {
                 sws_freeContext(self.sws);
                 self.sws = ptr::null_mut();
             }
+            let flags = if src_w == self.enc_w && src_h == self.enc_h {
+                SWS_POINT
+            } else {
+                SWS_BILINEAR
+            };
             self.sws = sws_getContext(
                 src_w,
                 src_h,
@@ -407,7 +455,7 @@ impl Muxer {
                 self.enc_w,
                 self.enc_h,
                 AV_PIX_FMT_YUV420P,
-                SWS_BILINEAR,
+                flags,
                 ptr::null_mut(),
                 ptr::null_mut(),
                 ptr::null(),
@@ -451,7 +499,10 @@ impl Muxer {
         }
 
         set_i64(self.frame, FRAME_PTS, pts);
-        ck("avcodec_send_frame", avcodec_send_frame(self.ctx, self.frame))?;
+        ck(
+            "avcodec_send_frame",
+            avcodec_send_frame(self.ctx, self.frame),
+        )?;
         self.drain_packets()
     }
 
@@ -504,6 +555,9 @@ impl Drop for Muxer {
 /// 这套构建里有没有可用的 `libopenh264` 编码器（给自检命令用）
 pub fn encoder_available() -> bool {
     unsafe {
+        if check_ffi_version().is_err() {
+            return false;
+        }
         let n = CString::new("libopenh264").unwrap();
         !avcodec_find_encoder_by_name(n.as_ptr()).is_null()
     }
@@ -531,13 +585,14 @@ pub fn encode_session(
     let frames = collect_frames(session_dir)?;
     if frames.is_empty() {
         return Err(format!(
-            "{} 里没有 frame_*.png 帧，无法合成",
+            "{} 里没有 frame_* 帧，无法合成",
             session_dir.display()
         ));
     }
 
-    let (first_w, first_h, _) = img_io::read_image_rgba(&frames[0])?;
-    let (first_w, first_h) = (first_w as i32, first_h as i32);
+    let (first_w_u32, first_h_u32, first_rgba) = img_io::read_image_rgba(&frames[0])?;
+    let (first_w, first_h) = (first_w_u32 as i32, first_h_u32 as i32);
+    let mut first_rgba = Some(first_rgba);
     let enc_w = first_w & !1;
     let enc_h = first_h & !1;
     if enc_w < 2 || enc_h < 2 {
@@ -550,6 +605,12 @@ pub fn encode_session(
                 .map_err(|e| format!("创建输出目录 {} 失败: {e}", parent.display()))?;
         }
     }
+    let space_dir = opts
+        .output
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(session_dir);
+    crate::fsutil::ensure_headroom(space_dir, crate::fsutil::MIN_FREE_BYTES, "视频输出目录")?;
 
     let bitrate = opts.quality.bitrate_for(enc_w, enc_h, opts.fps);
     let total = frames.len() as u32;
@@ -557,12 +618,23 @@ pub fn encode_session(
     let mut cancelled = false;
     let mut size_changes = 0u32;
 
-    {
-        let mut muxer = unsafe { Muxer::open(&opts.output, enc_w, enc_h, opts.fps, bitrate)? };
+    // 先写同目录的 .part，成功后再替换最终文件。这样编码中途失败不会留下
+    // 一个“看起来是完整 MP4”的坏文件；取消时仍会把已写入的部分视频提交。
+    let part = crate::fsutil::tmp_path(&opts.output);
+    let encoded = (|| -> Result<(), String> {
+        let mut muxer = unsafe { Muxer::open(&part, enc_w, enc_h, opts.fps, bitrate)? };
 
         for (i, path) in frames.iter().enumerate() {
-            let (fw, fh, rgba) = img_io::read_image_rgba(path)
-                .map_err(|e| format!("读取第 {i} 帧失败（{}）: {e}", path.display()))?;
+            let (fw, fh, rgba) = if i == 0 {
+                (
+                    first_w_u32,
+                    first_h_u32,
+                    first_rgba.take().expect("首帧已读取"),
+                )
+            } else {
+                img_io::read_image_rgba(path)
+                    .map_err(|e| format!("读取第 {i} 帧失败（{}）: {e}", path.display()))?
+            };
             let (fw, fh) = (fw as i32, fh as i32);
             if fw != first_w || fh != first_h {
                 size_changes += 1;
@@ -583,6 +655,15 @@ pub fn encode_session(
         }
 
         unsafe { muxer.finish()? };
+        Ok(())
+    })();
+    if let Err(e) = encoded {
+        let _ = fs::remove_file(&part);
+        return Err(e);
+    }
+    if let Err(e) = crate::fsutil::replace_file(&part, &opts.output) {
+        let _ = fs::remove_file(&part);
+        return Err(format!("提交输出文件 {} 失败: {e}", opts.output.display()));
     }
 
     if size_changes > 0 {
@@ -680,5 +761,33 @@ mod tests {
     fn rgba转bgra只交换红蓝() {
         let src = vec![1u8, 2, 3, 255, 10, 20, 30, 255];
         assert_eq!(rgba_to_bgra(src), vec![3u8, 2, 1, 255, 30, 20, 10, 255]);
+    }
+
+    #[test]
+    fn 编码先写part再提交最终文件() {
+        if !encoder_available() {
+            return;
+        }
+        let dir = std::path::PathBuf::from("target")
+            .join("test-tmp")
+            .join(format!("canlapse-encode-atomic-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let frame = crate::frame::Frame::new(32, 32, vec![255u8; 32 * 32 * 4]);
+        img_io::write_png(&dir.join("frame_0000.png"), &frame).unwrap();
+        let out = dir.join("out.mp4");
+        let opts = EncodeOptions {
+            fps: 10.0,
+            quality: Quality::Medium,
+            output: out.clone(),
+        };
+        let result = encode_session(&dir, &opts, &mut |_, _| Progress::Continue);
+        assert!(matches!(result, Ok(EncodeOutcome::Done(_))));
+        assert!(out.is_file());
+        assert!(!fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .any(|e| { e.file_name().to_string_lossy().ends_with(".tmp") }));
+        let _ = fs::remove_dir_all(&dir);
     }
 }
