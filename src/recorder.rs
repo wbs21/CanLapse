@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::HWND;
 
 use crate::capture::ThumbnailCapture;
+use crate::encode::{Quality, StreamEncoder};
 use crate::frame::Frame;
 use crate::logline;
 use crate::session::Session;
@@ -73,6 +74,10 @@ pub struct RecorderConfig {
     /// 但**命令行/脚本**常常是"在终端里录一个后台窗口"，此时前台永远是终端，
     /// 规则会让录制一直暂停、一帧都不出 —— 所以这类场景要能关掉。
     pub fg_pause: bool,
+    /// 从用户选择的第二视图采集完整画布。
+    pub full_view: bool,
+    /// 旧兼容入口：自动查找 SAI2/CSP 导航器。
+    pub navigator: bool,
 }
 
 pub struct Shared {
@@ -218,10 +223,6 @@ enum WriterCmd {
     Marker {
         elapsed_ms: u64,
     },
-    Geometry {
-        width: i32,
-        height: i32,
-    },
     Finish {
         dropped: u32,
         duration_ms: u64,
@@ -234,6 +235,7 @@ enum WriterCmd {
 ///
 /// 抓帧线程只负责抓帧、差分和把变化帧放进有界队列；写盘线程复用同一个
 /// `Session`，按队列顺序保存帧/标记，停止时 drain 完再写最终的 markers.json。
+#[cfg(test)]
 struct SessionWriter {
     tx: Option<SyncSender<WriterCmd>>,
     handle: Option<JoinHandle<()>>,
@@ -256,6 +258,30 @@ fn join_writer_timeout(handle: Option<JoinHandle<()>>, timeout: Duration) {
     let _ = handle.join();
 }
 
+fn send_finish_with_timeout(
+    tx: &SyncSender<WriterCmd>,
+    mut cmd: WriterCmd,
+    timeout: Duration,
+) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match tx.try_send(cmd) {
+            Ok(()) => return Ok(()),
+            Err(TrySendError::Full(returned)) if Instant::now() < deadline => {
+                cmd = returned;
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(TrySendError::Full(_)) => {
+                return Err("流式写入队列长时间无响应".into());
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                return Err("流式编码线程已退出".into());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 impl SessionWriter {
     fn new(mut session: Session, shared: Arc<Shared>) -> Self {
         let (tx, rx) = sync_channel::<WriterCmd>(4);
@@ -308,9 +334,6 @@ impl SessionWriter {
                         shared_for_thread
                             .markers
                             .store(session.marker_count() as u32, Ordering::SeqCst);
-                    }
-                    WriterCmd::Geometry { width, height } => {
-                        session.update_geometry(width, height);
                     }
                     WriterCmd::Finish {
                         dropped,
@@ -379,12 +402,6 @@ impl SessionWriter {
         }
     }
 
-    fn set_geometry(&self, width: i32, height: i32) {
-        if let Some(tx) = &self.tx {
-            let _ = tx.send(WriterCmd::Geometry { width, height });
-        }
-    }
-
     fn finish(mut self, dropped: u32, duration_ms: u64, completed: bool) -> Result<(), String> {
         let (ack_tx, ack_rx) = sync_channel(1);
         let Some(tx) = self.tx.take() else {
@@ -407,11 +424,225 @@ impl SessionWriter {
     }
 }
 
+#[cfg(test)]
 impl Drop for SessionWriter {
     fn drop(&mut self) {
         if let Some(tx) = self.tx.take() {
             let (ack_tx, _) = sync_channel(1);
             let _ = tx.send(WriterCmd::Finish {
+                dropped: self.shared.dropped.load(Ordering::SeqCst),
+                duration_ms: self.shared.elapsed_ms.load(Ordering::SeqCst),
+                completed: false,
+                ack: ack_tx,
+            });
+        }
+        join_writer_timeout(self.handle.take(), Duration::from_secs(5));
+    }
+}
+
+trait MarkerSink {
+    fn marker(&self, elapsed_ms: u64);
+}
+
+#[cfg(test)]
+impl MarkerSink for SessionWriter {
+    fn marker(&self, elapsed_ms: u64) {
+        SessionWriter::marker(self, elapsed_ms);
+    }
+}
+
+/// Streaming writer: H.264 packets go straight to a fragmented MP4.
+///
+/// No PNG/JPEG frame files are produced. Encoding runs on a separate bounded
+/// worker so the capture thread is not blocked by OpenH264 or file I/O.
+struct StreamWriter {
+    tx: Option<SyncSender<WriterCmd>>,
+    handle: Option<JoinHandle<()>>,
+    shared: Arc<Shared>,
+    pool: Arc<Mutex<Vec<Frame>>>,
+}
+
+impl StreamWriter {
+    fn new(
+        mut session: Session,
+        shared: Arc<Shared>,
+        width: i32,
+        height: i32,
+    ) -> Result<Self, String> {
+        let stream_path = session.dir().join(crate::session::STREAM_FILE);
+        let session_dir = session.dir().to_path_buf();
+        let mut encoder = match StreamEncoder::new(&stream_path, width, height, Quality::Medium) {
+            Ok(encoder) => encoder,
+            Err(e) => {
+                drop(session);
+                let _ = std::fs::remove_dir_all(&session_dir);
+                return Err(e);
+            }
+        };
+        let (enc_w, enc_h) = encoder.dimensions();
+        session.update_geometry(enc_w, enc_h);
+
+        let (tx, rx) = sync_channel::<WriterCmd>(4);
+        let shared_for_thread = shared.clone();
+        let pool = Arc::new(Mutex::new(Vec::<Frame>::new()));
+        let pool_for_thread = pool.clone();
+        let handle = std::thread::spawn(move || {
+            unsafe {
+                windows_sys::Win32::System::Threading::SetThreadPriority(
+                    windows_sys::Win32::System::Threading::GetCurrentThread(),
+                    -1,
+                );
+            }
+            let mut failure: Option<String> = None;
+            while let Ok(cmd) = rx.recv() {
+                match cmd {
+                    WriterCmd::Frame(frame) => {
+                        if failure.is_none() {
+                            match encoder.write_frame(&frame) {
+                                Ok(()) => {
+                                    let n = session.record_encoded_frame();
+                                    shared_for_thread.frames.store(n, Ordering::SeqCst);
+                                }
+                                Err(e) => {
+                                    let message = format!("流式编码失败: {e}");
+                                    failure = Some(message.clone());
+                                    if let Ok(mut slot) = shared_for_thread.error.lock() {
+                                        *slot = Some(message);
+                                    }
+                                    shared_for_thread.request_stop();
+                                }
+                            }
+                        } else {
+                            shared_for_thread.dropped.fetch_add(1, Ordering::SeqCst);
+                        }
+                        if let Ok(mut pool) = pool_for_thread.lock() {
+                            if pool.len() < 4 {
+                                pool.push(frame);
+                            }
+                        }
+                    }
+                    WriterCmd::Marker { elapsed_ms } => {
+                        session.add_marker(None, elapsed_ms);
+                        shared_for_thread
+                            .markers
+                            .store(session.marker_count() as u32, Ordering::SeqCst);
+                    }
+                    WriterCmd::Finish {
+                        dropped,
+                        duration_ms,
+                        completed,
+                        ack,
+                    } => {
+                        let result = if let Some(error) = failure {
+                            let _ = session.finish(dropped, duration_ms, false);
+                            Err(error)
+                        } else {
+                            encoder
+                                .finish()
+                                .and_then(|_| session.finish(dropped, duration_ms, completed))
+                        };
+                        let _ = ack.send(result);
+                        break;
+                    }
+                }
+            }
+        });
+        Ok(Self {
+            tx: Some(tx),
+            handle: Some(handle),
+            shared,
+            pool,
+        })
+    }
+
+    fn save(&self, frame: &Frame) -> bool {
+        let Some(tx) = &self.tx else {
+            return false;
+        };
+        let mut job = self
+            .pool
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .pop();
+        let job = match job.take() {
+            Some(mut buffered)
+                if buffered.width == frame.width
+                    && buffered.height == frame.height
+                    && buffered.bgra.len() == frame.bgra.len() =>
+            {
+                buffered.bgra.copy_from_slice(&frame.bgra);
+                buffered
+            }
+            _ => Frame::new(frame.width, frame.height, frame.bgra.clone()),
+        };
+        match tx.try_send(WriterCmd::Frame(job)) {
+            Ok(()) => true,
+            Err(TrySendError::Full(WriterCmd::Frame(job))) => {
+                if let Ok(mut pool) = self.pool.lock() {
+                    if pool.len() < 4 {
+                        pool.push(job);
+                    }
+                }
+                self.shared.dropped.fetch_add(1, Ordering::SeqCst);
+                false
+            }
+            Err(TrySendError::Disconnected(WriterCmd::Frame(job))) => {
+                if let Ok(mut pool) = self.pool.lock() {
+                    if pool.len() < 4 {
+                        pool.push(job);
+                    }
+                }
+                self.shared.dropped.fetch_add(1, Ordering::SeqCst);
+                if let Ok(mut slot) = self.shared.error.lock() {
+                    if slot.is_none() {
+                        *slot = Some("流式编码线程意外退出".into());
+                    }
+                }
+                self.shared.request_stop();
+                false
+            }
+            Err(_) => false,
+        }
+    }
+
+    fn finish(mut self, dropped: u32, duration_ms: u64, completed: bool) -> Result<(), String> {
+        let (ack_tx, ack_rx) = sync_channel(1);
+        let Some(tx) = self.tx.take() else {
+            return Ok(());
+        };
+        send_finish_with_timeout(
+            &tx,
+            WriterCmd::Finish {
+                dropped,
+                duration_ms,
+                completed,
+                ack: ack_tx,
+            },
+            Duration::from_secs(5),
+        )?;
+        drop(tx);
+        let result = match ack_rx.recv_timeout(Duration::from_secs(30)) {
+            Ok(result) => result,
+            Err(_) => Err("等待流式编码线程收尾超时".into()),
+        };
+        join_writer_timeout(self.handle.take(), Duration::from_secs(5));
+        result
+    }
+}
+
+impl MarkerSink for StreamWriter {
+    fn marker(&self, elapsed_ms: u64) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(WriterCmd::Marker { elapsed_ms });
+        }
+    }
+}
+
+impl Drop for StreamWriter {
+    fn drop(&mut self) {
+        if let Some(tx) = self.tx.take() {
+            let (ack_tx, _) = sync_channel(1);
+            let _ = tx.try_send(WriterCmd::Finish {
                 dropped: self.shared.dropped.load(Ordering::SeqCst),
                 duration_ms: self.shared.elapsed_ms.load(Ordering::SeqCst),
                 completed: false,
@@ -452,7 +683,7 @@ fn panic_text(e: &Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
-fn apply_marks(shared: &Shared, writer: &SessionWriter) {
+fn apply_marks(shared: &Shared, writer: &impl MarkerSink) {
     let marks = shared.take_marks();
     if marks.is_empty() {
         return;
@@ -463,21 +694,33 @@ fn apply_marks(shared: &Shared, writer: &SessionWriter) {
 }
 
 fn run(cfg: &RecorderConfig, shared: &Arc<Shared>) -> Result<(), String> {
+    if cfg.navigator {
+        return run_navigator(cfg, shared);
+    }
+    if cfg.full_view {
+        let hwnd = cfg.hwnd as HWND;
+        let info = win::describe(hwnd);
+        return run_full_canvas(cfg, shared, hwnd, &info, true);
+    }
     let hwnd = cfg.hwnd as HWND;
     let info = win::describe(hwnd);
     let target_pid = win::pid_of(hwnd);
     // 注意：ThumbnailCapture 在这个线程里创建，之后也只在它上面用（GDI 线程亲和性）
     let mut cap = ThumbnailCapture::new(hwnd)?;
     let (cw, ch) = cap.size();
+    let base_w = cw;
+    let base_h = ch;
     std::fs::create_dir_all(&cfg.root)
         .map_err(|e| format!("创建缓存目录 {} 失败: {e}", cfg.root.display()))?;
     crate::fsutil::ensure_headroom(&cfg.root, crate::fsutil::MIN_FREE_BYTES, "录制缓存")?;
     let sess = Session::create(&cfg.root, &cfg.name, &info, cw, ch, cfg.fps, cfg.threshold)?;
     let session_dir = sess.dir().to_path_buf();
-    let writer = SessionWriter::new(sess, shared.clone());
+    let writer = StreamWriter::new(sess, shared.clone(), base_w, base_h)?;
     if let Ok(mut d) = shared.dir.lock() {
         *d = Some(session_dir);
     }
+    shared.base_w.store(base_w, Ordering::SeqCst);
+    shared.base_h.store(base_h, Ordering::SeqCst);
     shared
         .phase
         .store(Phase::Recording.code(), Ordering::SeqCst);
@@ -486,7 +729,7 @@ fn run(cfg: &RecorderConfig, shared: &Arc<Shared>) -> Result<(), String> {
     let start = Instant::now();
     let mut paused_total = Duration::ZERO;
     let mut paused_at: Option<Instant> = None;
-    // 差分始终用**原始捕获帧**；落盘用等比适配到基准尺寸后的图。
+    // 差分始终用**原始捕获帧**；送入编码器前统一到基准尺寸。
     // `cur` / `prev` 两块缓冲交替使用：抓帧写进 cur，保存成功后与 prev 交换 ——
     // 这样每帧不再分配/释放 7.5 MB（4K 时是 33 MB），长时间录制内存曲线是平的。
     let mut cur = Frame::new(
@@ -501,7 +744,7 @@ fn run(cfg: &RecorderConfig, shared: &Arc<Shared>) -> Result<(), String> {
         ],
     );
     let mut prev: Option<Frame> = None;
-    let mut base_size: Option<(i32, i32)> = None;
+    let base_size = (base_w, base_h);
     let mut next_tick = Instant::now();
     let mut completed = true;
     let mut tick: u32 = 0;
@@ -552,10 +795,6 @@ fn run(cfg: &RecorderConfig, shared: &Arc<Shared>) -> Result<(), String> {
         // 目标窗口尺寸变化：重建抓帧（基准分辨率一旦确定就不再改）
         match cap.sync_source_size() {
             Ok(true) => {
-                let (nw, nh) = cap.size();
-                if base_size.is_none() {
-                    writer.set_geometry(nw, nh);
-                }
                 prev = None; // 尺寸变了，上一帧作废（强制下一帧保存）
             }
             Ok(false) => {}
@@ -587,16 +826,7 @@ fn run(cfg: &RecorderConfig, shared: &Arc<Shared>) -> Result<(), String> {
                     } else if cur.is_blank() {
                         shared.blank_warned.store(true, Ordering::SeqCst);
                     }
-                    let (bw, bh) = match base_size {
-                        None => {
-                            base_size = Some((cur.width, cur.height));
-                            writer.set_geometry(cur.width, cur.height);
-                            shared.base_w.store(cur.width, Ordering::SeqCst);
-                            shared.base_h.store(cur.height, Ordering::SeqCst);
-                            (cur.width, cur.height)
-                        }
-                        Some(sz) => sz,
-                    };
+                    let (bw, bh) = base_size;
                     // 尺寸一致时直接存 cur（不 clone）；不一致才做等比适配
                     let fitted;
                     let to_save: &Frame = if (cur.width, cur.height) == (bw, bh) {
@@ -678,6 +908,295 @@ fn run(cfg: &RecorderConfig, shared: &Arc<Shared>) -> Result<(), String> {
 
     if let Some(t) = paused_at.take() {
         paused_total += t.elapsed();
+    }
+    let elapsed = start.elapsed().saturating_sub(paused_total);
+    let dropped = shared.dropped.load(Ordering::SeqCst);
+    writer.finish(dropped, elapsed.as_millis() as u64, completed)?;
+    shared
+        .elapsed_ms
+        .store(elapsed.as_millis() as u64, Ordering::SeqCst);
+    shared.phase.store(Phase::Finished.code(), Ordering::SeqCst);
+    Ok(())
+}
+
+fn run_navigator(cfg: &RecorderConfig, shared: &Arc<Shared>) -> Result<(), String> {
+    use crate::navigator;
+
+    let nav = navigator::probe(cfg.hwnd as HWND)?;
+    run_full_canvas(cfg, shared, nav.capture.hwnd, &nav.root, true)
+}
+
+fn run_full_canvas(
+    cfg: &RecorderConfig,
+    shared: &Arc<Shared>,
+    capture_hwnd: HWND,
+    source_info: &win::WindowInfo,
+    force_direct: bool,
+) -> Result<(), String> {
+    use crate::navigator;
+
+    let target_pid = win::pid_of(capture_hwnd);
+    // 抓帧器必须在本线程创建、使用和销毁（GDI/DWM 线程亲和性）。
+    let mut cap = if force_direct {
+        ThumbnailCapture::new_direct(capture_hwnd)?
+    } else {
+        ThumbnailCapture::new(capture_hwnd)?
+    };
+    let full = cap.grab()?;
+    let mut canvas_rect = navigator::detect_canvas_rect(&full)?;
+    let initial = navigator::crop_canvas(&full, canvas_rect)?;
+    let (rw, rh) = cap.size();
+
+    std::fs::create_dir_all(&cfg.root)
+        .map_err(|e| format!("创建缓存目录 {} 失败: {e}", cfg.root.display()))?;
+    crate::fsutil::ensure_headroom(&cfg.root, crate::fsutil::MIN_FREE_BYTES, "录制缓存")?;
+    let sess = Session::create(
+        &cfg.root,
+        &cfg.name,
+        source_info,
+        initial.width,
+        initial.height,
+        cfg.fps,
+        cfg.threshold,
+    )?;
+    let session_dir = sess.dir().to_path_buf();
+    let base_w = initial.width;
+    let base_h = initial.height;
+    let writer = StreamWriter::new(sess, shared.clone(), base_w, base_h)?;
+    if let Ok(mut dir) = shared.dir.lock() {
+        *dir = Some(session_dir);
+    }
+    shared.base_w.store(base_w, Ordering::SeqCst);
+    shared.base_h.store(base_h, Ordering::SeqCst);
+    shared
+        .phase
+        .store(Phase::Recording.code(), Ordering::SeqCst);
+    if !writer.save(&initial) {
+        return Err("导航器首帧写入队列失败".into());
+    }
+    logline!(
+        "[full-view] 开始录制 source=0x{:X} | {} | raw={}x{} crop=({},{},{},{})",
+        capture_hwnd as isize,
+        source_info.label(),
+        rw,
+        rh,
+        canvas_rect.x,
+        canvas_rect.y,
+        canvas_rect.width,
+        canvas_rect.height
+    );
+
+    let interval = Duration::from_secs_f64(1.0 / cfg.fps.max(0.1));
+    let start = Instant::now();
+    let mut paused_total = Duration::ZERO;
+    let mut paused_at: Option<Instant> = None;
+    let mut raw_cur = Frame::new(
+        rw,
+        rh,
+        vec![
+            0u8;
+            (rw as usize)
+                .saturating_mul(rh as usize)
+                .saturating_mul(4)
+                .max(4)
+        ],
+    );
+    let mut raw_prev = Some(full);
+    let mut prev: Option<Frame> = Some(initial);
+    let mut next_tick = Instant::now() + interval;
+    let mut completed = true;
+    let mut tick: u32 = 0;
+    let mut grab_us: u64 = 0;
+    let mut grab_n: u32 = 0;
+    let mut grab_failures: u32 = 0;
+    let mut last_disk_check = Instant::now();
+    let mut last_rect_check = Instant::now();
+    let mut rect_dirty = false;
+
+    loop {
+        apply_marks(shared, &writer);
+        if shared.stop.load(Ordering::SeqCst) {
+            break;
+        }
+        if !cap.source_alive() {
+            completed = false;
+            break;
+        }
+        if last_disk_check.elapsed() >= Duration::from_secs(30) {
+            crate::fsutil::ensure_headroom(&cfg.root, crate::fsutil::MIN_FREE_BYTES, "录制缓存")?;
+            last_disk_check = Instant::now();
+        }
+
+        if shared.paused.load(Ordering::SeqCst) || {
+            let foreground = win::foreground_pid();
+            let other = cfg.fg_pause
+                && foreground != 0
+                && foreground != target_pid
+                && foreground != std::process::id();
+            shared.fg_paused.store(other, Ordering::SeqCst);
+            other
+        } {
+            if paused_at.is_none() {
+                paused_at = Some(Instant::now());
+                shared.phase.store(Phase::Paused.code(), Ordering::SeqCst);
+            }
+            shared.wait_control(Duration::from_millis(200));
+            continue;
+        } else if let Some(at) = paused_at.take() {
+            paused_total += at.elapsed();
+            shared
+                .phase
+                .store(Phase::Recording.code(), Ordering::SeqCst);
+        }
+
+        match cap.sync_source_size() {
+            Ok(true) => {
+                let (nw, nh) = cap.size();
+                raw_prev = None;
+                rect_dirty = true;
+                raw_cur = Frame::new(
+                    nw,
+                    nh,
+                    vec![
+                        0u8;
+                        (nw as usize)
+                            .saturating_mul(nh as usize)
+                            .saturating_mul(4)
+                            .max(4)
+                    ],
+                );
+                logline!("[full-view] 视图尺寸变化，重新定位画布 ({nw}x{nh})");
+            }
+            Ok(false) => {}
+            Err(e) => {
+                shared.dropped.fetch_add(1, Ordering::SeqCst);
+                grab_failures += 1;
+                if grab_failures >= 30 {
+                    return Err(format!("连续 {grab_failures} 次同步导航器尺寸失败: {e}"));
+                }
+            }
+        }
+
+        let t_grab = Instant::now();
+        let changed = match &raw_prev {
+            Some(previous) => cap.grab_if_changed(previous, cfg.threshold, &mut raw_cur),
+            None => cap.grab_into(&mut raw_cur).map(|_| true),
+        };
+        grab_us += t_grab.elapsed().as_micros() as u64;
+        grab_n += 1;
+        match changed {
+            Ok(false) => {}
+            Ok(true) => {
+                grab_failures = 0;
+                if rect_dirty
+                    || last_rect_check.elapsed() >= Duration::from_secs(30)
+                    || canvas_rect.width > raw_cur.width
+                    || canvas_rect.height > raw_cur.height
+                    || canvas_rect.x < 0
+                    || canvas_rect.y < 0
+                    || canvas_rect.x.saturating_add(canvas_rect.width) > raw_cur.width
+                    || canvas_rect.y.saturating_add(canvas_rect.height) > raw_cur.height
+                {
+                    canvas_rect = navigator::detect_canvas_rect(&raw_cur)?;
+                    rect_dirty = false;
+                    last_rect_check = Instant::now();
+                }
+                let cropped = navigator::crop_canvas(&raw_cur, canvas_rect)?;
+                let image_changed = prev.as_ref().map_or(true, |previous| {
+                    previous.width != cropped.width
+                        || previous.height != cropped.height
+                        || previous.changed_enough_bytes(&cropped.bgra, cfg.threshold)
+                });
+                if image_changed {
+                    if shared.blank_warned.load(Ordering::SeqCst) {
+                        if !cropped.is_blank() {
+                            shared.blank_warned.store(false, Ordering::SeqCst);
+                        }
+                    } else if cropped.is_blank() {
+                        shared.blank_warned.store(true, Ordering::SeqCst);
+                    }
+                    let (bw, bh) = shared.base_size();
+                    let to_save: &Frame = if cropped.width == bw && cropped.height == bh {
+                        &cropped
+                    } else {
+                        // 后续帧统一适配首帧画布尺寸，避免预览/视频在导航器调整尺寸时抖动。
+                        &cropped.fit_into(bw.max(1), bh.max(1), cfg.fill_rgb)
+                    };
+                    if writer.save(to_save) {
+                        prev = Some(cropped);
+                        let old = raw_prev.take();
+                        let next = old
+                            .filter(|f| f.width == raw_cur.width && f.height == raw_cur.height)
+                            .unwrap_or_else(|| {
+                                Frame::new(
+                                    raw_cur.width,
+                                    raw_cur.height,
+                                    vec![0u8; raw_cur.bgra.len()],
+                                )
+                            });
+                        raw_prev = Some(std::mem::replace(&mut raw_cur, next));
+                    }
+                } else {
+                    let old = raw_prev.take();
+                    let next = old
+                        .filter(|f| f.width == raw_cur.width && f.height == raw_cur.height)
+                        .unwrap_or_else(|| {
+                            Frame::new(raw_cur.width, raw_cur.height, vec![0u8; raw_cur.bgra.len()])
+                        });
+                    raw_prev = Some(std::mem::replace(&mut raw_cur, next));
+                }
+            }
+            Err(e) => {
+                shared.dropped.fetch_add(1, Ordering::SeqCst);
+                grab_failures += 1;
+                if grab_failures >= 30 {
+                    return Err(format!("连续 {grab_failures} 次导航器抓帧失败: {e}"));
+                }
+            }
+        }
+
+        tick = tick.wrapping_add(1);
+        let elapsed = start.elapsed().saturating_sub(paused_total);
+        shared
+            .elapsed_ms
+            .store(elapsed.as_millis() as u64, Ordering::SeqCst);
+        if tick % 40 == 0 {
+            let avg = if grab_n > 0 {
+                grab_us as f64 / grab_n as f64 / 1000.0
+            } else {
+                0.0
+            };
+            logline!(
+                "[full-view][perf] 抓帧 {grab_n} 次，平均 {avg:.2} ms/帧，丢弃 {}",
+                shared.dropped.load(Ordering::SeqCst)
+            );
+            grab_us = 0;
+            grab_n = 0;
+        }
+
+        next_tick += interval;
+        let now = Instant::now();
+        if next_tick > now {
+            let mut left = next_tick - now;
+            while !left.is_zero() {
+                shared.wait_control(left.min(Duration::from_millis(200)));
+                let active = start.elapsed().saturating_sub(paused_total);
+                shared
+                    .elapsed_ms
+                    .store(active.as_millis() as u64, Ordering::SeqCst);
+                apply_marks(shared, &writer);
+                if shared.stop.load(Ordering::SeqCst) || shared.paused.load(Ordering::SeqCst) {
+                    break;
+                }
+                left = next_tick.saturating_duration_since(Instant::now());
+            }
+        } else {
+            next_tick = now;
+        }
+    }
+
+    if let Some(at) = paused_at {
+        paused_total += at.elapsed();
     }
     let elapsed = start.elapsed().saturating_sub(paused_total);
     let dropped = shared.dropped.load(Ordering::SeqCst);

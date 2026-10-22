@@ -1,13 +1,13 @@
 //! CanLapse 命令行切片。
 //!
-//! 当前阶段目标是打通**垂直切片**：拾取窗口 → 按帧密度与差异阈值抓帧 → 写 PNG 缓存 →
-//! （待接入）合成 MP4。GUI（460×380 单页 + 悬浮条）在切片验证通过后再做。
+//! 当前流程：拾取窗口 → 按帧密度与差异阈值抓帧 → 流式 H.264 编码 →
+//! 停止后无重编码重封装为普通 MP4。
 //!
 //! 用法见 `canlapse --help`。
 
 // 模块都在 lib（src/lib.rs）里；这里按名字引入，CLI 用到的路径写法保持不变，
 // 与 GUI 入口（src/bin/canlapse-gui.rs）共用同一份实现。
-use canlapse::{capture, encode, recorder, session, ui, win};
+use canlapse::{capture, encode, navigator, recorder, session, ui, win};
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -31,6 +31,10 @@ struct RecordArgs {
     quiet: bool,
     /// 关闭"其他软件在前台就暂停抓帧"（录后台窗口时必需）
     no_fg_pause: bool,
+    /// 从用户指定的第二视图采集完整画布。
+    full_view: bool,
+    /// 旧兼容入口：自动查找 SAI2/CSP 导航器。
+    navigator: bool,
 }
 
 impl Default for RecordArgs {
@@ -46,6 +50,8 @@ impl Default for RecordArgs {
             duration: None,
             quiet: false,
             no_fg_pause: false,
+            full_view: false,
+            navigator: false,
         }
     }
 }
@@ -60,6 +66,59 @@ fn next_value(args: &[String], i: &mut usize) -> Option<String> {
     args.get(*i).cloned()
 }
 
+fn required_value(args: &[String], i: &mut usize, option: &str) -> Result<String, String> {
+    next_value(args, i).ok_or_else(|| format!("{option} 缺少参数"))
+}
+
+fn parse_record_args(args: &[String]) -> Result<RecordArgs, String> {
+    let mut a = RecordArgs::default();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--hwnd" => {
+                let value = required_value(args, &mut i, "--hwnd")?;
+                a.hwnd = Some(
+                    parse_hex_hwnd(&value)
+                        .ok_or_else(|| "--hwnd 需要十六进制句柄，例如 0x00120AB4".to_string())?,
+                );
+            }
+            "--title" => a.title = Some(required_value(args, &mut i, "--title")?),
+            "--pick" => a.pick = true,
+            "--out" => a.out = Some(PathBuf::from(required_value(args, &mut i, "--out")?)),
+            "--name" => a.name = Some(required_value(args, &mut i, "--name")?),
+            "--fps" => {
+                let value = required_value(args, &mut i, "--fps")?;
+                a.fps = value
+                    .parse()
+                    .map_err(|_| format!("--fps 需要数字（收到 {value}）"))?;
+            }
+            "--threshold" => {
+                let value = required_value(args, &mut i, "--threshold")?;
+                a.threshold = value
+                    .parse()
+                    .map_err(|_| format!("--threshold 需要数字（收到 {value}）"))?;
+            }
+            "--duration" => {
+                let value = required_value(args, &mut i, "--duration")?;
+                let seconds: f64 = value
+                    .parse()
+                    .map_err(|_| format!("--duration 需要秒数（收到 {value}）"))?;
+                if !seconds.is_finite() || seconds <= 0.0 {
+                    return Err("--duration 必须是大于 0 的有限秒数".into());
+                }
+                a.duration = Some(seconds);
+            }
+            "--quiet" => a.quiet = true,
+            "--no-fg-pause" => a.no_fg_pause = true,
+            "--full-view" | "--full" => a.full_view = true,
+            "--navigator" | "--nav" => a.navigator = true,
+            other => return Err(format!("record 不支持参数 {other}")),
+        }
+        i += 1;
+    }
+    Ok(a)
+}
+
 fn help() {
     println!(
         r#"CanLapse —— 画布窗口缩时录屏工具（{version}）
@@ -69,9 +128,9 @@ fn help() {
   canlapse-cli gui [--hwnd 0x… | --title 子串]     启动图形界面并预先指定目标窗口
   canlapse-cli list                                列出可见顶层窗口（挑目标用）
   canlapse-cli pick                                鼠标拾取画布窗口并打印结果
-  canlapse-cli record [目标] [选项]                 开始录制（抓帧到缓存目录）
+  canlapse-cli record [目标] [选项]                 录制并自动整理为普通 MP4
   canlapse-cli sessions                            列出历史缓存会话
-  canlapse-cli encode --session DIR [选项]         把会话缓存合成 MP4
+  canlapse-cli encode --session DIR [选项]         把会话整理为普通 MP4
   canlapse-cli doctor                              自检（抓帧/编码/运行时 DLL/缓存）
   canlapse-cli --help
 
@@ -90,6 +149,10 @@ fn help() {
   --no-fg-pause        关闭"其他软件在前台就暂停抓帧"。
                        默认开启该规则（切到别的软件=没在画画，自动暂停）；
                        但命令行录**后台窗口**时必须关掉，否则会一直暂停、一帧都不出。
+  --navigator          从 SAI2/CSP 分离导航器录制完整画布。
+                       自动查找导航器、裁掉标题/边距；目标可省略。
+  --full-view          从用户选择的 CSP 第二视图录制完整画布（推荐）。
+                       自动裁剪窗口边框/标题并持续直接抓取源窗口。
 
 导出选项（canlapse encode）:
   --session DIR        会话缓存目录（必填）
@@ -110,17 +173,20 @@ fn help() {
 fn cmd_list() -> i32 {
     let ws = win::list_windows();
     println!(
-        "{:<12} {:<22} {:<26} {:>10}  标题",
-        "HWND", "进程", "类名", "客户区"
+        "{:<12} {:<22} {:<26} {:>10}  {:<18}  标题",
+        "HWND", "进程", "类名", "客户区", "窗口位置/尺寸"
     );
     for w in &ws {
         let (cw, ch) = w.client_size();
+        let rw = w.rect.right - w.rect.left;
+        let rh = w.rect.bottom - w.rect.top;
         println!(
-            "0x{:<10X} {:<22} {:<26} {:>10}  {}",
+            "0x{:<10X} {:<22} {:<26} {:>10}  {:<18}  {}",
             w.hwnd as isize,
             w.process,
             w.class_name,
             format!("{cw}x{ch}"),
+            format!("{},{} {}x{}", w.rect.left, w.rect.top, rw, rh),
             w.title
         );
     }
@@ -174,6 +240,13 @@ fn cmd_sessions(root: &std::path::Path) -> i32 {
 }
 
 fn resolve_target(a: &RecordArgs) -> Option<win::WindowInfo> {
+    if a.navigator && !a.pick && a.hwnd.is_none() && a.title.is_none() {
+        if let Some(main) = navigator::find_navigator_main() {
+            return Some(main);
+        }
+        eprintln!("未找到受支持的 SAI2/CSP 窗口。请先启动软件并分离导航器。");
+        return None;
+    }
     if a.pick {
         let hwnd = win::pick_window_interactive(std::ptr::null_mut(), None)?;
         return Some(win::describe(hwnd));
@@ -199,8 +272,29 @@ fn resolve_target(a: &RecordArgs) -> Option<win::WindowInfo> {
     Some(win::describe(hwnd))
 }
 
+fn unique_output_path(dir: &std::path::Path, stem: &str) -> PathBuf {
+    let mut path = dir.join(format!("{stem}.mp4"));
+    let mut n = 2;
+    while path.exists() {
+        path = dir.join(format!("{stem}_{n}.mp4"));
+        n += 1;
+    }
+    path
+}
+
+fn unique_timelapse_output() -> PathBuf {
+    let dir = canlapse::default_output_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let stamp = win::stamp_compact(&win::local_now());
+    unique_output_path(&dir, &format!("timelapse_{stamp}"))
+}
+
 fn cmd_record(a: RecordArgs) -> i32 {
-    if !capture::composition_enabled() {
+    if a.full_view && a.navigator {
+        eprintln!("--full-view 和 --navigator 不能同时使用");
+        return 2;
+    }
+    if !a.full_view && !a.navigator && !capture::composition_enabled() {
         eprintln!("桌面合成（DWM）未开启，无法使用缩略图抓帧。");
         return 2;
     }
@@ -217,7 +311,29 @@ fn cmd_record(a: RecordArgs) -> i32 {
         Some(i) => i,
         None => return 1,
     };
+    if a.full_view
+        && (info.process.eq_ignore_ascii_case("sai2.exe")
+            || info.process.eq_ignore_ascii_case("sai.exe"))
+    {
+        eprintln!("SAI2 第二视图不稳定，请改用 --navigator 导航器模式");
+        return 2;
+    }
     println!("目标: {}", info.label());
+    if a.navigator {
+        match navigator::probe(info.hwnd) {
+            Ok(nav) => {
+                let (w, h) = nav.capture.client_size();
+                println!(
+                    "导航器: root=0x{:X} capture=0x{:X} {}x{}",
+                    nav.root.hwnd as isize, nav.capture.hwnd as isize, w, h
+                );
+            }
+            Err(e) => {
+                eprintln!("导航器模式不可用: {e}");
+                return 2;
+            }
+        }
+    }
 
     let root = a.out.clone().unwrap_or_else(cache_root);
     let removed = canlapse::fsutil::cleanup_stale_temps(&root, canlapse::fsutil::STALE_TEMP_AGE);
@@ -240,10 +356,27 @@ fn cmd_record(a: RecordArgs) -> i32 {
             None => String::new(),
         }
     );
-    println!(
-        "提示: 录制开始后**第一张保存的画面决定视频分辨率**。建议录制初期就把画布窗口调到目标大小；\n\
-         录制中尽量不要缩小画布窗口（画布变小、后续帧会被拉伸放大，画面会糊；变大则会被缩小）。"
-    );
+    if a.full_view {
+        println!("模式: 完整画布视图（第二视图，推荐）");
+    } else if a.navigator {
+        println!("模式: 导航器兼容模式");
+    }
+    if a.navigator {
+        println!(
+            "提示: 导航器模式会录制固定方向的全画布，并自动裁掉导航器标题和边距；\n\
+             录制中请保持导航器尺寸不变。"
+        );
+    } else if a.full_view {
+        println!(
+            "提示: 请确保第二视图保持完整画布和固定方向；程序会自动裁掉标题栏和窗口边框，\n\
+             并在窗口缩放时保持固定视频画面。"
+        );
+    } else {
+        println!(
+            "提示: 录制开始后**第一张保存的画面决定视频分辨率**。建议录制初期就把画布窗口调到目标大小；\n\
+             录制中尽量不要缩小画布窗口（画布变小、后续帧会被拉伸放大，画面会糊；变大则会被缩小）。"
+        );
+    }
 
     // 抓帧/差分/分辨率统一都在录制线程里做（GDI 有线程亲和性，且不能阻塞 UI）。
     // 这里只负责：把按键转成线程指令 + 打印进度。
@@ -255,6 +388,8 @@ fn cmd_record(a: RecordArgs) -> i32 {
         threshold: a.threshold,
         fill_rgb: [0, 0, 0],
         fg_pause: !a.no_fg_pause,
+        full_view: a.full_view,
+        navigator: a.navigator,
     };
     let shared = recorder::Shared::new();
     let worker = recorder::spawn(cfg, shared.clone());
@@ -302,10 +437,13 @@ fn cmd_record(a: RecordArgs) -> i32 {
             use std::io::Write;
             let _ = std::io::stdout().flush();
         }
-        if let Some(d) = a.duration {
-            if d > 0.0 && start.elapsed().as_secs_f64() >= d {
-                println!("\n达到指定时长 {d} 秒，结束录制。");
-                shared.request_stop();
+        if !stop_sent {
+            if let Some(d) = a.duration {
+                if start.elapsed().as_secs_f64() >= d {
+                    println!("\n达到指定时长 {d} 秒，结束录制。");
+                    shared.request_stop();
+                    stop_sent = true;
+                }
             }
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -325,10 +463,23 @@ fn cmd_record(a: RecordArgs) -> i32 {
     );
     if let Some(dir) = shared.session_dir() {
         println!("会话目录: {}", dir.display());
-        println!(
-            "下一步：canlapse-cli encode --session \"{}\" --fps 10",
-            dir.display()
-        );
+        if shared.frames() > 0 {
+            let output = unique_timelapse_output();
+            let opts = encode::EncodeOptions {
+                fps: encode::LIVE_FPS,
+                quality: encode::Quality::Medium,
+                output: output.clone(),
+            };
+            println!("正在重新封装为普通 MP4（不重新编码）…");
+            let mut progress = |_done, _total| encode::Progress::Continue;
+            match encode::encode_session(&dir, &opts, &mut progress) {
+                Ok(_) => println!("最终视频: {}", output.display()),
+                Err(e) => {
+                    eprintln!("重新封装失败: {e}");
+                    return 2;
+                }
+            }
+        }
     }
     0
 }
@@ -336,6 +487,7 @@ fn cmd_record(a: RecordArgs) -> i32 {
 fn cmd_encode(args: &[String]) -> i32 {
     let mut dir: Option<PathBuf> = None;
     let mut fps = 10.0f64;
+    let mut fps_explicit = false;
     let mut quality = encode::Quality::Medium;
     let mut out: Option<PathBuf> = None;
     let mut max_frames: Option<u32> = None;
@@ -343,39 +495,80 @@ fn cmd_encode(args: &[String]) -> i32 {
     while i < args.len() {
         match args[i].as_str() {
             "--session" => {
-                if let Some(v) = next_value(args, &mut i) {
-                    dir = Some(PathBuf::from(v));
-                }
+                let v = match required_value(args, &mut i, "--session") {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("{e}");
+                        return 2;
+                    }
+                };
+                dir = Some(PathBuf::from(v));
             }
             "--fps" => {
-                if let Some(v) = next_value(args, &mut i) {
-                    fps = v.parse().unwrap_or(10.0);
-                }
+                let v = match required_value(args, &mut i, "--fps") {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("{e}");
+                        return 2;
+                    }
+                };
+                fps = match v.parse() {
+                    Ok(v) => v,
+                    Err(_) => {
+                        eprintln!("--fps 需要数字（收到 {v}）");
+                        return 2;
+                    }
+                };
+                fps_explicit = true;
             }
             "--quality" => {
-                if let Some(v) = next_value(args, &mut i) {
-                    match encode::Quality::parse(&v) {
-                        Some(q) => quality = q,
-                        None => {
-                            eprintln!("画质只支持 high/medium/low（收到 {v}）");
-                            return 2;
-                        }
+                let v = match required_value(args, &mut i, "--quality") {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("{e}");
+                        return 2;
+                    }
+                };
+                match encode::Quality::parse(&v) {
+                    Some(q) => quality = q,
+                    None => {
+                        eprintln!("画质只支持 high/medium/low（收到 {v}）");
+                        return 2;
                     }
                 }
             }
             "--out" => {
-                if let Some(v) = next_value(args, &mut i) {
-                    out = Some(PathBuf::from(v));
-                }
+                let v = match required_value(args, &mut i, "--out") {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("{e}");
+                        return 2;
+                    }
+                };
+                out = Some(PathBuf::from(v));
             }
             // 只导出前 N 帧（预览用）。它走的正是 GUI 上【取消合成】那条路径：
             // 回调返回 Cancel 后仍会写 trailer，产出可播放的部分视频。
             "--frames" => {
-                if let Some(v) = next_value(args, &mut i) {
-                    max_frames = v.parse().ok();
-                }
+                let v = match required_value(args, &mut i, "--frames") {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("{e}");
+                        return 2;
+                    }
+                };
+                max_frames = match v.parse::<u32>() {
+                    Ok(n) if n > 0 => Some(n),
+                    _ => {
+                        eprintln!("--frames 需要大于 0 的整数（收到 {v}）");
+                        return 2;
+                    }
+                };
             }
-            _ => {}
+            other => {
+                eprintln!("encode 不支持参数 {other}");
+                return 2;
+            }
         }
         i += 1;
     }
@@ -386,27 +579,39 @@ fn cmd_encode(args: &[String]) -> i32 {
             return 2;
         }
     };
-    let output = out.unwrap_or_else(|| dir.join("timelapse.mp4"));
+    let output = out.unwrap_or_else(|| unique_output_path(&dir, "timelapse"));
     let removed = canlapse::fsutil::cleanup_stale_temps(&dir, canlapse::fsutil::STALE_TEMP_AGE);
     if removed > 0 {
         println!("已清理 {removed} 个过期临时缓存文件");
+    }
+    let streaming = dir.join(canlapse::session::STREAM_FILE).is_file();
+    if streaming && !fps_explicit {
+        fps = encode::LIVE_FPS;
     }
     let opts = encode::EncodeOptions {
         fps,
         quality,
         output: output.clone(),
     };
-    println!(
-        "开始合成：{} fps，画质 {}，输出 {}",
-        fps,
-        quality.label(),
-        output.display()
-    );
+    if streaming {
+        println!("开始重新封装（不重新编码）：输出 {}", output.display());
+    } else {
+        println!(
+            "开始合成：{} fps，画质 {}，输出 {}",
+            fps,
+            quality.label(),
+            output.display()
+        );
+    }
     let mut last = 0u32;
     let r = encode::encode_session(&dir, &opts, &mut |done, total| {
         if done != last {
             last = done;
-            print!("\r编码 {done}/{total} 帧");
+            if streaming {
+                print!("\r重新封装 {done} 帧");
+            } else {
+                print!("\r编码 {done}/{total} 帧");
+            }
             use std::io::Write;
             let _ = std::io::stdout().flush();
         }
@@ -454,7 +659,7 @@ fn cmd_doctor() -> i32 {
         if comp {
             "已开启 ✓"
         } else {
-            "未开启 ✗ —— 缩略图抓帧不可用，录屏无法工作"
+            "未开启 ✗ —— 普通缩略图抓帧不可用；完整画布/导航器模式仍可使用"
         }
     );
 
@@ -563,61 +768,13 @@ fn main() {
         "sessions" => cmd_sessions(&cache_root()),
         "doctor" => cmd_doctor(),
         "encode" => cmd_encode(&rest),
-        "record" => {
-            let mut a = RecordArgs::default();
-            let mut i = 0;
-            while i < rest.len() {
-                match rest[i].as_str() {
-                    "--hwnd" => {
-                        if let Some(v) = next_value(&rest, &mut i) {
-                            match parse_hex_hwnd(&v) {
-                                Some(h) => a.hwnd = Some(h),
-                                None => {
-                                    eprintln!("--hwnd 需要十六进制句柄，例如 0x00120AB4");
-                                    std::process::exit(2);
-                                }
-                            }
-                        }
-                    }
-                    "--title" => {
-                        if let Some(v) = next_value(&rest, &mut i) {
-                            a.title = Some(v);
-                        }
-                    }
-                    "--pick" => a.pick = true,
-                    "--out" => {
-                        if let Some(v) = next_value(&rest, &mut i) {
-                            a.out = Some(PathBuf::from(v));
-                        }
-                    }
-                    "--name" => {
-                        if let Some(v) = next_value(&rest, &mut i) {
-                            a.name = Some(v);
-                        }
-                    }
-                    "--fps" => {
-                        if let Some(v) = next_value(&rest, &mut i) {
-                            a.fps = v.parse().unwrap_or(a.fps);
-                        }
-                    }
-                    "--threshold" => {
-                        if let Some(v) = next_value(&rest, &mut i) {
-                            a.threshold = v.parse().unwrap_or(a.threshold);
-                        }
-                    }
-                    "--duration" => {
-                        if let Some(v) = next_value(&rest, &mut i) {
-                            a.duration = v.parse().ok();
-                        }
-                    }
-                    "--quiet" => a.quiet = true,
-                    "--no-fg-pause" => a.no_fg_pause = true,
-                    _ => {}
-                }
-                i += 1;
+        "record" => match parse_record_args(&rest) {
+            Ok(a) => cmd_record(a),
+            Err(e) => {
+                eprintln!("{e}");
+                2
             }
-            cmd_record(a)
-        }
+        },
         "--help" | "-h" | "help" => {
             help();
             0
@@ -629,4 +786,35 @@ fn main() {
         }
     };
     std::process::exit(code);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn record参数解析拒绝无效数字和缺失值() {
+        assert!(parse_record_args(&["--fps".into(), "abc".into()]).is_err());
+        assert!(parse_record_args(&["--threshold".into()]).is_err());
+        assert!(parse_record_args(&["--duration".into(), "NaN".into()]).is_err());
+        assert!(parse_record_args(&["--unknown".into()]).is_err());
+    }
+
+    #[test]
+    fn record参数解析保留合法模式() {
+        let args = parse_record_args(&[
+            "--hwnd".into(),
+            "0x1234".into(),
+            "--fps".into(),
+            "2.5".into(),
+            "--threshold".into(),
+            "0.006".into(),
+            "--navigator".into(),
+        ])
+        .unwrap();
+        assert_eq!(args.hwnd, Some(0x1234));
+        assert_eq!(args.fps, 2.5);
+        assert_eq!(args.threshold, 0.006);
+        assert!(args.navigator);
+    }
 }

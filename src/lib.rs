@@ -16,6 +16,7 @@ pub mod fsutil;
 pub mod img_io;
 pub mod lang;
 pub mod log;
+pub mod navigator;
 pub mod recorder;
 pub mod session;
 pub mod ui;
@@ -73,10 +74,10 @@ fn exe_dir() -> Option<std::path::PathBuf> {
 }
 
 fn dir_writable(dir: &std::path::Path) -> bool {
-    let probe = dir.join(".canlapse-write-test");
-    match std::fs::write(&probe, b"1") {
-        Ok(_) => {
-            let _ = std::fs::remove_file(&probe);
+    match crate::fsutil::create_temp(&dir.join("canlapse-write-test")) {
+        Ok((probe, file)) => {
+            drop(file);
+            let _ = std::fs::remove_file(probe);
             true
         }
         Err(_) => false,

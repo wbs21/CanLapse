@@ -17,7 +17,6 @@ use windows_sys::Win32::Graphics::Gdi::{
     FillRect, GetStockObject, InvalidateRect, RoundRect, SelectObject, SetBkColor, SetBkMode,
     SetTextColor, DEFAULT_GUI_FONT, FW_NORMAL, HBRUSH, HDC, HGDIOBJ, NULL_BRUSH, PS_SOLID,
 };
-use windows_sys::Win32::UI::Controls::SetWindowTheme;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     IsWindowEnabled, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
 };
@@ -501,24 +500,6 @@ pub unsafe fn prefer_dark() {
             f(2);
         }
     });
-}
-
-/// 单个窗口：允许深色 + 换成 DarkMode_Explorer 主题
-#[allow(dead_code)]
-pub unsafe fn darken(hwnd: HWND) {
-    if hwnd.is_null() {
-        return;
-    }
-    prefer_dark();
-    let allow = ordinal(133);
-    if allow != 0 {
-        let allow: unsafe extern "system" fn(HWND, i32) -> i32 = std::mem::transmute(allow);
-        allow(hwnd, 1);
-    }
-    let cls = win::wide("DarkMode_Explorer");
-    SetWindowTheme(hwnd, cls.as_ptr(), std::ptr::null());
-    // 输入框/下拉框重绘一次，让新主题生效
-    InvalidateRect(hwnd, std::ptr::null(), 1);
 }
 
 /// 静态文字控件：深色底 + 浅色字（在主窗口 `WM_CTLCOLORSTATIC` 里调用）

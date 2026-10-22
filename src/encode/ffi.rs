@@ -24,7 +24,7 @@
 //!
 //! ⚠️ 偏移量随 ffmpeg 版本失效：升级 `ffmpeg-min` 必须重跑探针并更新 [`off`]。
 
-#![allow(non_camel_case_types, non_snake_case, dead_code)]
+#![allow(non_camel_case_types, non_snake_case)]
 
 use std::os::raw::{c_char, c_int, c_void};
 
@@ -70,7 +70,6 @@ pub const SWS_BILINEAR: c_int = 2;
 pub const SWS_POINT: c_int = 0x10;
 pub const AV_CODEC_FLAG_GLOBAL_HEADER: c_int = 0x0040_0000;
 pub const AV_CODEC_ID_H264: c_int = 27;
-pub const AV_OPT_SEARCH_CHILDREN: c_int = 0x0002;
 
 pub const AV_LOG_ERROR: c_int = 16;
 pub const AV_LOG_WARNING: c_int = 24;
@@ -81,53 +80,29 @@ pub const AV_LOG_INFO: c_int = 32;
 // ---------------------------------------------------------------------------
 
 pub mod off {
-    // ---- AVCodec (sizeof 56) ----
-    pub const CODEC_NAME: usize = 0;
-    pub const CODEC_LONG_NAME: usize = 8;
-    pub const CODEC_TYPE: usize = 16;
-    pub const CODEC_ID: usize = 20;
-    pub const CODEC_CAPABILITIES: usize = 24;
-    pub const CODEC_PRIV_CLASS: usize = 32;
-    pub const CODEC_WRAPPER_NAME: usize = 48;
-
     // ---- AVCodecContext (sizeof 864) ----
-    pub const CC_CODEC_TYPE: usize = 12;
-    pub const CC_CODEC_ID: usize = 24;
     pub const CC_PRIV_DATA: usize = 32;
     pub const CC_BIT_RATE: usize = 56;
     pub const CC_FLAGS: usize = 64;
-    pub const CC_EXTRA_DATA: usize = 72;
-    pub const CC_EXTRA_DATA_SIZE: usize = 80;
     pub const CC_TIME_BASE: usize = 84;
     pub const CC_FRAMERATE: usize = 100;
-    pub const CC_DELAY: usize = 108;
     pub const CC_WIDTH: usize = 112;
     pub const CC_HEIGHT: usize = 116;
     pub const CC_SAMPLE_ASPECT_RATIO: usize = 128;
     pub const CC_PIX_FMT: usize = 136;
-    pub const CC_SW_PIX_FMT: usize = 140;
-    pub const CC_COLOR_RANGE: usize = 156;
-    pub const CC_REFS: usize = 168;
     pub const CC_MAX_B_FRAMES: usize = 200;
     pub const CC_GOP_SIZE: usize = 332;
-    pub const CC_QMIN: usize = 436;
-    pub const CC_QMAX: usize = 440;
     pub const CC_RC_BUFFER_SIZE: usize = 448;
     pub const CC_RC_MAX_RATE: usize = 464;
     pub const CC_THREAD_COUNT: usize = 656;
-    pub const CC_PROFILE: usize = 688;
-    pub const CC_LEVEL: usize = 692;
 
     // ---- AVFrame (sizeof 424) ----
     pub const FRAME_DATA: usize = 0; // uint8_t *data[8]
     pub const FRAME_LINESIZE: usize = 64; // int linesize[8]
-    pub const FRAME_EXTENDED_DATA: usize = 96;
     pub const FRAME_WIDTH: usize = 104;
     pub const FRAME_HEIGHT: usize = 108;
     pub const FRAME_FORMAT: usize = 116;
-    pub const FRAME_SAMPLE_ASPECT_RATIO: usize = 124;
     pub const FRAME_PTS: usize = 136;
-    pub const FRAME_COLOR_RANGE: usize = 280;
 
     // ---- AVPacket (sizeof 104) ----
     pub const PKT_PTS: usize = 8;
@@ -139,32 +114,29 @@ pub mod off {
     pub const PKT_DURATION: usize = 64;
 
     // ---- AVStream (sizeof 216) ----
-    pub const ST_INDEX: usize = 8;
     pub const ST_CODECPAR: usize = 16;
     pub const ST_TIME_BASE: usize = 32;
-    pub const ST_START_TIME: usize = 40;
-    pub const ST_DURATION: usize = 48;
-    pub const ST_NB_FRAMES: usize = 56;
     pub const ST_AVG_FRAME_RATE: usize = 88;
     pub const ST_R_FRAME_RATE: usize = 204;
 
     // ---- AVCodecParameters (sizeof 184) ----
     pub const CP_CODEC_TYPE: usize = 0;
     pub const CP_CODEC_ID: usize = 4;
+    pub const CP_CODEC_TAG: usize = 8;
     pub const CP_EXTRA_DATA: usize = 16;
     pub const CP_EXTRA_DATA_SIZE: usize = 24;
     pub const CP_FORMAT: usize = 44;
     pub const CP_BIT_RATE: usize = 48;
+    pub const CP_PROFILE: usize = 64;
+    pub const CP_LEVEL: usize = 68;
     pub const CP_WIDTH: usize = 72;
     pub const CP_HEIGHT: usize = 76;
+    pub const CP_SAMPLE_ASPECT_RATIO: usize = 80;
     pub const CP_FRAMERATE: usize = 88;
 
     // ---- AVFormatContext (sizeof 480) ----
-    pub const FC_OFORMAT: usize = 16;
+    pub const FC_PRIV_DATA: usize = 24;
     pub const FC_PB: usize = 32;
-    pub const FC_NB_STREAMS: usize = 44;
-    pub const FC_STREAMS: usize = 48;
-    pub const FC_DURATION: usize = 104;
 }
 
 // ---------------------------------------------------------------------------
@@ -244,17 +216,14 @@ extern "C" {
     pub fn av_strerror(errnum: c_int, errbuf: *mut c_char, errbuf_size: usize) -> c_int;
     pub fn avcodec_version() -> u32;
     pub fn avutil_version() -> u32;
-    pub fn avutil_configuration() -> *const c_char;
     pub fn avcodec_configuration() -> *const c_char;
-    pub fn avformat_configuration() -> *const c_char;
 
     pub fn av_frame_alloc() -> *mut AVFrame;
     pub fn av_frame_free(frame: *mut *mut AVFrame);
-    pub fn av_frame_unref(frame: *mut AVFrame);
     pub fn av_frame_get_buffer(frame: *mut AVFrame, align: c_int) -> c_int;
     pub fn av_frame_make_writable(frame: *mut AVFrame) -> c_int;
 
-    pub fn av_rescale_q(a: i64, bq: AVRational, cq: AVRational) -> i64;
+    pub fn av_mallocz(size: usize) -> *mut c_void;
 
     pub fn av_opt_set(
         obj: *mut c_void,
@@ -270,11 +239,7 @@ extern "C" {
 // ---------------------------------------------------------------------------
 
 extern "C" {
-    pub fn av_codec_iterate(opaque: *mut *mut c_void) -> *const AVCodec;
-    pub fn av_codec_is_encoder(codec: *const AVCodec) -> c_int;
     pub fn avcodec_find_encoder_by_name(name: *const c_char) -> *const AVCodec;
-    pub fn avcodec_find_decoder_by_name(name: *const c_char) -> *const AVCodec;
-    pub fn avcodec_find_decoder(id: c_int) -> *const AVCodec;
 
     pub fn avcodec_alloc_context3(codec: *const AVCodec) -> *mut AVCodecContext;
     pub fn avcodec_free_context(ctx: *mut *mut AVCodecContext);
@@ -286,23 +251,15 @@ extern "C" {
 
     pub fn avcodec_send_frame(ctx: *mut AVCodecContext, frame: *const AVFrame) -> c_int;
     pub fn avcodec_receive_packet(ctx: *mut AVCodecContext, pkt: *mut AVPacket) -> c_int;
-    pub fn avcodec_send_packet(ctx: *mut AVCodecContext, pkt: *const AVPacket) -> c_int;
-    pub fn avcodec_receive_frame(ctx: *mut AVCodecContext, frame: *mut AVFrame) -> c_int;
 
     pub fn avcodec_parameters_from_context(
         par: *mut AVCodecParameters,
         ctx: *const AVCodecContext,
     ) -> c_int;
-    pub fn avcodec_parameters_to_context(
-        ctx: *mut AVCodecContext,
-        par: *const AVCodecParameters,
-    ) -> c_int;
-    pub fn avcodec_parameters_alloc() -> *mut AVCodecParameters;
-    pub fn avcodec_parameters_free(par: *mut *mut AVCodecParameters);
-
     pub fn av_packet_alloc() -> *mut AVPacket;
     pub fn av_packet_free(pkt: *mut *mut AVPacket);
     pub fn av_packet_unref(pkt: *mut AVPacket);
+    pub fn av_new_packet(pkt: *mut AVPacket, size: c_int) -> c_int;
     pub fn av_packet_rescale_ts(pkt: *mut AVPacket, tb_src: AVRational, tb_dst: AVRational);
 }
 
@@ -326,23 +283,6 @@ extern "C" {
     pub fn avio_open(s: *mut *mut AVIOContext, url: *const c_char, flags: c_int) -> c_int;
     pub fn avio_closep(s: *mut *mut AVIOContext) -> c_int;
 
-    pub fn avformat_open_input(
-        ps: *mut *mut AVFormatContext,
-        url: *const c_char,
-        fmt: *const c_void,
-        options: *mut *mut c_void,
-    ) -> c_int;
-    pub fn avformat_find_stream_info(ic: *mut AVFormatContext, options: *mut *mut c_void) -> c_int;
-    pub fn av_find_best_stream(
-        ic: *mut AVFormatContext,
-        type_: c_int,
-        wanted_stream_nb: c_int,
-        related_stream: c_int,
-        decoder_ret: *mut *const AVCodec,
-        flags: c_int,
-    ) -> c_int;
-    pub fn av_read_frame(s: *mut AVFormatContext, pkt: *mut AVPacket) -> c_int;
-    pub fn avformat_close_input(s: *mut *mut AVFormatContext);
 }
 
 // ---------------------------------------------------------------------------

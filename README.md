@@ -6,7 +6,7 @@ Pick a canvas window once, and CanLapse quietly captures it on a schedule, keeps
 actually changed, and exports a 30 fps MP4 when you stop. Built for digital painters using SAI2,
 Photoshop, CLIP STUDIO PAINT or Krita.
 
-`v1.3.2` · single-file executable · no DLLs · English / 中文 UI (follows system language)
+`v2.0.0` · single-file executable · no DLLs · English / 中文 UI (follows system language)
 
 ![Main window](docs/evidence/ui-main-en.png)
 
@@ -35,16 +35,32 @@ Photoshop, CLIP STUDIO PAINT or Krita.
 
 ## Quick start
 
-1. Extract `CanLapse-v1.3.2-win64.zip` to any writable folder (for example `D:\Tools\CanLapse`).
+1. Extract `CanLapse-v2.0.0-win64.zip` to any writable folder (for example `D:\Tools\CanLapse`).
 2. Run `CanLapse.exe`.
-3. Click **Pick Window** — CanLapse minimizes itself and shows *“Click the canvas border”*.
-   Click the canvas (its border or its content; `Esc`/right-click cancels).
-4. Choose **Frame density** and **Change sensitivity**, then click **Start Recording**.
-5. Work. Use the floating bar to **Pause**, **Mark** (remember this moment) or **Stop**.
-6. The MP4 lands in `output\timelapse_YYYYMMDD-HHMMSS.mp4` next to the exe. **Open Video Folder** takes you there.
+3. Choose the source for your app:
+   - SAI2: detach the navigator and click **Use SAI2 Navigator**
+   - CSP: **View → New View** (or drag the canvas tab out), then click
+     **Select CSP Full Canvas View**
+4. Keep the selected source showing the complete canvas at a fixed angle.
+5. Choose **Frame density** and **Change sensitivity**, then click **Start Recording**.
+6. Draw in the original view. Use the floating bar to **Pause**, **Mark** or **Stop**.
+7. The MP4 lands in `output\timelapse_YYYYMMDD-HHMMSS.mp4` next to the exe.
 
 > The first captured frame defines the video resolution. If you resize the canvas mid-session, frames are
 > scaled proportionally and letterboxed.
+
+### SAI2 navigator and CSP full-canvas view
+
+SAI2 uses its detached navigator because SAI2 child views become unreliable when
+dragged partially outside the parent window. CSP uses a second full-canvas view,
+which is more stable and avoids navigator position indicators.
+
+CLI equivalents:
+
+```powershell
+canlapse-cli record --navigator
+canlapse-cli record --hwnd 0x1234 --full-view
+```
 
 `cache\` (session frames) and `output\` (videos) are created automatically next to the executable, so a
 USB-stick copy stays self-contained.
@@ -56,7 +72,7 @@ USB-stick copy stays self-contained.
 | Item | Requirement |
 |---|---|
 | OS | Windows 10 / 11, 64-bit (x64). ARM64 works through emulation. |
-| Desktop composition | DWM must be enabled (default on Windows 10/11). |
+| Desktop composition | Recommended for legacy thumbnail capture. Full-canvas and SAI2 navigator modes use direct capture and do not require DWM. |
 | Runtime | **None.** No DLLs, no .NET, no Visual C++ redistributable, no installer. |
 | Drawing apps | Any app with a floating canvas window: SAI2, Photoshop, CLIP STUDIO PAINT, Krita… |
 
@@ -69,16 +85,16 @@ canvas HWND ──► DWM thumbnail (DwmRegisterThumbnail + rcSource crop)
                      │
                      ▼
               BGRA frame ──► pixel diff (threshold by changed-pixel ratio)
-                     │                 │
-             changed │                 │ nearly blank
-                     ▼                 ▼
-              JPEG q85 frame      PNG frame      → cache\<session>\frame_NNNN.*
-                     │
-                     ▼
-   static ffmpeg 9.0.2 (libavformat + libopenh264)  →  H.264 High, 30 fps, 1 s GOP
-                     │
-                     ▼
-              output\timelapse_YYYYMMDD-HHMMSS.mp4
+                                │ changed
+                                ▼
+             libopenh264 (H.264 High, 30 fps, 1 s GOP)
+                                │
+                 ┌──────────────┴──────────────┐
+                 ▼                             ▼
+      stream.mp4 (fragmented)       stream.packets (packet index)
+                 │
+                 ▼ finalize: packet stream-copy, no video re-encode
+      output\timelapse_YYYYMMDD-HHMMSS.mp4
 ```
 
 - Capture uses the **DWM thumbnail** of the target window, read back through
@@ -86,6 +102,12 @@ canvas HWND ──► DWM thumbnail (DwmRegisterThumbnail + rcSource crop)
 - Recording **auto-pauses when another app is in the foreground** (you are not painting) and resumes when
   you return to the canvas.
 - Encoding is a hand-written FFI layer over avcodec/avformat; no `ffmpeg.exe`, no subprocess.
+- Frames are encoded during recording. Finalization copies the existing H.264 packets into a regular MP4;
+  it does not save image files and does not encode the video a second time.
+- If a target is mostly or completely outside the virtual desktop, CanLapse automatically switches from
+  the DWM thumbnail path to direct `PrintWindow(PW_RENDERFULLCONTENT)` capture.
+- Full-canvas view mode always uses direct source capture, so partial occlusion or an off-screen
+  position does not stop the second view from refreshing.
 
 ---
 
@@ -94,10 +116,10 @@ canvas HWND ──► DWM thumbnail (DwmRegisterThumbnail + rcSource crop)
 | Setting | Options | Default |
 |---|---|---|
 | Frame density | 1 frame / 5 s · 1 frame / 2 s · 1 frame / s · 2 frames / s | **1 frame / 5 s** |
-| Change sensitivity | 1 = 0.08 · 2 = 0.04 · 3 = 0.02 · **4 = 0.01** · 5 = 0.008 · 6 = 0.004 · 7 = 0.002 · 8 = 0.001 | **4** |
+| Change sensitivity | 1 = 0.016 · 2 = 0.014 · 3 = 0.012 · 4 = 0.010 · 5 = 0.008 · **6 = 0.006** · 7 = 0.002 · 8 = 0.001 | **6** |
 | Playback rate | fixed 30 fps | — |
 | Quality | fixed medium (H.264, ~0.06 bpp) | — |
-| Auto-clean cache | delete session frames after a successful export | on |
+| Auto-clean cache | delete streaming session data after a successful finalize | on |
 
 *Frame density* is how often the canvas is checked; *sensitivity* decides whether the change is worth a
 frame. Large canvases need higher sensitivity (5–8).
@@ -109,7 +131,7 @@ frame. Large canvases need higher sensitivity (5–8).
 | Path | Content |
 |---|---|
 | `output\timelapse_YYYYMMDD-HHMMSS.mp4` | exported video, timestamped at stop time (no overwrites) |
-| `cache\<timestamp>_<process>\` | JPEG/PNG frames of one session + `markers.json` |
+| `cache\<timestamp>_<process>\` | `stream.mp4` + `stream.packets` + `markers.json` |
 | `canlapse.log` | startup / pick / record / encode diagnostics |
 | `crash.log` | only if the app crashed (panic or unhandled exception) |
 
@@ -134,9 +156,9 @@ pwsh -File tools\build.ps1
 pwsh -File tools\build.ps1 -Profile release
 
 # assemble dist\CanLapse-v<version>-win64.zip (exe + 使用说明.txt only)
-pwsh -File tools\package.ps1 -Version 1.3.2
+pwsh -File tools\package.ps1 -Version 2.0.0
 
-# tests (49 unit + 4 integration)
+# tests (55 unit + 5 integration)
 cargo test --offline
 ```
 
@@ -166,8 +188,8 @@ docs/evidence/        screenshots used in this README and in the logs
 | Symptom | Cause / fix |
 |---|---|
 | Preview shows toolbars and layer panels | The canvas is not a floating window. Click **How to Locate** for per-app steps. |
-| “Desktop composition (DWM) is off” | DWM is disabled on this machine/session; thumbnail capture is unavailable. |
-| Recorded area is black outside the screen | The DWM thumbnail only contains on-screen pixels; keep the canvas on a visible monitor. |
+| “Desktop composition (DWM) is off” | Legacy thumbnail capture is unavailable. Use the CSP full-canvas or SAI2 navigator mode. |
+| Target is mostly/fully outside the screen | CanLapse switches to direct `PrintWindow`; if that app does not support it, the reason is written to `canlapse.log`. |
 | No frames at all | The canvas never changed during the recording — the session is discarded with a notice. |
 | Video is short | Playback is fixed at 30 fps; `seconds = frames / 30`. Raise frame density for more frames. |
 
@@ -176,10 +198,10 @@ docs/evidence/        screenshots used in this README and in the logs
 ## Known limitations
 
 - Canvas picking is manual by design (no auto-detection of “the canvas”).
-- Only the on-screen part of a window is captured.
-- Session frames are lossy JPEG (q85); re-exporting decodes once, without compounding loss.
-- Encoding is single-threaded: roughly 8–9 frames/s at 982×812 on a typical desktop CPU
-  (hardware encoders are on the v1.3 list).
+- Direct capture still depends on the drawing app implementing `PrintWindow`; if it does not, the reason is written to `canlapse.log`.
+- Streaming sessions are H.264-encoded as they record; finalization and re-export only remux packets.
+- Legacy sessions containing `frame_*.jpg/png` remain readable and are encoded through the old offline path.
+- Encoding remains single-threaded on a below-normal-priority worker thread.
 
 - The floating bar position is not persisted between sessions (it re-snaps to the canvas monitor, top-right).
 

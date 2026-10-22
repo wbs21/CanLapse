@@ -177,3 +177,62 @@ fn encode_中途取消产出部分视频() {
 
     cleanup(&dir);
 }
+
+#[test]
+fn 流式编码后仅重封装为普通mp4() {
+    if !ensure_encoder() {
+        eprintln!("[skip] OpenH264 编码器不可用");
+        return;
+    }
+    let dir = make_tmp_dir("stream_remux");
+    let stream = dir.join("stream.mp4");
+    let output = dir.join("normal.mp4");
+    let mut encoder =
+        canlapse::encode::StreamEncoder::new(&stream, 32, 32, canlapse::encode::Quality::Medium)
+            .unwrap();
+    for i in 0..10u32 {
+        let mut bgra = vec![0u8; 32 * 32 * 4];
+        for px in bgra.chunks_exact_mut(4) {
+            px[0] = (i * 20) as u8;
+            px[1] = (255 - i * 20) as u8;
+            px[2] = 64;
+            px[3] = 255;
+        }
+        encoder
+            .write_frame(&canlapse::frame::Frame::new(32, 32, bgra))
+            .unwrap();
+    }
+    encoder.finish().unwrap();
+
+    assert!(stream.is_file());
+    assert!(dir.join("stream.packets").is_file());
+    assert!(
+        !std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .any(|entry| entry.file_name().to_string_lossy().starts_with("frame_")),
+        "流式录制不应生成图片帧"
+    );
+    let stream_text = std::fs::read(&stream).unwrap();
+    assert!(stream_text.windows(4).any(|w| w == b"moof"));
+    assert!(stream_text.windows(4).any(|w| w == b"mvex"));
+
+    let opts = canlapse::encode::EncodeOptions {
+        fps: 30.0,
+        quality: canlapse::encode::Quality::Medium,
+        output: output.clone(),
+    };
+    let mut progress = |_done: u32, _total: u32| canlapse::encode::Progress::Continue;
+    let result = canlapse::encode::encode_session(&dir, &opts, &mut progress);
+    match result {
+        Ok(canlapse::encode::EncodeOutcome::Done(stats)) => {
+            assert_eq!(stats.frames, 10);
+            assert_eq!((stats.width, stats.height), (32, 32));
+        }
+        other => panic!("预期流式重封装成功，得到 {other:?}"),
+    }
+    let normal = std::fs::read(&output).unwrap();
+    assert!(normal.windows(4).any(|w| w == b"moov"));
+    assert!(!normal.windows(4).any(|w| w == b"moof"));
+    cleanup(&dir);
+}

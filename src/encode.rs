@@ -1,4 +1,6 @@
-//! 视频合成：把会话缓存里的 `frame_xxxx.png` 批量编码成 H.264 MP4。
+//! 视频编码：录制时把 BGRA 帧流式编码为分片 MP4；停止后只重封装为普通 MP4。
+//!
+//! 旧会话仍支持把 `frame_xxxx.png/jpg` 批量编码成 H.264 MP4。
 //!
 //! 编码器是**自编译最小 ffmpeg** 里的 `libopenh264`（静态编在 `avcodec-63.dll` 内），
 //! 封装用 libavformat 的 `mp4` muxer，像素转换用 libswscale（BGRA → YUV420P）。
@@ -15,7 +17,8 @@
 mod ffi;
 
 use std::ffi::CString;
-use std::fs;
+use std::fs::{self, File};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::os::raw::{c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
 use std::ptr;
@@ -23,6 +26,7 @@ use std::ptr;
 use ffi::off::*;
 use ffi::*;
 
+use crate::frame::Frame;
 use crate::img_io;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -115,22 +119,29 @@ fn ck(what: &str, r: c_int) -> Result<c_int, String> {
     }
 }
 
-unsafe fn set_opt_str(obj: *mut c_void, name: &str, value: &str) {
+unsafe fn set_opt_str(obj: *mut c_void, name: &str, value: &str) -> Result<(), String> {
     if obj.is_null() {
-        return;
+        return Err(format!("设置编码选项 {name} 失败：目标对象为空"));
     }
-    if let (Ok(n), Ok(v)) = (CString::new(name), CString::new(value)) {
-        av_opt_set(obj, n.as_ptr(), v.as_ptr(), 0);
-    }
+    let n = CString::new(name).map_err(|_| format!("编码选项名 {name} 含 NUL"))?;
+    let v = CString::new(value).map_err(|_| format!("编码选项 {name} 的值含 NUL"))?;
+    ck(
+        &format!("av_opt_set({name})"),
+        av_opt_set(obj, n.as_ptr(), v.as_ptr(), 0),
+    )?;
+    Ok(())
 }
 
-unsafe fn set_opt_int(obj: *mut c_void, name: &str, value: i64) {
+unsafe fn set_opt_int(obj: *mut c_void, name: &str, value: i64) -> Result<(), String> {
     if obj.is_null() {
-        return;
+        return Err(format!("设置编码选项 {name} 失败：目标对象为空"));
     }
-    if let Ok(n) = CString::new(name) {
-        av_opt_set_int(obj, n.as_ptr(), value, 0);
-    }
+    let n = CString::new(name).map_err(|_| format!("编码选项名 {name} 含 NUL"))?;
+    ck(
+        &format!("av_opt_set_int({name})"),
+        av_opt_set_int(obj, n.as_ptr(), value, 0),
+    )?;
+    Ok(())
 }
 
 fn gcd(a: i32, b: i32) -> i32 {
@@ -208,6 +219,313 @@ fn collect_frames(dir: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(indexed.into_iter().map(|(_, p)| p).collect())
 }
 
+const JOURNAL_MAGIC: &[u8; 8] = b"CLPKT001";
+const JOURNAL_VERSION: u32 = 1;
+const PACKET_MAGIC: u32 = 0x4b50_4c43; // "CLPK"
+const MAX_JOURNAL_EXTRADATA: u32 = 1024 * 1024;
+const MAX_JOURNAL_PACKET: u32 = 64 * 1024 * 1024;
+
+#[derive(Clone)]
+struct JournalHeader {
+    codec_type: i32,
+    codec_id: i32,
+    codec_tag: u32,
+    format: i32,
+    bit_rate: i64,
+    profile: i32,
+    level: i32,
+    width: i32,
+    height: i32,
+    sar: AVRational,
+    framerate: AVRational,
+    time_base: AVRational,
+    extradata: Vec<u8>,
+}
+
+impl JournalHeader {
+    unsafe fn from_stream(stream: *mut AVStream, time_base: AVRational) -> Result<Self, String> {
+        let par = get_ptr::<AVCodecParameters>(stream, ST_CODECPAR);
+        if par.is_null() {
+            return Err("无法读取编码参数".into());
+        }
+        let extra_size = get_i32(par, CP_EXTRA_DATA_SIZE).max(0) as usize;
+        if extra_size > MAX_JOURNAL_EXTRADATA as usize {
+            return Err("编码器返回的编码参数异常过大".into());
+        }
+        let extra_ptr = get_ptr::<u8>(par, CP_EXTRA_DATA);
+        let extradata = if extra_size > 0 && !extra_ptr.is_null() {
+            std::slice::from_raw_parts(extra_ptr, extra_size).to_vec()
+        } else {
+            Vec::new()
+        };
+        Ok(Self {
+            codec_type: get_i32(par, CP_CODEC_TYPE),
+            codec_id: get_i32(par, CP_CODEC_ID),
+            codec_tag: get_i32(par, CP_CODEC_TAG).max(0) as u32,
+            format: get_i32(par, CP_FORMAT),
+            bit_rate: get_i64(par, CP_BIT_RATE),
+            profile: get_i32(par, CP_PROFILE),
+            level: get_i32(par, CP_LEVEL),
+            width: get_i32(par, CP_WIDTH),
+            height: get_i32(par, CP_HEIGHT),
+            sar: get_rat(par, CP_SAMPLE_ASPECT_RATIO),
+            framerate: get_rat(par, CP_FRAMERATE),
+            time_base,
+            extradata,
+        })
+    }
+}
+
+fn write_u32<W: Write>(w: &mut W, value: u32) -> Result<(), String> {
+    w.write_all(&value.to_le_bytes())
+        .map_err(|e| format!("写入流式索引失败: {e}"))
+}
+
+fn write_i32<W: Write>(w: &mut W, value: i32) -> Result<(), String> {
+    w.write_all(&value.to_le_bytes())
+        .map_err(|e| format!("写入流式索引失败: {e}"))
+}
+
+fn write_i64<W: Write>(w: &mut W, value: i64) -> Result<(), String> {
+    w.write_all(&value.to_le_bytes())
+        .map_err(|e| format!("写入流式索引失败: {e}"))
+}
+
+fn read_u32<R: Read>(r: &mut R) -> Result<u32, String> {
+    let mut buf = [0u8; 4];
+    r.read_exact(&mut buf)
+        .map_err(|e| format!("读取流式索引失败: {e}"))?;
+    Ok(u32::from_le_bytes(buf))
+}
+
+fn read_i32<R: Read>(r: &mut R) -> Result<i32, String> {
+    let mut buf = [0u8; 4];
+    r.read_exact(&mut buf)
+        .map_err(|e| format!("读取流式索引失败: {e}"))?;
+    Ok(i32::from_le_bytes(buf))
+}
+
+fn read_i64<R: Read>(r: &mut R) -> Result<i64, String> {
+    let mut buf = [0u8; 8];
+    r.read_exact(&mut buf)
+        .map_err(|e| format!("读取流式索引失败: {e}"))?;
+    Ok(i64::from_le_bytes(buf))
+}
+
+/// A packet may be cut short only by a process crash or forced power loss.
+/// Treat an incomplete final record as end-of-journal so all fully flushed
+/// packets remain exportable. Real I/O errors are still returned.
+fn read_record_exact<R: Read>(r: &mut R, buf: &mut [u8], what: &str) -> Result<bool, String> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match r.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(format!("读取{what}失败: {e}")),
+        }
+    }
+    if filled == buf.len() {
+        Ok(true)
+    } else {
+        crate::logline!("[encode] 流式索引尾部不完整（{what}），保留此前已完整写入的帧");
+        Ok(false)
+    }
+}
+
+struct PacketJournal {
+    writer: BufWriter<File>,
+}
+
+impl PacketJournal {
+    unsafe fn create(
+        path: &Path,
+        stream: *mut AVStream,
+        time_base: AVRational,
+    ) -> Result<Self, String> {
+        let header = JournalHeader::from_stream(stream, time_base)?;
+        let file =
+            File::create(path).map_err(|e| format!("创建流式索引 {} 失败: {e}", path.display()))?;
+        let mut writer = BufWriter::new(file);
+        writer
+            .write_all(JOURNAL_MAGIC)
+            .map_err(|e| format!("写入流式索引头失败: {e}"))?;
+        write_u32(&mut writer, JOURNAL_VERSION)?;
+        write_i32(&mut writer, header.codec_type)?;
+        write_i32(&mut writer, header.codec_id)?;
+        write_u32(&mut writer, header.codec_tag)?;
+        write_i32(&mut writer, header.format)?;
+        write_i64(&mut writer, header.bit_rate)?;
+        write_i32(&mut writer, header.profile)?;
+        write_i32(&mut writer, header.level)?;
+        write_i32(&mut writer, header.width)?;
+        write_i32(&mut writer, header.height)?;
+        write_i32(&mut writer, header.sar.num)?;
+        write_i32(&mut writer, header.sar.den)?;
+        write_i32(&mut writer, header.framerate.num)?;
+        write_i32(&mut writer, header.framerate.den)?;
+        write_i32(&mut writer, header.time_base.num)?;
+        write_i32(&mut writer, header.time_base.den)?;
+        let extra_len = u32::try_from(header.extradata.len())
+            .map_err(|_| "编码参数长度超出流式索引限制".to_string())?;
+        if extra_len > MAX_JOURNAL_EXTRADATA {
+            return Err("编码参数异常过大".into());
+        }
+        write_u32(&mut writer, extra_len)?;
+        writer
+            .write_all(&header.extradata)
+            .map_err(|e| format!("写入编码参数失败: {e}"))?;
+        Ok(Self { writer })
+    }
+
+    unsafe fn write_packet(&mut self, packet: *const AVPacket) -> Result<(), String> {
+        let raw_size = get_i32(packet, PKT_SIZE);
+        if raw_size <= 0 {
+            return Err(format!("编码器返回异常编码包大小: {raw_size}"));
+        }
+        let size = raw_size as usize;
+        if size > MAX_JOURNAL_PACKET as usize {
+            return Err(format!("单帧编码包异常过大: {size} 字节"));
+        }
+        let data = get_ptr::<u8>(packet, PKT_DATA);
+        if size > 0 && data.is_null() {
+            return Err("编码包数据为空".into());
+        }
+        write_u32(&mut self.writer, PACKET_MAGIC)?;
+        write_i64(&mut self.writer, get_i64(packet, PKT_PTS))?;
+        write_i64(&mut self.writer, get_i64(packet, PKT_DTS))?;
+        write_i64(&mut self.writer, get_i64(packet, PKT_DURATION))?;
+        write_i32(&mut self.writer, get_i32(packet, PKT_FLAGS))?;
+        write_u32(&mut self.writer, size as u32)?;
+        if size > 0 {
+            let bytes = std::slice::from_raw_parts(data, size);
+            self.writer
+                .write_all(bytes)
+                .map_err(|e| format!("写入编码包失败: {e}"))?;
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<(), String> {
+        self.writer
+            .flush()
+            .map_err(|e| format!("刷新流式索引失败: {e}"))
+    }
+}
+
+struct JournalPacket {
+    pts: i64,
+    dts: i64,
+    duration: i64,
+    flags: i32,
+    data: Vec<u8>,
+}
+
+struct JournalReader {
+    reader: BufReader<File>,
+    header: JournalHeader,
+}
+
+impl JournalReader {
+    fn open(path: &Path) -> Result<Self, String> {
+        let file =
+            File::open(path).map_err(|e| format!("打开流式索引 {} 失败: {e}", path.display()))?;
+        let mut reader = BufReader::new(file);
+        let mut magic = [0u8; 8];
+        reader
+            .read_exact(&mut magic)
+            .map_err(|e| format!("读取流式索引头失败: {e}"))?;
+        if &magic != JOURNAL_MAGIC {
+            return Err("流式索引格式不匹配".into());
+        }
+        if read_u32(&mut reader)? != JOURNAL_VERSION {
+            return Err("流式索引版本不支持".into());
+        }
+        let codec_type = read_i32(&mut reader)?;
+        let codec_id = read_i32(&mut reader)?;
+        let codec_tag = read_u32(&mut reader)?;
+        let format = read_i32(&mut reader)?;
+        let bit_rate = read_i64(&mut reader)?;
+        let profile = read_i32(&mut reader)?;
+        let level = read_i32(&mut reader)?;
+        let width = read_i32(&mut reader)?;
+        let height = read_i32(&mut reader)?;
+        let sar = AVRational::new(read_i32(&mut reader)?, read_i32(&mut reader)?);
+        let framerate = AVRational::new(read_i32(&mut reader)?, read_i32(&mut reader)?);
+        let time_base = AVRational::new(read_i32(&mut reader)?, read_i32(&mut reader)?);
+        let extra_len = read_u32(&mut reader)?;
+        if extra_len > MAX_JOURNAL_EXTRADATA {
+            return Err("流式索引中的编码参数异常过大".into());
+        }
+        let mut extradata = vec![0u8; extra_len as usize];
+        reader
+            .read_exact(&mut extradata)
+            .map_err(|e| format!("读取编码参数失败: {e}"))?;
+        Ok(Self {
+            reader,
+            header: JournalHeader {
+                codec_type,
+                codec_id,
+                codec_tag,
+                format,
+                bit_rate,
+                profile,
+                level,
+                width,
+                height,
+                sar,
+                framerate,
+                time_base,
+                extradata,
+            },
+        })
+    }
+
+    fn next_packet(&mut self) -> Result<Option<JournalPacket>, String> {
+        let mut first = [0u8; 4];
+        let read = self
+            .reader
+            .read(&mut first)
+            .map_err(|e| format!("读取编码包失败: {e}"))?;
+        if read == 0 {
+            return Ok(None);
+        }
+        if read < 4 && !read_record_exact(&mut self.reader, &mut first[read..], "编码包标记尾部")?
+        {
+            return Ok(None);
+        }
+        if u32::from_le_bytes(first) != PACKET_MAGIC {
+            return Err("编码包索引损坏".into());
+        }
+        let mut record = [0u8; 32];
+        if !read_record_exact(&mut self.reader, &mut record, "编码包头")? {
+            return Ok(None);
+        }
+        let pts = i64::from_le_bytes(record[0..8].try_into().expect("固定长度"));
+        let dts = i64::from_le_bytes(record[8..16].try_into().expect("固定长度"));
+        let duration = i64::from_le_bytes(record[16..24].try_into().expect("固定长度"));
+        let flags = i32::from_le_bytes(record[24..28].try_into().expect("固定长度"));
+        let size = u32::from_le_bytes(record[28..32].try_into().expect("固定长度"));
+        if size > MAX_JOURNAL_PACKET {
+            return Err("编码包大小异常".into());
+        }
+        if size == 0 {
+            return Err("编码包为空".into());
+        }
+        let mut data = vec![0u8; size as usize];
+        if !read_record_exact(&mut self.reader, &mut data, "编码包数据")? {
+            return Ok(None);
+        }
+        Ok(Some(JournalPacket {
+            pts,
+            dts,
+            duration,
+            flags,
+            data,
+        }))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 编码器 + 封装器（RAII）
 // ---------------------------------------------------------------------------
@@ -227,6 +545,7 @@ struct Muxer {
     dst_tb: AVRational,
     header_written: bool,
     trailer_written: bool,
+    journal: Option<PacketJournal>,
     total_bytes: u64,
     packets: usize,
 }
@@ -267,6 +586,7 @@ impl Muxer {
             dst_tb: AVRational::new(1, 1),
             header_written: false,
             trailer_written: false,
+            journal: None,
             total_bytes: 0,
             packets: 0,
         }
@@ -278,6 +598,7 @@ impl Muxer {
         height: i32,
         fps: f64,
         bitrate: i64,
+        streaming: bool,
     ) -> Result<Muxer, String> {
         check_ffi_version()?;
         // 日志级别：默认只报错；排查时可用 CANLAPSE_AV_LOG=info
@@ -332,14 +653,13 @@ impl Muxer {
         let flags = get_i32(m.ctx, CC_FLAGS);
         set_i32(m.ctx, CC_FLAGS, flags | AV_CODEC_FLAG_GLOBAL_HEADER);
 
-        // 包装器的私有选项要写在 ctx->priv_data 上：
-        // 用 AV_OPT_SEARCH_CHILDREN 从 ctx 设会返回 AVERROR_OPTION_NOT_FOUND（实测）。
+        // 包装器的私有选项要直接写在 ctx->priv_data 对应的 OpenH264 私有结构上。
         let priv_data = get_ptr::<c_void>(m.ctx, CC_PRIV_DATA);
         // profile 用 high：ADR 0003 实测它体积更小、质量更好，
         // 且能避开 constrained_baseline 触发的无害警告。
-        set_opt_str(priv_data, "profile", "high");
-        set_opt_str(priv_data, "rc_mode", "bitrate");
-        set_opt_int(priv_data, "allow_skip_frames", 0);
+        set_opt_str(priv_data, "profile", "high")?;
+        set_opt_str(priv_data, "rc_mode", "bitrate")?;
+        set_opt_int(priv_data, "allow_skip_frames", 0)?;
 
         ck(
             "avcodec_open2",
@@ -369,12 +689,25 @@ impl Muxer {
             "avformat_alloc_output_context2",
             avformat_alloc_output_context2(&mut m.oc, ptr::null(), fmt.as_ptr(), fname.as_ptr()),
         )?;
+        if streaming {
+            // Keep the in-progress file playable/recoverable. Fragments start on
+            // keyframes, and the empty initial moov is required for fragmented MP4.
+            let format_priv = get_ptr::<c_void>(m.oc, FC_PRIV_DATA);
+            set_opt_str(
+                format_priv,
+                "movflags",
+                "frag_keyframe+empty_moov+default_base_moof",
+            )?;
+        }
 
         let st = avformat_new_stream(m.oc, ptr::null());
         if st.is_null() {
             return Err("avformat_new_stream 失败".into());
         }
         let codecpar = get_ptr::<AVCodecParameters>(st, ST_CODECPAR);
+        if codecpar.is_null() {
+            return Err("输出流缺少编码参数".into());
+        }
         ck(
             "avcodec_parameters_from_context",
             avcodec_parameters_from_context(codecpar, m.ctx),
@@ -403,6 +736,10 @@ impl Muxer {
         if m.dst_tb.num == 0 || m.dst_tb.den == 0 {
             m.dst_tb = AVRational::new(1, 1000);
         }
+        if streaming {
+            let journal_path = output.with_extension("packets");
+            m.journal = Some(PacketJournal::create(&journal_path, st, m.src_tb)?);
+        }
         Ok(m)
     }
 
@@ -414,6 +751,9 @@ impl Muxer {
             }
             if r < 0 {
                 return Err(format!("avcodec_receive_packet 失败: {r} ({})", av_err(r)));
+            }
+            if let Some(journal) = &mut self.journal {
+                journal.write_packet(self.pkt)?;
             }
             self.total_bytes += get_i32(self.pkt, PKT_SIZE).max(0) as u64;
             set_i32(self.pkt, PKT_STREAM_INDEX, 0);
@@ -514,6 +854,9 @@ impl Muxer {
                 avcodec_send_frame(self.ctx, ptr::null()),
             )?;
             self.drain_packets()?;
+            if let Some(journal) = self.journal.take() {
+                journal.finish()?;
+            }
             ck("av_write_trailer", av_write_trailer(self.oc))?;
             self.trailer_written = true;
         }
@@ -548,6 +891,238 @@ impl Drop for Muxer {
     }
 }
 
+/// Fixed playback rate for frames captured during recording.
+pub const LIVE_FPS: f64 = 30.0;
+
+/// Incremental H.264 encoder used while recording.
+///
+/// The current file is fragmented MP4 so packets remain recoverable while the
+/// recording is still running. No image files are created.
+pub struct StreamEncoder {
+    muxer: Muxer,
+    width: i32,
+    height: i32,
+    next_pts: i64,
+}
+
+// The encoder is created on one thread and moved to the dedicated writer thread
+// before any frame is written. It is never accessed concurrently.
+unsafe impl Send for StreamEncoder {}
+
+impl StreamEncoder {
+    pub fn new(
+        output: &Path,
+        width: i32,
+        height: i32,
+        quality: Quality,
+    ) -> Result<StreamEncoder, String> {
+        let enc_w = width & !1;
+        let enc_h = height & !1;
+        if enc_w < 2 || enc_h < 2 {
+            return Err(format!("流式视频尺寸异常: {width}x{height}"));
+        }
+        let bitrate = quality.bitrate_for(enc_w, enc_h, LIVE_FPS);
+        let muxer = unsafe { Muxer::open(output, enc_w, enc_h, LIVE_FPS, bitrate, true)? };
+        Ok(StreamEncoder {
+            muxer,
+            width: enc_w,
+            height: enc_h,
+            next_pts: 0,
+        })
+    }
+
+    pub fn dimensions(&self) -> (i32, i32) {
+        (self.width, self.height)
+    }
+
+    pub fn write_frame(&mut self, frame: &Frame) -> Result<(), String> {
+        let src_w = frame.width & !1;
+        let src_h = frame.height & !1;
+        if src_w < 2 || src_h < 2 {
+            return Err(format!(
+                "流式编码帧尺寸异常: {}x{}",
+                frame.width, frame.height
+            ));
+        }
+        unsafe {
+            self.muxer
+                .write_frame(&frame.bgra, frame.width * 4, src_w, src_h, self.next_pts)?;
+        }
+        self.next_pts += 1;
+        Ok(())
+    }
+
+    pub fn finish(&mut self) -> Result<(), String> {
+        unsafe { self.muxer.finish() }
+    }
+}
+
+struct Remuxer {
+    journal: JournalReader,
+    output: *mut AVFormatContext,
+    pb_slot: *mut *mut AVIOContext,
+    packet: *mut AVPacket,
+    output_tb: AVRational,
+    header_written: bool,
+    trailer_written: bool,
+}
+
+impl Remuxer {
+    unsafe fn open(journal_path: &Path, output: &Path) -> Result<Self, String> {
+        check_ffi_version()?;
+        let journal = JournalReader::open(journal_path)?;
+        if journal.header.codec_type != AVMEDIA_TYPE_VIDEO
+            || journal.header.codec_id != AV_CODEC_ID_H264
+            || journal.header.width < 2
+            || journal.header.height < 2
+            || journal.header.time_base.num <= 0
+            || journal.header.time_base.den <= 0
+        {
+            return Err("流式索引中的视频参数无效".into());
+        }
+        let time_base = journal.header.time_base;
+        let framerate = journal.header.framerate;
+        let mut remuxer = Remuxer {
+            journal,
+            output: ptr::null_mut(),
+            pb_slot: ptr::null_mut(),
+            packet: ptr::null_mut(),
+            output_tb: time_base,
+            header_written: false,
+            trailer_written: false,
+        };
+        let fmt = CString::new("mp4").unwrap();
+        let output_name = CString::new(output.to_string_lossy().replace('/', "\\"))
+            .map_err(|e| format!("输出路径非法: {e}"))?;
+        ck(
+            "avformat_alloc_output_context2",
+            avformat_alloc_output_context2(
+                &mut remuxer.output,
+                ptr::null(),
+                fmt.as_ptr(),
+                output_name.as_ptr(),
+            ),
+        )?;
+        let output_stream = avformat_new_stream(remuxer.output, ptr::null());
+        if output_stream.is_null() {
+            return Err("avformat_new_stream 失败".into());
+        }
+        let output_par = get_ptr::<AVCodecParameters>(output_stream, ST_CODECPAR);
+        if output_par.is_null() {
+            return Err("无法创建输出流的编码参数".into());
+        }
+        let header = &remuxer.journal.header;
+        set_i32(output_par, CP_CODEC_TYPE, header.codec_type);
+        set_i32(output_par, CP_CODEC_ID, header.codec_id);
+        set_i32(output_par, CP_CODEC_TAG, header.codec_tag as i32);
+        set_i32(output_par, CP_FORMAT, header.format);
+        set_i64(output_par, CP_BIT_RATE, header.bit_rate);
+        set_i32(output_par, CP_PROFILE, header.profile);
+        set_i32(output_par, CP_LEVEL, header.level);
+        set_i32(output_par, CP_WIDTH, header.width);
+        set_i32(output_par, CP_HEIGHT, header.height);
+        set_rat(output_par, CP_SAMPLE_ASPECT_RATIO, header.sar);
+        set_rat(output_par, CP_FRAMERATE, header.framerate);
+        if !header.extradata.is_empty() {
+            let extra = av_mallocz(header.extradata.len()) as *mut u8;
+            if extra.is_null() {
+                return Err("分配 H.264 编码参数内存失败".into());
+            }
+            ptr::copy_nonoverlapping(header.extradata.as_ptr(), extra, header.extradata.len());
+            set_ptr(output_par, CP_EXTRA_DATA, extra);
+            set_i32(
+                output_par,
+                CP_EXTRA_DATA_SIZE,
+                header.extradata.len() as i32,
+            );
+        }
+        set_rat(output_stream, ST_TIME_BASE, time_base);
+        if framerate.num > 0 && framerate.den > 0 {
+            set_rat(output_stream, ST_AVG_FRAME_RATE, framerate);
+            set_rat(output_stream, ST_R_FRAME_RATE, framerate);
+        }
+
+        remuxer.packet = av_packet_alloc();
+        if remuxer.packet.is_null() {
+            return Err("av_packet_alloc 失败".into());
+        }
+        remuxer.pb_slot = (remuxer.output as *mut u8).add(FC_PB) as *mut *mut AVIOContext;
+        ck(
+            "avio_open",
+            avio_open(remuxer.pb_slot, output_name.as_ptr(), AVIO_FLAG_WRITE),
+        )?;
+        ck(
+            "avformat_write_header",
+            avformat_write_header(remuxer.output, ptr::null_mut()),
+        )?;
+        remuxer.header_written = true;
+        let mut output_tb = get_rat(output_stream, ST_TIME_BASE);
+        if output_tb.num == 0 || output_tb.den == 0 {
+            output_tb = time_base;
+        }
+        remuxer.output_tb = output_tb;
+        Ok(remuxer)
+    }
+
+    unsafe fn copy_packets(
+        &mut self,
+        progress: &mut dyn FnMut(u32, u32) -> Progress,
+    ) -> Result<(u32, bool), String> {
+        let mut frames = 0u32;
+        let mut cancelled = false;
+        progress(0, 1);
+        while let Some(source) = self.journal.next_packet()? {
+            ck(
+                "av_new_packet",
+                av_new_packet(self.packet, source.data.len() as i32),
+            )?;
+            let data = get_ptr::<u8>(self.packet, PKT_DATA);
+            ptr::copy_nonoverlapping(source.data.as_ptr(), data, source.data.len());
+            set_i32(self.packet, PKT_STREAM_INDEX, 0);
+            set_i64(self.packet, PKT_PTS, source.pts);
+            set_i64(self.packet, PKT_DTS, source.dts);
+            set_i64(self.packet, PKT_DURATION, source.duration);
+            set_i32(self.packet, PKT_FLAGS, source.flags);
+            av_packet_rescale_ts(self.packet, self.journal.header.time_base, self.output_tb);
+            ck(
+                "av_interleaved_write_frame",
+                av_interleaved_write_frame(self.output, self.packet),
+            )?;
+            av_packet_unref(self.packet);
+            frames += 1;
+            if progress(frames, 0) == Progress::Cancel {
+                cancelled = true;
+                break;
+            }
+        }
+        Ok((frames, cancelled))
+    }
+
+    unsafe fn finish(&mut self) -> Result<(), String> {
+        if self.header_written && !self.trailer_written {
+            ck("av_write_trailer", av_write_trailer(self.output))?;
+            self.trailer_written = true;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Remuxer {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.packet.is_null() {
+                av_packet_free(&mut self.packet);
+            }
+            if !self.pb_slot.is_null() && !(*self.pb_slot).is_null() {
+                avio_closep(self.pb_slot);
+            }
+            if !self.output.is_null() {
+                avformat_free_context(self.output);
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 对外接口
 // ---------------------------------------------------------------------------
@@ -568,9 +1143,74 @@ pub fn backend_info() -> String {
     unsafe { cstr(avcodec_configuration()) }
 }
 
-/// 把会话目录里的 PNG 帧合成 MP4。
+/// Repackage a fragmented recording into a regular MP4 without re-encoding.
+pub fn remux_stream(
+    input: &Path,
+    output: &Path,
+    progress: &mut dyn FnMut(u32, u32) -> Progress,
+) -> Result<EncodeOutcome, String> {
+    if !input.is_file() {
+        return Err(format!("流式视频不存在: {}", input.display()));
+    }
+    if let Some(parent) = output.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("创建输出目录 {} 失败: {e}", parent.display()))?;
+        }
+    }
+    let output_dir = output
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    crate::fsutil::ensure_headroom(output_dir, crate::fsutil::MIN_FREE_BYTES, "视频输出目录")?;
+
+    let part = crate::fsutil::tmp_path(output);
+    let journal = input.with_extension("packets");
+    if !journal.is_file() {
+        return Err(format!("流式索引不存在: {}", journal.display()));
+    }
+    let result = (|| -> Result<(u32, bool, u32, u32), String> {
+        let mut remuxer = unsafe { Remuxer::open(&journal, &part)? };
+        let width = remuxer.journal.header.width.max(0) as u32;
+        let height = remuxer.journal.header.height.max(0) as u32;
+        let (frames, cancelled) = unsafe { remuxer.copy_packets(progress)? };
+        if frames == 0 {
+            return Err("流式视频中没有可封装的帧".into());
+        }
+        unsafe { remuxer.finish()? };
+        Ok((frames, cancelled, width, height))
+    })();
+    let (frames, cancelled, width, height) = match result {
+        Ok(value) => value,
+        Err(e) => {
+            let _ = fs::remove_file(&part);
+            return Err(e);
+        }
+    };
+    if let Err(e) = crate::fsutil::replace_file(&part, output) {
+        let _ = fs::remove_file(&part);
+        return Err(format!("提交输出文件 {} 失败: {e}", output.display()));
+    }
+    let bytes = fs::metadata(output).map(|m| m.len()).unwrap_or(0);
+    let stats = EncodeStats {
+        frames,
+        bytes,
+        width,
+        height,
+        seconds: frames as f64 / LIVE_FPS,
+    };
+    progress(frames.max(1), frames.max(1));
+    Ok(if cancelled {
+        EncodeOutcome::Cancelled(stats)
+    } else {
+        EncodeOutcome::Done(stats)
+    })
+}
+
+/// 把会话目录整理为普通 MP4。
 ///
-/// * 输出尺寸取**首帧**尺寸（宽高向下取偶数，libopenh264 要求偶数）；
+/// * 新流式会话从 packet 索引直接重封装，不重新编码；
+/// * 旧图片会话输出尺寸取**首帧**尺寸（宽高向下取偶数，libopenh264 要求偶数）；
 /// * `progress(已编码帧数, 总帧数)` 返回 [`Progress::Cancel`] 即可取消，
 ///   取消后仍会写 trailer，产出文件是**可播放的部分视频**；
 /// * 单帧读不出来直接报错（缓存被外部删改属于异常，不该悄悄产出缺帧的视频）。
@@ -581,6 +1221,15 @@ pub fn encode_session(
 ) -> Result<EncodeOutcome, String> {
     if !(1.0..=120.0).contains(&opts.fps) {
         return Err(format!("导出帧率不合理: {}", opts.fps));
+    }
+    let stream = session_dir.join(crate::session::STREAM_FILE);
+    if stream.is_file() {
+        if (opts.fps - LIVE_FPS).abs() > f64::EPSILON {
+            return Err(format!(
+                "流式会话固定为 {LIVE_FPS:.0} fps；重封装不会改变播放速度，请使用 --fps {LIVE_FPS:.0}"
+            ));
+        }
+        return remux_stream(&stream, &opts.output, progress);
     }
     let frames = collect_frames(session_dir)?;
     if frames.is_empty() {
@@ -609,7 +1258,7 @@ pub fn encode_session(
         .output
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(session_dir);
+        .unwrap_or_else(|| Path::new("."));
     crate::fsutil::ensure_headroom(space_dir, crate::fsutil::MIN_FREE_BYTES, "视频输出目录")?;
 
     let bitrate = opts.quality.bitrate_for(enc_w, enc_h, opts.fps);
@@ -622,7 +1271,7 @@ pub fn encode_session(
     // 一个“看起来是完整 MP4”的坏文件；取消时仍会把已写入的部分视频提交。
     let part = crate::fsutil::tmp_path(&opts.output);
     let encoded = (|| -> Result<(), String> {
-        let mut muxer = unsafe { Muxer::open(&part, enc_w, enc_h, opts.fps, bitrate)? };
+        let mut muxer = unsafe { Muxer::open(&part, enc_w, enc_h, opts.fps, bitrate, false)? };
 
         for (i, path) in frames.iter().enumerate() {
             let (fw, fh, rgba) = if i == 0 {
@@ -755,6 +1404,18 @@ mod tests {
             ]
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 流式索引尾部截断视为正常结束() {
+        let mut input = std::io::Cursor::new(vec![1u8, 2]);
+        let mut buf = [0u8; 4];
+        assert!(!read_record_exact(&mut input, &mut buf, "测试记录").unwrap());
+        assert_eq!(&buf[..2], &[1, 2]);
+
+        let mut input = std::io::Cursor::new(vec![1u8, 2, 3, 4]);
+        assert!(read_record_exact(&mut input, &mut buf, "测试记录").unwrap());
+        assert_eq!(buf, [1, 2, 3, 4]);
     }
 
     #[test]

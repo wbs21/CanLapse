@@ -1,7 +1,8 @@
-//! 录制会话：缓存目录、`frame_xxxx.png`、`markers.json`。
+//! 录制会话：缓存目录、流式 MP4、packet 索引与 `markers.json`。
 //!
 //! 目录命名按需求：`{时间}_{会话名称}`，例如 `2026-02-14_13-20-51_下雨天喝咖啡`。
-//! 帧文件命名：`frame_0000.png`（四位序号，超过 9999 自动变宽）。
+//! 新会话保存 `stream.mp4` + `stream.packets`，不再生成图片帧；
+//! 旧会话的 `frame_0000.png/jpg` 仍保持可读和可重新导出。
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -11,6 +12,9 @@ use serde::{Deserialize, Serialize};
 use crate::frame::Frame;
 use crate::img_io;
 use crate::win;
+
+/// New recordings store encoded packets here instead of image frames.
+pub const STREAM_FILE: &str = "stream.mp4";
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Marker {
@@ -116,10 +120,6 @@ impl Session {
         &self.dir
     }
 
-    pub fn frame_count(&self) -> u32 {
-        self.meta.frames
-    }
-
     /// 存一帧，返回保存后的帧总数。
     /// 单帧失败由调用方决定怎么处理（需求：跳过该帧、不中断录制）。
     pub fn save_frame(&mut self, frame: &Frame) -> Result<u32, String> {
@@ -138,6 +138,12 @@ impl Session {
         }
         self.meta.frames += 1;
         Ok(self.meta.frames)
+    }
+
+    /// Count a frame already encoded by the streaming writer.
+    pub fn record_encoded_frame(&mut self) -> u32 {
+        self.meta.frames += 1;
+        self.meta.frames
     }
 
     /// 打一个标记（来自悬浮条的 🏷 按钮，或命令行的 F8）。
@@ -202,7 +208,14 @@ impl Session {
         };
         for e in entries.flatten() {
             let dir = e.path();
-            if !dir.is_dir() {
+            let Ok(meta) = fs::symlink_metadata(&dir) else {
+                continue;
+            };
+            use std::os::windows::fs::MetadataExt;
+            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+            if !meta.file_type().is_dir()
+                || meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            {
                 continue;
             }
             let (name, created, meta_frames, completed) = read_markers_meta(&dir);
@@ -214,12 +227,15 @@ impl Session {
                     .map(|s| s.to_string_lossy().to_string())
                     .unwrap_or_default()
             });
+            let has_stream = dir.join(STREAM_FILE).is_file();
             out.push(SessionSummary {
                 dir,
                 name,
                 frames,
                 created: created.unwrap_or_default(),
-                completed: completed.unwrap_or(true),
+                // 旧图片会话没有 markers.json 仍按兼容会话处理；新流式会话没有
+                // markers.json 通常表示录制中途崩溃，不能标记成正常完成。
+                completed: completed.unwrap_or(!has_stream),
             });
         }
         // 目录名以时间开头，倒序即最新在前
@@ -227,14 +243,16 @@ impl Session {
         out
     }
 
-    /// 删除整个会话缓存目录
-    pub fn delete(dir: &Path) -> Result<(), String> {
-        fs::remove_dir_all(dir).map_err(|e| format!("删除 {} 失败: {e}", dir.display()))
-    }
-
     /// 只允许删除缓存根目录的**直接子目录**。删除是递归的，必须防止
     /// CANLAPSE_CACHE 被指向别处、或缓存目录里出现 junction 时误删外部内容。
     pub fn delete_in(root: &Path, dir: &Path) -> Result<(), String> {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        let link_meta = fs::symlink_metadata(dir)
+            .map_err(|e| format!("读取会话目录 {} 失败: {e}", dir.display()))?;
+        if link_meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(format!("拒绝删除重解析点/junction：{}", dir.display()));
+        }
         let root = fs::canonicalize(root)
             .map_err(|e| format!("解析缓存根目录 {} 失败: {e}", root.display()))?;
         let target = fs::canonicalize(dir)
@@ -385,7 +403,7 @@ mod tests {
         assert_eq!(list[0].name, "测试会话");
 
         // 删除会带走整个会话目录
-        Session::delete(s.dir()).unwrap();
+        Session::delete_in(&root, s.dir()).unwrap();
         assert!(!png.exists());
         assert_eq!(Session::list(&root).len(), 0);
         let _ = fs::remove_dir_all(&root);
@@ -399,6 +417,18 @@ mod tests {
         let b = Session::create(&root, "同名", &info, 4, 4, 2.0, 0.01).unwrap();
         assert_ne!(a.dir(), b.dir());
         assert_eq!(Session::list(&root).len(), 2);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn 无元数据的流式会话标记为未完成() {
+        let root = tmp_root("stream-incomplete");
+        let dir = root.join("2026-01-01_00-00-00_test");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(STREAM_FILE), b"partial").unwrap();
+        let list = Session::list(&root);
+        assert_eq!(list.len(), 1);
+        assert!(!list[0].completed);
         let _ = fs::remove_dir_all(&root);
     }
 

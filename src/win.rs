@@ -33,11 +33,11 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_ESCAP
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EnumChildWindows,
     EnumWindows, GetAncestor, GetClassNameW, GetClientRect, GetCursorPos, GetForegroundWindow,
-    GetParent, GetSystemMetrics, GetWindow, GetWindowRect, GetWindowTextW,
-    GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, PeekMessageW, RegisterClassW,
-    SetLayeredWindowAttributes, SetWindowPos, ShowWindow, SystemParametersInfoW, TranslateMessage,
-    WindowFromPoint, GA_ROOT, GW_OWNER, MSG, PM_REMOVE, SW_HIDE, SW_SHOWNOACTIVATE, WM_LBUTTONDOWN,
-    WM_PAINT, WM_RBUTTONDOWN, WNDCLASSW, WS_POPUP,
+    GetParent, GetSystemMetrics, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
+    IsWindow, IsWindowVisible, PeekMessageW, RegisterClassW, SetLayeredWindowAttributes,
+    SetWindowPos, ShowWindow, SystemParametersInfoW, TranslateMessage, WindowFromPoint, GA_ROOT,
+    MSG, PM_REMOVE, SW_HIDE, SW_SHOWNOACTIVATE, WM_LBUTTONDOWN, WM_PAINT, WM_RBUTTONDOWN,
+    WNDCLASSW, WS_POPUP,
 };
 
 pub fn wide(s: &str) -> Vec<u16> {
@@ -194,6 +194,39 @@ pub fn list_windows() -> Vec<WindowInfo> {
     out
 }
 
+unsafe extern "system" fn child_enum_cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if IsWindowVisible(hwnd) == 0 {
+            return;
+        }
+        let out = &mut *(lparam as *mut Vec<HWND>);
+        out.push(hwnd);
+    }));
+    1
+}
+
+/// 枚举某个顶层窗口的全部可见后代，按客户区面积从大到小。
+pub fn list_child_windows(root: HWND) -> Vec<WindowInfo> {
+    let mut handles: Vec<HWND> = Vec::new();
+    unsafe {
+        EnumChildWindows(
+            root,
+            Some(child_enum_cb),
+            &mut handles as *mut Vec<HWND> as LPARAM,
+        );
+    }
+    let mut out: Vec<WindowInfo> = handles
+        .into_iter()
+        .map(describe)
+        .filter(|w| !w.title.is_empty() || !w.class_name.is_empty())
+        .collect();
+    out.sort_by_key(|w| {
+        let (cw, ch) = w.client_size();
+        -(cw as i64 * ch as i64)
+    });
+    out
+}
+
 /// 按标题子串 / 类名 / 进程名查找（用于命令行指定目标）
 pub fn find_window(spec: &str) -> Option<WindowInfo> {
     let low = spec.to_lowercase();
@@ -230,6 +263,35 @@ pub fn client_screen_rect(hwnd: HWND) -> RECT {
         right: pt.x + (rc.right - rc.left),
         bottom: pt.y + (rc.bottom - rc.top),
     }
+}
+
+fn visible_ratio(rc: &RECT, vx: i32, vy: i32, vw: i32, vh: i32) -> f32 {
+    let width = (rc.right - rc.left).max(0);
+    let height = (rc.bottom - rc.top).max(0);
+    if vw <= 0 || vh <= 0 || width == 0 || height == 0 {
+        return 0.0;
+    }
+    let visible_w = rc.right.min(vx + vw).saturating_sub(rc.left.max(vx)).max(0);
+    let visible_h = rc.bottom.min(vy + vh).saturating_sub(rc.top.max(vy)).max(0);
+    (visible_w as i64 * visible_h as i64) as f32 / (width as i64 * height as i64) as f32
+}
+
+/// 客户端区域在虚拟桌面内的可见比例（0.0~1.0）。
+pub fn client_visible_ratio(hwnd: HWND) -> f32 {
+    let rc = client_screen_rect(hwnd);
+    let vx = unsafe { GetSystemMetrics(76) }; // SM_XVIRTUALSCREEN
+    let vy = unsafe { GetSystemMetrics(77) }; // SM_YVIRTUALSCREEN
+    let vw = unsafe { GetSystemMetrics(78) }; // SM_CXVIRTUALSCREEN
+    let vh = unsafe { GetSystemMetrics(79) }; // SM_CYVIRTUALSCREEN
+    visible_ratio(&rc, vx, vy, vw, vh)
+}
+
+/// DWM 在源窗口只剩很窄边缘时可能停止刷新；这类窗口改用直接 PrintWindow。
+pub fn capture_needs_direct(hwnd: HWND) -> bool {
+    let rc = client_screen_rect(hwnd);
+    let width = (rc.right - rc.left).max(0);
+    let height = (rc.bottom - rc.top).max(0);
+    client_visible_ratio(hwnd) < 0.999 || width < 64 || height < 64
 }
 
 // ---------------------------------------------------------------------------
@@ -500,21 +562,6 @@ static OVERLAY_CANCEL: AtomicBool = AtomicBool::new(false);
 static OVERLAY_X: AtomicIsize = AtomicIsize::new(0);
 static OVERLAY_Y: AtomicIsize = AtomicIsize::new(0);
 /// 最后一次成功拾取的点击点（do_pick 用它判断"点到边框还是画面"）
-static LAST_X: AtomicIsize = AtomicIsize::new(0);
-static LAST_Y: AtomicIsize = AtomicIsize::new(0);
-static LAST_PT_VALID: AtomicBool = AtomicBool::new(false);
-
-/// 最后一次成功拾取的屏幕点击点
-pub fn last_click_point() -> Option<POINT> {
-    if !LAST_PT_VALID.load(Ordering::SeqCst) {
-        return None;
-    }
-    Some(POINT {
-        x: LAST_X.load(Ordering::SeqCst) as i32,
-        y: LAST_Y.load(Ordering::SeqCst) as i32,
-    })
-}
-
 unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     guard(|| match msg {
         WM_LBUTTONDOWN => {
@@ -670,13 +717,6 @@ fn rect_of(h: HWND) -> Option<RECT> {
     }
 }
 
-/// 点是否在窗口边框 `px` 像素内（写状态栏/日志用）
-pub fn border_hit(h: HWND, pt: POINT, px: i32) -> bool {
-    rect_of(h)
-        .map(|rc| point_near_edge(pt, &rc, px))
-        .unwrap_or(false)
-}
-
 /// 点击归位：返回最终目标 + 一句说明（写日志/状态栏用）
 pub fn resolve_click(root: HWND, hit: HWND, pt: POINT) -> (HWND, &'static str) {
     if hit.is_null() {
@@ -796,9 +836,6 @@ pub fn pick_window_interactive(owner: HWND, hint: Option<HWND>) -> Option<HWND> 
                             ShowWindow(overlay, SW_SHOWNOACTIVATE);
                         }
                     } else {
-                        LAST_X.store(x as isize, Ordering::SeqCst);
-                        LAST_Y.store(y as isize, Ordering::SeqCst);
-                        LAST_PT_VALID.store(true, Ordering::SeqCst);
                         result = Some(h);
                         break;
                     }
@@ -932,94 +969,6 @@ pub fn sanitize_name(name: &str) -> String {
     } else {
         trimmed
     }
-}
-
-/// 统计画布区域被"**同属主**的其他窗口"遮住的比例（0.0~1.0）。
-///
-/// 为什么需要它 —— 这是实测得出的重要事实：
-/// * DWM 缩略图会把**被该窗口拥有（owned）的窗口一起渲染**。SAI2 的浮动面板
-///   （「颜色」等）的 `GW_OWNER` 就是主窗口，所以它们**会出现在画布里**；
-///   而别的软件的窗口不属于这个属主组，因此不会串进来 ——
-///   用户观察到的"自家面板能录进、别家窗口录不进"正是这个原因。
-/// * 被面板盖住的那部分画布像素，应用**根本没有绘制到任何地方**，
-///   所以没有任何抓帧方式能把它拿回来。产品能做的是**如实提醒用户移开面板**，
-///   而不是假装能录到。
-///
-/// `crop` 是相对 `root` 客户区原点的矩形 `(x, y, w, h)`。
-pub fn covered_ratio(root: HWND, crop: (i32, i32, i32, i32)) -> f32 {
-    let (cx, cy, cw, ch) = crop;
-    if cw <= 0 || ch <= 0 {
-        return 0.0;
-    }
-    // 用一个粗网格做并集，避免多块面板互相重叠时把面积重复计算
-    const GRID: i32 = 64;
-    let mut cells = vec![false; (GRID * GRID) as usize];
-    unsafe {
-        let mut owned: Vec<RECT> = Vec::new();
-        let root_for_cb = root;
-        unsafe extern "system" fn cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let out = &mut *(lparam as *mut (HWND, Vec<RECT>));
-                let (root, list) = out;
-                if IsWindowVisible(hwnd) == 0 || IsIconic(hwnd) != 0 {
-                    return;
-                }
-                // 只看"被 root 拥有"的顶层窗口（GetWindow(GW_OWNER)）
-                let owner = GetWindow(hwnd, GW_OWNER);
-                if owner != *root {
-                    return;
-                }
-                let mut rc: RECT = std::mem::zeroed();
-                if GetWindowRect(hwnd, &mut rc) == 0 {
-                    return;
-                }
-                // 转成 root 客户区坐标
-                let mut tl = POINT {
-                    x: rc.left,
-                    y: rc.top,
-                };
-                let mut br = POINT {
-                    x: rc.right,
-                    y: rc.bottom,
-                };
-                windows_sys::Win32::Graphics::Gdi::ScreenToClient(*root, &mut tl);
-                windows_sys::Win32::Graphics::Gdi::ScreenToClient(*root, &mut br);
-                list.push(RECT {
-                    left: tl.x,
-                    top: tl.y,
-                    right: br.x,
-                    bottom: br.y,
-                });
-            }));
-            1
-        }
-        let mut state = (root_for_cb, owned);
-        EnumWindows(Some(cb), &mut state as *mut (HWND, Vec<RECT>) as LPARAM);
-        owned = state.1;
-
-        for rc in &owned {
-            // 与裁剪矩形求交
-            let l = rc.left.max(cx);
-            let t = rc.top.max(cy);
-            let r = rc.right.min(cx + cw);
-            let b = rc.bottom.min(cy + ch);
-            if r <= l || b <= t {
-                continue;
-            }
-            // 映射到网格
-            let gx0 = ((l - cx) as i64 * GRID as i64 / cw as i64).clamp(0, GRID as i64 - 1) as i32;
-            let gx1 = ((r - cx) as i64 * GRID as i64 / cw as i64).clamp(0, GRID as i64) as i32;
-            let gy0 = ((t - cy) as i64 * GRID as i64 / ch as i64).clamp(0, GRID as i64 - 1) as i32;
-            let gy1 = ((b - cy) as i64 * GRID as i64 / ch as i64).clamp(0, GRID as i64) as i32;
-            for gy in gy0..gy1 {
-                for gx in gx0..gx1 {
-                    cells[(gy * GRID + gx) as usize] = true;
-                }
-            }
-        }
-    }
-    let hit = cells.iter().filter(|c| **c).count();
-    hit as f32 / (GRID * GRID) as f32
 }
 
 /// 取窗口所属进程 ID
@@ -1248,6 +1197,27 @@ pub fn cursor_window_deep() -> HWND {
 mod tests {
     use super::*;
 
+    #[test]
+    fn 离屏可见比例覆盖窄边和完全离屏() {
+        let rc = RECT {
+            left: -484,
+            top: 358,
+            right: 43,
+            bottom: 1125,
+        };
+        let ratio = visible_ratio(&rc, 0, 0, 3600, 1080);
+        assert!((ratio - 43.0 / 527.0 * 722.0 / 767.0).abs() < 0.01);
+        assert!(ratio < 0.25);
+
+        let outside = RECT {
+            left: -600,
+            top: 0,
+            right: -10,
+            bottom: 700,
+        };
+        assert_eq!(visible_ratio(&outside, 0, 0, 3600, 1080), 0.0);
+    }
+
     /// 点击归位用到的几何判定（纯函数，便于回归）
     #[test]
     fn 点在矩形内与边框环的判定() {
@@ -1299,103 +1269,6 @@ mod tests {
         assert_eq!(sanitize_name("com1.txt"), "_com1.txt");
         assert_eq!(sanitize_name("a\nb"), "a_b");
         assert!(sanitize_name(&"长".repeat(200)).chars().count() <= 80);
-    }
-
-    /// 「画布被自家面板遮挡」的检测：属主窗口覆盖面积比例。
-    /// 实测背景：DWM 缩略图会连同**被拥有（owned）的窗口**一起渲染，
-    /// 所以 SAI2 的浮动面板会出现在画布里；被盖住的像素应用根本没画，抓不回来 ——
-    /// 产品能做的是如实提醒，这个函数就是提醒的依据。
-    #[test]
-    fn 属主窗口遮挡比例可计算() {
-        unsafe {
-            use windows_sys::Win32::UI::WindowsAndMessaging::{
-                CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, SetWindowPos,
-                SWP_NOACTIVATE, SWP_NOZORDER, WNDCLASSW, WS_CHILD, WS_POPUP, WS_VISIBLE,
-            };
-            let hinst = module_handle();
-            let mk = |n: &str| -> Vec<u16> {
-                let w = wide(n);
-                let wc = WNDCLASSW {
-                    style: 0,
-                    lpfnWndProc: Some(DefWindowProcW),
-                    cbClsExtra: 0,
-                    cbWndExtra: 0,
-                    hInstance: hinst,
-                    hIcon: null_mut(),
-                    hCursor: null_mut(),
-                    hbrBackground: null_mut(),
-                    lpszMenuName: null(),
-                    lpszClassName: w.as_ptr(),
-                };
-                RegisterClassW(&wc);
-                w
-            };
-            let pc = mk("CanLapseCovRoot");
-            let root = CreateWindowExW(
-                0,
-                pc.as_ptr(),
-                wide("root").as_ptr(),
-                WS_POPUP | WS_VISIBLE,
-                100,
-                100,
-                800,
-                600,
-                null_mut(),
-                null_mut(),
-                hinst,
-                null(),
-            );
-            let cc = mk("CanLapseCovChild");
-            let child = CreateWindowExW(
-                0,
-                cc.as_ptr(),
-                wide("child").as_ptr(),
-                WS_CHILD | WS_VISIBLE,
-                50,
-                60,
-                400,
-                400,
-                root,
-                null_mut(),
-                hinst,
-                null(),
-            );
-            // 被 root 拥有的弹窗，盖在 child 左上 100x200 处
-            let oc = mk("CanLapseCovOwned");
-            let owned = CreateWindowExW(
-                0,
-                oc.as_ptr(),
-                wide("owned").as_ptr(),
-                WS_POPUP | WS_VISIBLE,
-                150,
-                160,
-                100,
-                200,
-                root,
-                null_mut(),
-                hinst,
-                null(),
-            );
-            SetWindowPos(
-                owned,
-                null_mut(),
-                150,
-                160,
-                100,
-                200,
-                SWP_NOZORDER | SWP_NOACTIVATE,
-            );
-            let crop = crop_rect_in_root(child, root).unwrap();
-            let ratio = covered_ratio(root, crop);
-            // 100x200 / (400x400) = 12.5%
-            assert!(
-                (ratio - 0.125).abs() < 0.02,
-                "遮挡比例应约 12.5%，实测 {ratio}"
-            );
-            DestroyWindow(owned);
-            DestroyWindow(child);
-            DestroyWindow(root);
-        }
     }
 
     /// 需求「跟随窗口缩放」的几何验证：裁剪矩形必须随子窗口移动/缩放而变。

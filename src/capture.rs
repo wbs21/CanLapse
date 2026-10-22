@@ -9,6 +9,8 @@
 //! * `BitBlt` 宿主 DC 读到的永远是宿主自绘内容，读不到缩略图（实测恒为底色）；
 //! * 宿主**不需要显示在屏幕上**（实测移到屏幕外 4000px 仍有效），
 //!   但仍必须是**真实顶层窗口**（消息窗口不行）。
+//! * 源窗口只剩窄边或完全离开虚拟桌面时，DWM 可能停止刷新；抓帧会自动退回
+//!   直接 `PrintWindow(源窗口, PW_RENDERFULLCONTENT)`。
 //!
 //! ⚠️ 线程亲和性：GDI 的 DC/位图**只能在创建它的线程上使用**。
 //! 因此一个 `ThumbnailCapture` 必须在同一个线程里建、抓、销毁
@@ -26,9 +28,9 @@ use windows_sys::Win32::Graphics::Dwm::{
     DWM_TNP_RECTDESTINATION, DWM_TNP_RECTSOURCE, DWM_TNP_SOURCECLIENTAREAONLY, DWM_TNP_VISIBLE,
 };
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, BitBlt, CreateCompatibleDC, CreateDIBSection, CreateSolidBrush, DeleteDC,
-    DeleteObject, EndPaint, FillRect, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
-    DIB_RGB_COLORS, HDC, HGDIOBJ, PAINTSTRUCT, RGBQUAD, SRCCOPY,
+    BeginPaint, CreateCompatibleDC, CreateDIBSection, CreateSolidBrush, DeleteDC, DeleteObject,
+    EndPaint, FillRect, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HDC,
+    HGDIOBJ, PAINTSTRUCT, RGBQUAD,
 };
 use windows_sys::Win32::Storage::Xps::PrintWindow;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -43,6 +45,8 @@ use crate::win;
 const HOST_CLASS: &str = "CanLapseThumbnailHost";
 const PW_RENDERFULLCONTENT_FLAG: u32 = 0x2;
 static REGISTER_HOST_CLASS: Once = Once::new();
+static OFFSCREEN_FALLBACK_LOGGED: Once = Once::new();
+static PREFERRED_DIRECT_LOGGED: Once = Once::new();
 
 /// `WS_EX_TOOLWINDOW`：宿主窗口**不进任务栏、不进 Alt+Tab**。
 /// 少了它，用户把鼠标停在任务栏图标上会看到一堆"CanLapse 抓帧宿主"的预览
@@ -235,8 +239,9 @@ impl Drop for Dib {
 /// 一个窗口（或它的某个**子窗口**区域）的持续抓帧器。
 ///
 /// ⚠️ 关键事实（在真实 SAI2 上实测得出）：**`DwmRegisterThumbnail` 不接受子窗口** ——
-/// 对子窗口调用返回 `E_INVALIDARG (0x80070057)`，因为 DWM 只合成顶层窗口，
-/// 子窗口是画进父窗口表面里的（直接对子窗口 `PrintWindow` 同样失败）。
+/// 对子窗口调用返回 `E_INVALIDARG (0x80070057)`，因为 DWM 只合成顶层窗口。
+/// 部分绘画软件的画布子窗口也不能可靠地直接 `PrintWindow`；独立导航器等原生子窗口
+/// 则可以使用直接抓取模式。
 ///
 /// 所以抓"画布子窗口"的正确做法是三步：
 ///   1. 对**顶层窗口**注册缩略图；
@@ -252,6 +257,8 @@ pub struct ThumbnailCapture {
     host: HWND,
     thumb: isize,
     dib: Dib,
+    /// 直接抓取且需要缩放时，复用的源尺寸 DIB；避免预览每帧重建大位图。
+    direct_dib: Option<Dib>,
     /// 裁剪矩形 `(x, y, w, h)`，相对 root 的客户区原点
     crop: (i32, i32, i32, i32),
     /// 输出尺寸（宿主客户区大小）。等于 crop 尺寸时是 1:1；
@@ -259,6 +266,8 @@ pub struct ThumbnailCapture {
     out: (i32, i32),
     /// 缩放上限（宽度）；`i32::MAX` 表示不缩放（录制用，必须 1:1）
     max_w: i32,
+    /// 导航器模式始终直接抓源窗口，避免 DWM 在遮挡/离屏时冻结。
+    direct_source: bool,
 }
 
 impl ThumbnailCapture {
@@ -269,7 +278,12 @@ impl ThumbnailCapture {
     ///
     /// 宿主放在虚拟桌面之外（屏幕外），用户完全看不到它 —— 实测可行（FINDINGS 实验 1 的 M6）。
     pub fn new(target: HWND) -> Result<Self, String> {
-        Self::new_scaled(target, i32::MAX)
+        Self::new_inner(target, i32::MAX, false)
+    }
+
+    /// 始终直接抓取源窗口；用于 SAI2 导航器等需要持续刷新的源。
+    pub fn new_direct(target: HWND) -> Result<Self, String> {
+        Self::new_inner(target, i32::MAX, true)
     }
 
     /// 建一个**缩放输出**的抓帧器：DWM 直接把裁剪区域缩到 `max_w` 以内再合成，
@@ -278,10 +292,19 @@ impl ThumbnailCapture {
     /// 用途：界面里 160×100 的实时预览，没必要每帧拷整张 1920×986（约 7.5 MB）。
     /// 录制必须用 [`Self::new`]（1:1，像素级差分不能用缩放图）。
     pub fn new_scaled(target: HWND, max_w: i32) -> Result<Self, String> {
+        Self::new_inner(target, max_w, false)
+    }
+
+    /// 始终直接抓取源窗口，并把结果缩放到预览宽度以内。
+    pub fn new_scaled_direct(target: HWND, max_w: i32) -> Result<Self, String> {
+        Self::new_inner(target, max_w, true)
+    }
+
+    fn new_inner(target: HWND, max_w: i32, direct_source: bool) -> Result<Self, String> {
         if !win::is_window_alive(target) {
             return Err("目标窗口无效（可能已关闭）".into());
         }
-        if !composition_enabled() {
+        if !direct_source && !composition_enabled() {
             return Err("桌面合成（DWM）未开启，无法使用缩略图抓帧".into());
         }
         let root = win::root_of(target);
@@ -299,18 +322,26 @@ impl ThumbnailCapture {
         unsafe {
             // 先建 DIB 再建宿主：如果 DIB 失败，不会留下已注册的 DWM 缩略图和宿主窗口。
             let dib = Dib::new(out.0, out.1)?;
-            let (host, thumb) = Self::create_host_and_register(root, crop, out)?;
+            let (host, thumb) = if direct_source {
+                (null_mut(), 0)
+            } else {
+                Self::create_host_and_register(root, crop, out)?
+            };
             let me = ThumbnailCapture {
                 root,
                 target,
                 host,
                 thumb,
                 dib,
+                direct_dib: None,
                 crop,
                 out,
                 max_w,
+                direct_source,
             };
-            me.apply_properties()?;
+            if !direct_source {
+                me.apply_properties()?;
+            }
             Ok(me)
         }
     }
@@ -416,6 +447,9 @@ impl ThumbnailCapture {
     /// 主窗口最小化、又没有在录制时，DWM 没必要继续为这个宿主合成画面 ——
     /// 关掉能实打实降低后台 GPU/CPU 占用。`PrintWindow` 前必须重新打开。
     pub fn set_visible(&self, visible: bool) -> Result<(), String> {
+        if self.thumb == 0 {
+            return Ok(());
+        }
         let mut props: DWM_THUMBNAIL_PROPERTIES = unsafe { std::mem::zeroed() };
         props.dwFlags = DWM_TNP_VISIBLE;
         props.fVisible = if visible { 1 } else { 0 };
@@ -429,15 +463,6 @@ impl ThumbnailCapture {
     }
 
     pub fn target(&self) -> HWND {
-        self.target
-    }
-
-    pub fn root(&self) -> HWND {
-        self.root
-    }
-
-    /// 兼容旧调用名
-    pub fn source(&self) -> HWND {
         self.target
     }
 
@@ -474,24 +499,29 @@ impl ThumbnailCapture {
         if size_changed || out_changed {
             unsafe {
                 let new_dib = Dib::new(out.0, out.1)?;
-                win::pump();
-                if self.thumb != 0 {
-                    DwmUnregisterThumbnail(self.thumb);
-                    self.thumb = 0;
+                if !self.direct_source {
+                    win::pump();
+                    if self.thumb != 0 {
+                        DwmUnregisterThumbnail(self.thumb);
+                        self.thumb = 0;
+                    }
+                    if !self.host.is_null() {
+                        DestroyWindow(self.host);
+                        self.host = null_mut();
+                    }
+                    let (host, thumb) = Self::create_host_and_register(self.root, crop, out)?;
+                    self.host = host;
+                    self.thumb = thumb;
                 }
-                if !self.host.is_null() {
-                    DestroyWindow(self.host);
-                    self.host = null_mut();
-                }
-                let (host, thumb) = Self::create_host_and_register(self.root, crop, out)?;
-                self.host = host;
-                self.thumb = thumb;
                 self.out = out;
                 self.dib = new_dib;
+                if self.direct_source {
+                    self.direct_dib = None;
+                }
             }
         }
         self.crop = crop;
-        if crop_changed || size_changed || out_changed {
+        if !self.direct_source && (crop_changed || size_changed || out_changed) {
             unsafe { self.apply_properties()? };
         }
         Ok(size_changed)
@@ -502,20 +532,10 @@ impl ThumbnailCapture {
         self.sync()
     }
 
-    /// 目标区域被"**同属主窗口**"遮住的比例（见 [`crate::win::covered_ratio`] 的说明）。
-    ///
-    /// ⚠️ 按用户要求，**当前不用于提醒**：绘画软件自己的浮动面板压在画布上是正常现象，
-    /// 照原样录进画面即可（不裁切、不提示）。这个函数保留下来是因为
-    /// "画布被遮住多少"仍是可复现的事实，将来若要做"自动裁掉被遮区域"会用到。
-    #[allow(dead_code)]
-    pub fn covered_ratio(&self) -> f32 {
-        win::covered_ratio(self.root, self.crop)
-    }
-
     /// 抓一帧。返回的像素是**源窗口客户区**的内容（1:1 抓帧时；预览缩放时是缩放后的）。
     ///
     /// 目标窗口被其他窗口盖住、甚至被最小化时，本方法依然能取到画面（实测）。
-    pub fn grab(&self) -> Result<Frame, String> {
+    pub fn grab(&mut self) -> Result<Frame, String> {
         let (w, h) = self.out;
         let mut f = Frame::new(
             w,
@@ -529,9 +549,12 @@ impl ThumbnailCapture {
     /// 抓一帧到**已有缓冲区**里（录制循环用，避免每帧分配几 MB）。
     ///
     /// 尺寸变了会自动重建缓冲区；调用方拿到的 `frame` 始终是当前尺寸。
-    pub fn grab_into(&self, frame: &mut Frame) -> Result<(), String> {
+    pub fn grab_into(&mut self, frame: &mut Frame) -> Result<(), String> {
         if !self.source_alive() {
             return Err("目标窗口已关闭".into());
+        }
+        if self.should_capture_direct() {
+            return self.grab_direct_into(frame);
         }
         // 让宿主窗口处理掉待处理消息，保持它"活着"
         win::pump();
@@ -555,13 +578,16 @@ impl ThumbnailCapture {
     /// 静态画布下 `prev` 与当前 DIB 相同，直接返回 false，不产生几十 MB 的
     /// DIB→Frame 拷贝；只有确实需要保存时才复制。
     pub fn grab_if_changed(
-        &self,
+        &mut self,
         prev: &Frame,
         threshold: f32,
         frame: &mut Frame,
     ) -> Result<bool, String> {
         if !self.source_alive() {
             return Err("目标窗口已关闭".into());
+        }
+        if self.should_capture_direct() {
+            return self.grab_direct_if_changed(prev, threshold, frame);
         }
         win::pump();
         let ok = unsafe { PrintWindow(self.host, self.dib.dc, PW_RENDERFULLCONTENT_FLAG) };
@@ -581,40 +607,98 @@ impl ThumbnailCapture {
         Ok(true)
     }
 
-    /// 直接对源窗口抓一帧（`PrintWindow(源, PW_RENDERFULLCONTENT)`）。
-    ///
-    /// **只作为诊断/对照**：实测在 Chromium 这类 GPU 合成窗口上直接失败，
-    /// 因此它不是主路径，不要拿它替换 `grab()`。
-    #[allow(dead_code)]
-    pub fn grab_direct_from_source(&self) -> Result<Frame, String> {
+    fn should_capture_direct(&self) -> bool {
+        if self.direct_source {
+            PREFERRED_DIRECT_LOGGED.call_once(|| {
+                logline!(
+                    "[capture] 完整画布模式始终直接抓取源窗口 target=0x{:X}",
+                    self.target as isize
+                );
+            });
+            return true;
+        }
+        if win::capture_needs_direct(self.target) {
+            OFFSCREEN_FALLBACK_LOGGED.call_once(|| {
+                logline!(
+                    "[capture] 目标未完全位于显示器内（可见 {:.1}%），切换到 PrintWindow(源窗口) 抓帧 target=0x{:X}",
+                    win::client_visible_ratio(self.target) * 100.0,
+                    self.target as isize,
+                );
+            });
+            return true;
+        }
+        false
+    }
+
+    fn grab_direct_into(&mut self, frame: &mut Frame) -> Result<(), String> {
         let (w, h) = win::client_size(self.target);
         if w <= 0 || h <= 0 {
             return Err(format!("源窗口客户区尺寸异常（{w}x{h}）"));
         }
-        let dib = Dib::new(w, h)?;
-        let ok = unsafe { PrintWindow(self.target, dib.dc, PW_RENDERFULLCONTENT_FLAG) };
+        if self.out == (w, h) {
+            let ok = unsafe { PrintWindow(self.target, self.dib.dc, PW_RENDERFULLCONTENT_FLAG) };
+            if ok == 0 {
+                return Err("PrintWindow(源窗口) 返回失败".into());
+            }
+            let pixels = self.dib.pixels();
+            if frame.width != w || frame.height != h || frame.bgra.len() != pixels.len() {
+                *frame = Frame::new(w, h, pixels.to_vec());
+            } else {
+                frame.bgra.copy_from_slice(pixels);
+            }
+        } else {
+            let needs_source = self
+                .direct_dib
+                .as_ref()
+                .map(|dib| dib.width != w || dib.height != h)
+                .unwrap_or(true);
+            if needs_source {
+                self.direct_dib = Some(Dib::new(w, h)?);
+            }
+            let Some(source_dib) = self.direct_dib.as_ref() else {
+                return Err("直接抓取源缓冲未初始化".into());
+            };
+            let ok = unsafe { PrintWindow(self.target, source_dib.dc, PW_RENDERFULLCONTENT_FLAG) };
+            if ok == 0 {
+                return Err("PrintWindow(源窗口) 返回失败".into());
+            }
+            let source = Frame::new(w, h, source_dib.pixels().to_vec());
+            *frame = source.resize_to(self.out.0, self.out.1);
+        }
+        Ok(())
+    }
+
+    fn grab_direct_if_changed(
+        &mut self,
+        prev: &Frame,
+        threshold: f32,
+        frame: &mut Frame,
+    ) -> Result<bool, String> {
+        let (w, h) = win::client_size(self.target);
+        if w <= 0 || h <= 0 {
+            return Err(format!("源窗口客户区尺寸异常（{w}x{h}）"));
+        }
+        if self.out != (w, h) {
+            self.grab_direct_into(frame)?;
+            return Ok(prev.width != frame.width
+                || prev.height != frame.height
+                || prev.changed_enough_bytes(&frame.bgra, threshold));
+        }
+
+        let ok = unsafe { PrintWindow(self.target, self.dib.dc, PW_RENDERFULLCONTENT_FLAG) };
         if ok == 0 {
             return Err("PrintWindow(源窗口) 返回失败".into());
         }
-        Ok(Frame::new(w, h, dib.pixels().to_vec()))
-    }
-
-    /// 屏幕 BitBlt 一块区域（诊断用；被遮挡即失效）
-    #[allow(dead_code)]
-    pub fn grab_screen_rect(rc: &RECT) -> Result<Frame, String> {
-        let w = rc.right - rc.left;
-        let h = rc.bottom - rc.top;
-        let dib = Dib::new(w, h)?;
-        let ok = unsafe {
-            let screen = windows_sys::Win32::Graphics::Gdi::GetDC(null_mut());
-            let r = BitBlt(dib.dc, 0, 0, w, h, screen, rc.left, rc.top, SRCCOPY);
-            windows_sys::Win32::Graphics::Gdi::ReleaseDC(null_mut(), screen);
-            r
-        };
-        if ok == 0 {
-            return Err("屏幕 BitBlt 失败".into());
+        let pixels = self.dib.pixels();
+        if prev.width == w && prev.height == h && !prev.changed_enough_bytes(pixels, threshold) {
+            return Ok(false);
         }
-        Ok(Frame::new(w, h, dib.pixels().to_vec()))
+        if frame.width != w || frame.height != h || frame.bgra.len() != pixels.len() {
+            *frame = Frame::new(w, h, pixels.to_vec());
+        } else {
+            frame.bgra.copy_from_slice(pixels);
+        }
+        Ok(true)
     }
 }
 

@@ -26,10 +26,6 @@ impl Frame {
         }
     }
 
-    pub fn byte_len(&self) -> usize {
-        self.bgra.len()
-    }
-
     /// 取一个像素的 RGB（越界返回 None）。测试、UI 预览、边缘检测都会用到。
     pub fn get(&self, x: i32, y: i32) -> Option<[u8; 3]> {
         if x < 0 || y < 0 || x >= self.width || y >= self.height {
@@ -37,6 +33,29 @@ impl Frame {
         }
         let i = ((y * self.width + x) * 4) as usize;
         Some([self.bgra[i + 2], self.bgra[i + 1], self.bgra[i]])
+    }
+
+    /// 裁出整数像素矩形，矩形必须完全位于画面内。
+    pub fn crop(&self, x: i32, y: i32, width: i32, height: i32) -> Result<Frame, String> {
+        if width <= 0
+            || height <= 0
+            || x < 0
+            || y < 0
+            || x.saturating_add(width) > self.width
+            || y.saturating_add(height) > self.height
+        {
+            return Err(format!(
+                "裁剪矩形无效：({x},{y},{width},{height})，源尺寸 {}x{}",
+                self.width, self.height
+            ));
+        }
+        let row_bytes = width as usize * 4;
+        let mut out = Vec::with_capacity(row_bytes * height as usize);
+        for row in y..y + height {
+            let start = ((row * self.width + x) * 4) as usize;
+            out.extend_from_slice(&self.bgra[start..start + row_bytes]);
+        }
+        Ok(Frame::new(width, height, out))
     }
 
     /// 与另一帧相比，变化像素所占比例（0.0 ~ 1.0）。
@@ -145,7 +164,7 @@ impl Frame {
         false
     }
 
-    /// 画面是否几乎全黑/恒定 —— 用于抓帧自检告警（见 ADR 0002 的"依赖实现行为"风险）。
+    /// 画面是否几乎恒定 —— 用于抓帧自检告警和旧图片缓存格式选择。
     pub fn is_blank(&self) -> bool {
         if self.bgra.len() < 4 {
             return true;

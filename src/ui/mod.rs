@@ -29,6 +29,7 @@ use windows_sys::Win32::UI::Controls::{
     InitCommonControlsEx, ICC_BAR_CLASSES, ICC_PROGRESS_CLASS, ICC_STANDARD_CLASSES,
     INITCOMMONCONTROLSEX, PBM_SETPOS, PBM_SETRANGE32,
 };
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetMessageW,
     GetWindowLongPtrW, GetWindowRect, LoadCursorW, MessageBoxW, MoveWindow, PostQuitMessage,
@@ -54,6 +55,7 @@ use crate::win;
 // ---------------------------------------------------------------------------
 
 const ID_PICK: usize = 100;
+const ID_SAI_NAVIGATOR: usize = 101;
 const ID_HELP: usize = 102;
 const ID_STATUS: usize = 103;
 const ID_HDR_REC: usize = 110;
@@ -103,9 +105,9 @@ const REC_FPS_KEYS: [(lang::K, f64); 4] = [
 const REC_FPS_DEFAULT: usize = 0;
 
 /// 画面检测灵敏度 8 档：档位 1~8 → 变化像素比例阈值（数字越大越灵敏）
-const SENS_LEVELS: [f32; 8] = [0.08, 0.04, 0.02, 0.01, 0.008, 0.004, 0.002, 0.001];
-/// 默认第 4 档（0.01）
-const SENS_DEFAULT: usize = 3;
+const SENS_LEVELS: [f32; 8] = [0.016, 0.014, 0.012, 0.010, 0.008, 0.006, 0.002, 0.001];
+/// 默认第 6 档（0.006）
+const SENS_DEFAULT: usize = 5;
 
 /// 播放帧率与画质固定，不提供选择
 const EXPORT_FPS: f64 = 30.0;
@@ -142,8 +144,6 @@ fn cls(s: &str) -> Vec<u16> {
 enum PickState {
     Empty,
     Ok,
-    /// 画布没浮动（窗口里含工具栏/面板）—— 只做提醒，允许强行继续
-    HasPanel,
 }
 
 struct EncState {
@@ -167,6 +167,7 @@ struct EncState {
 struct Ctl {
     title: HWND,
     btn_pick: HWND,
+    btn_sai_navigator: HWND,
     btn_help: HWND,
     status: HWND,
     hdr_rec: HWND,
@@ -200,7 +201,13 @@ struct App {
     threshold: f32,
     auto_clean: bool,
     target: Option<win::WindowInfo>,
+    full_view_mode: bool,
+    full_view_rect: Option<crate::navigator::CanvasRect>,
+    full_view_tip_shown: bool,
+    sai_navigator_mode: bool,
     preview: Option<Frame>,
+    /// 完整画布预览的直接抓取原始缓冲；裁剪结果另存 `preview`，避免每帧重分配。
+    preview_raw: Frame,
     preview_rect: RECT,
     pick_state: PickState,
     preview_cap: Option<ThumbnailCapture>,
@@ -219,8 +226,6 @@ struct App {
     preview_err: Option<(String, std::time::Instant)>,
     /// 上一次成功抓到的预览尺寸，尺寸变化时记一条日志（换目标/改窗口大小时有用）
     preview_size: (i32, i32),
-    /// 这次拾取点到的是"边框"还是"画面"（状态栏展示，便于确认点中位置）
-    pick_where: Option<&'static str>,
     /// 预览抓帧是否因"主窗口不可见"而暂停（对应的 DWM 缩略图已关掉合成）
     preview_hidden: bool,
     /// 预览抓帧耗时累计（每 20 次写一条 `[perf]`，用于验证降采样的效果）
@@ -228,11 +233,8 @@ struct App {
     preview_grabs: u32,
 }
 
-/// 有界等待线程收尾。线程卡在 PrintWindow/编码里时，宁可退出也不能让 UI 无限挂住。
-fn join_with_timeout(handle: Option<JoinHandle<()>>, timeout: std::time::Duration) -> bool {
-    let Some(handle) = handle else {
-        return true;
-    };
+/// 有界等待，但不消费 JoinHandle，超时后调用方仍可保留它。
+fn wait_handle(handle: &JoinHandle<()>, timeout: std::time::Duration) -> bool {
     let deadline = std::time::Instant::now() + timeout;
     while !handle.is_finished() {
         if std::time::Instant::now() >= deadline {
@@ -241,12 +243,37 @@ fn join_with_timeout(handle: Option<JoinHandle<()>>, timeout: std::time::Duratio
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    let _ = handle.join();
     true
+}
+
+/// 有界等待线程收尾。线程卡在 PrintWindow/编码里时，宁可退出也不能让 UI 无限挂住。
+fn join_with_timeout(handle: Option<JoinHandle<()>>, timeout: std::time::Duration) -> bool {
+    let Some(handle) = handle else {
+        return true;
+    };
+    let finished = wait_handle(&handle, timeout);
+    if finished {
+        let _ = handle.join();
+    }
+    finished
 }
 
 impl App {
     fn status_text(&self) -> String {
+        if self.sai_navigator_mode {
+            let size = self
+                .full_view_rect
+                .map(|rect| format!("{}×{}", rect.width, rect.height))
+                .unwrap_or_else(|| "SAI2".to_string());
+            return lang::f(lang::K::StatusNavigator, &[&size]);
+        }
+        if self.full_view_mode {
+            let size = self
+                .full_view_rect
+                .map(|rect| format!("{}×{}", rect.width, rect.height))
+                .unwrap_or_else(|| "Navigator".to_string());
+            return lang::f(lang::K::StatusFullView, &[&size]);
+        }
         // 把目标尺寸/类名带出来：用户一眼就能分辨"选中的是画布还是整个窗口"
         // （之前只显示"已选中画布窗口"，选到主窗口也照样这么说，没法判断）。
         let picked = self
@@ -259,12 +286,28 @@ impl App {
             .unwrap_or_default();
         match self.pick_state {
             PickState::Empty => lang::s(lang::K::StatusEmpty).to_string(),
-            PickState::Ok => match self.pick_where {
-                Some(where_) => lang::f(lang::K::StatusOkWith, &[&picked, &where_]),
-                None => lang::f(lang::K::StatusOkPlain, &[&picked]),
-            },
-            PickState::HasPanel => lang::s(lang::K::StatusPanelWarn).to_string(),
+            PickState::Ok => lang::f(lang::K::StatusOkPlain, &[&picked]),
         }
+    }
+
+    fn crop_navigator_preview(&self, frame: &Frame) -> Option<Frame> {
+        if !self.full_view_mode {
+            return None;
+        }
+        let (Some(rect), Some(cap)) = (self.full_view_rect, self.preview_cap.as_ref()) else {
+            return None;
+        };
+        let (source_w, source_h) = win::client_size(cap.target());
+        if source_w <= 0 || source_h <= 0 {
+            return None;
+        }
+        let x0 = rect.x as i64 * frame.width as i64 / source_w as i64;
+        let y0 = rect.y as i64 * frame.height as i64 / source_h as i64;
+        let x1 = (rect.x as i64 + rect.width as i64) * frame.width as i64 / source_w as i64;
+        let y1 = (rect.y as i64 + rect.height as i64) * frame.height as i64 / source_h as i64;
+        frame
+            .crop(x0 as i32, y0 as i32, (x1 - x0) as i32, (y1 - y0) as i32)
+            .ok()
     }
 }
 
@@ -305,7 +348,8 @@ fn compute_layout(app: &App, cw: i32) -> (Vec<(HWND, RECT, bool)>, RECT, i32) {
         true,
     );
     y += scale::px(30);
-
+    push(c.btn_sai_navigator, rect(m, y, inner, scale::px(24)), true);
+    y += scale::px(30);
     // 预览缩略图 + 右侧【开始录制】：按钮吃掉预览右侧的剩余宽度
     let preview_w = scale::px(PREVIEW_W);
     let preview_h = scale::px(PREVIEW_H);
@@ -605,7 +649,12 @@ impl App {
             auto_clean: true,
             // 默认导出到"程序所在目录\output"（不再放在缓存目录里）
             target: None,
+            full_view_mode: false,
+            full_view_rect: None,
+            full_view_tip_shown: false,
+            sai_navigator_mode: false,
             preview: None,
+            preview_raw: Frame::new(0, 0, Vec::new()),
             preview_rect: rect(0, 0, 0, 0),
             pick_state: PickState::Empty,
             preview_cap: None,
@@ -620,7 +669,6 @@ impl App {
             relayouting: false,
             preview_err: None,
             preview_size: (0, 0),
-            pick_where: None,
             preview_hidden: false,
             preview_us: 0,
             preview_grabs: 0,
@@ -641,7 +689,15 @@ impl App {
             0,
             f,
         );
-        c.btn_pick = mk(h, "Button", lang::s(lang::K::PickWindow), ws, ID_PICK, f);
+        c.btn_pick = mk(h, "Button", lang::s(lang::K::FullViewMode), ws, ID_PICK, f);
+        c.btn_sai_navigator = mk(
+            h,
+            "Button",
+            lang::s(lang::K::SaiNavigatorMode),
+            ws,
+            ID_SAI_NAVIGATOR,
+            f,
+        );
         c.btn_help = mk(h, "Button", lang::s(lang::K::HowToLocate), ws, ID_HELP, f);
         c.status = mk(h, "Static", "", ws, ID_STATUS, f);
 
@@ -766,6 +822,7 @@ impl App {
 
         // 深色主题：按钮/复选框/进度条自绘；下拉框与输入框交给系统深色主题
         theme::decorate(c.btn_pick, theme::Role::Ghost);
+        theme::decorate(c.btn_sai_navigator, theme::Role::Ghost);
         theme::decorate(c.btn_help, theme::Role::Ghost);
         theme::decorate(c.btn_record, theme::Role::Accent);
         theme::decorate(c.btn_open_out, theme::Role::Ghost);
@@ -812,6 +869,7 @@ impl App {
         for h in [
             c.title,
             c.btn_pick,
+            c.btn_sai_navigator,
             c.btn_help,
             c.status,
             c.hdr_rec,
@@ -938,7 +996,8 @@ impl App {
     fn on_command(&mut self, id: usize, _code: u32) {
         unsafe {
             match id {
-                ID_PICK => self.do_pick(),
+                ID_PICK => self.select_full_view(),
+                ID_SAI_NAVIGATOR => self.select_sai_navigator(),
                 ID_HELP => self.show_help(),
                 ID_BTN_CLEAN => {
                     // 打开缓存根目录，让用户自己清理（替代原来的"提示"文字）
@@ -1031,7 +1090,26 @@ impl App {
         );
     }
 
-    unsafe fn do_pick(&mut self) {
+    unsafe fn select_full_view(&mut self) {
+        if self.enc.is_some()
+            || self.worker.is_some()
+            || self.shared.as_ref().is_some_and(|s| s.phase().is_running())
+        {
+            message(
+                self.hwnd,
+                lang::s(lang::K::Notice),
+                lang::s(lang::K::ExportInProgress),
+            );
+            return;
+        }
+        if !self.full_view_tip_shown {
+            message(
+                self.hwnd,
+                lang::s(lang::K::FullViewTitle),
+                lang::s(lang::K::FullViewHelp),
+            );
+            self.full_view_tip_shown = true;
+        }
         // 拾取期间：**始终置顶 + 半透明**（按用户要求）。
         // 置顶保证提示始终可见；半透明让我们不完全挡住下面的目标，方便点它的标题栏。
         // GWL_EXSTYLE = -20，WS_EX_LAYERED = 0x00080000，LWA_ALPHA = 0x2
@@ -1060,12 +1138,10 @@ impl App {
         let hint = win::PickHintGuard(win::pick_hint_create(lang::s(lang::K::PickHint)));
         let picked = win::pick_window_interactive(self.hwnd, Some(hint.0));
 
-        // 拾取结束：真正取消置顶，把界面拉回最前并正常显示。
-        // ⚠️ hWndInsertAfter = NULL 等价 HWND_TOP，并不会移除 WS_EX_TOPMOST；
-        // 必须显式用 HWND_NOTOPMOST (-2)。
+        // 拾取结束后继续保持置顶，避免 SAI2/CSP 把主界面压到后面。
         SetWindowPos(
             self.hwnd,
-            (-2isize) as HWND, // HWND_NOTOPMOST
+            (-1isize) as HWND, // HWND_TOPMOST
             0,
             0,
             0,
@@ -1090,14 +1166,20 @@ impl App {
             SetWindowTextW(self.ctl.status, t.as_ptr());
             return;
         };
-        // ⚠️ 这里**不要**把目标"统一解析到顶层窗口"。
-        // 旧写法 `root_of(hwnd)` 会把用户点中的"画布子窗口"换成整个主窗口 ——
-        // 预览里于是出现工具栏和颜色面板，用户看到的就是"没锁到画布"（SAI2 上实测）。
-        // 子窗口由 ThumbnailCapture::new 自己解析成「顶层缩略图 + rcSource 裁剪」。
         let info = win::describe(hwnd);
+        if info.process.eq_ignore_ascii_case("sai2.exe")
+            || info.process.eq_ignore_ascii_case("sai.exe")
+        {
+            message(
+                self.hwnd,
+                lang::s(lang::K::CannotRecord),
+                "SAI2 第二视图捕获不稳定，请使用【使用 SAI2 导航器】。",
+            );
+            return;
+        }
         let (cw, ch) = info.client_size();
         logline!(
-            "[pick] 目标 0x{:X} | {} | 客户区 {}x{} | root=0x{:X} | 层级：{}",
+            "[full-view] 目标 0x{:X} | {} | 客户区 {}x{} | root=0x{:X} | 层级：{}",
             hwnd as isize,
             info.label(),
             cw,
@@ -1105,57 +1187,48 @@ impl App {
             win::root_of(hwnd) as isize,
             win::ancestor_chain(hwnd)
         );
-        // 释放上一个预览抓帧器
-        self.preview_cap = None;
-        match ThumbnailCapture::new_scaled(hwnd, scale::px(PREVIEW_MAX_W)) {
-            Ok(cap) => {
-                let (ow, oh) = cap.size();
-                self.preview = match cap.grab() {
-                    Ok(f) => {
-                        logline!(
-                            "[pick] 抓帧器 ok，输出 {}x{}，首帧 {}x{}",
-                            ow,
-                            oh,
-                            f.width,
-                            f.height
-                        );
-                        Some(f)
-                    }
-                    Err(e) => {
-                        logline!("[pick] 抓帧器 ok，但首帧失败：{e}");
-                        None
-                    }
-                };
-                self.preview_cap = Some(cap);
-            }
+        let full = match ThumbnailCapture::new_direct(hwnd).and_then(|mut cap| cap.grab()) {
+            Ok(frame) => frame,
             Err(e) => {
-                // 不再弹模态框：把原因写进状态栏，用户可直接再点一次【拾取窗口】
-                // ⚠️ 必须把旧预览清掉：否则状态栏说"抓不到"，画面上却还留着上一个目标的图，
-                //    用户会以为拾取成功了（实测踩过）。
-                logline!("[pick] 建抓帧器失败：{e}");
-                self.preview = None;
+                logline!("[full-view] 抓帧失败：{e}");
                 let t = win::wide(&lang::f(lang::K::GrabFailed, &[&e]));
                 SetWindowTextW(self.ctl.status, t.as_ptr());
-                InvalidateRect(self.hwnd, &self.preview_rect, 0);
                 return;
             }
-        }
-        // 辅助提醒：目标客户区明显大于"典型画布比例"时提示可能没浮动
-        // （规格：仅提示，允许强行继续）
-        self.pick_state = if looks_like_panel(&info) {
-            PickState::HasPanel
-        } else {
-            PickState::Ok
         };
-        // 点到的是边框还是画面（参考实现的 6px 判定，用于状态栏/日志）
-        self.pick_where = win::last_click_point().map(|pt| {
-            if win::border_hit(hwnd, pt, win::BORDER_PX) {
-                lang::s(lang::K::WhereBorder)
-            } else {
-                lang::s(lang::K::WhereSurface)
+        let rect = match crate::navigator::detect_canvas_rect(&full) {
+            Ok(rect) => rect,
+            Err(e) => {
+                logline!("[full-view] 画布定位失败：{e}");
+                message(
+                    self.hwnd,
+                    lang::s(lang::K::CannotRecord),
+                    &lang::f(lang::K::NavigatorFailed, &[&e]),
+                );
+                return;
             }
-        });
-        logline!("[pick] 点击位置：{:?}", self.pick_where);
+        };
+        let preview = match crate::navigator::crop_canvas(&full, rect) {
+            Ok(frame) => frame,
+            Err(e) => {
+                message(
+                    self.hwnd,
+                    lang::s(lang::K::CannotRecord),
+                    &lang::f(lang::K::NavigatorFailed, &[&e]),
+                );
+                return;
+            }
+        };
+        self.preview_cap = None;
+        self.preview_cap = ThumbnailCapture::new_scaled_direct(hwnd, scale::px(PREVIEW_MAX_W)).ok();
+        self.preview_size = (preview.width, preview.height);
+        self.preview_raw = full;
+        self.preview = Some(preview);
+        self.preview_err = None;
+        self.full_view_mode = true;
+        self.full_view_rect = Some(rect);
+        self.sai_navigator_mode = false;
+        self.pick_state = PickState::Ok;
         logline!(
             "[pick] 拾取完成 pick_state={:?} 预览={}x{}",
             self.pick_state,
@@ -1169,6 +1242,107 @@ impl App {
         InvalidateRect(self.hwnd, std::ptr::null(), 1);
         UpdateWindow(self.hwnd);
         logline!("[pick] 同步重绘完成");
+    }
+
+    unsafe fn select_sai_navigator(&mut self) {
+        if self.enc.is_some()
+            || self.worker.is_some()
+            || self.shared.as_ref().is_some_and(|s| s.phase().is_running())
+        {
+            message(
+                self.hwnd,
+                lang::s(lang::K::Notice),
+                lang::s(lang::K::ExportInProgress),
+            );
+            return;
+        }
+        let selected = self
+            .target
+            .as_ref()
+            .filter(|target| {
+                target.process.eq_ignore_ascii_case("sai2.exe")
+                    || target.process.eq_ignore_ascii_case("sai.exe")
+            })
+            .map(|target| target.hwnd)
+            .or_else(|| crate::navigator::find_sai2_main().map(|window| window.hwnd));
+        let Some(selected) = selected else {
+            message(
+                self.hwnd,
+                lang::s(lang::K::CannotRecord),
+                lang::s(lang::K::SaiNavigatorMissing),
+            );
+            return;
+        };
+        let nav = match crate::navigator::probe(selected) {
+            Ok(nav) => nav,
+            Err(e) => {
+                let detail = if e == lang::s(lang::K::SaiNavigatorMissing) {
+                    e
+                } else {
+                    lang::f(lang::K::NavigatorFailed, &[&e])
+                };
+                message(self.hwnd, lang::s(lang::K::CannotRecord), &detail);
+                return;
+            }
+        };
+        let full =
+            match ThumbnailCapture::new_direct(nav.capture.hwnd).and_then(|mut cap| cap.grab()) {
+                Ok(frame) => frame,
+                Err(e) => {
+                    message(
+                        self.hwnd,
+                        lang::s(lang::K::CannotRecord),
+                        &lang::f(lang::K::NavigatorFailed, &[&e]),
+                    );
+                    return;
+                }
+            };
+        let rect = match crate::navigator::detect_canvas_rect(&full) {
+            Ok(rect) => rect,
+            Err(e) => {
+                message(
+                    self.hwnd,
+                    lang::s(lang::K::CannotRecord),
+                    &lang::f(lang::K::NavigatorFailed, &[&e]),
+                );
+                return;
+            }
+        };
+        let preview = match crate::navigator::crop_canvas(&full, rect) {
+            Ok(frame) => frame,
+            Err(e) => {
+                message(
+                    self.hwnd,
+                    lang::s(lang::K::CannotRecord),
+                    &lang::f(lang::K::NavigatorFailed, &[&e]),
+                );
+                return;
+            }
+        };
+        self.preview_cap = None;
+        self.preview_cap =
+            ThumbnailCapture::new_scaled_direct(nav.capture.hwnd, scale::px(PREVIEW_MAX_W)).ok();
+        self.preview_size = (preview.width, preview.height);
+        self.preview_raw = full;
+        self.preview = Some(preview);
+        self.preview_err = None;
+        self.target = Some(nav.capture.clone());
+        self.full_view_mode = true;
+        self.full_view_rect = Some(rect);
+        self.sai_navigator_mode = true;
+        self.pick_state = PickState::Ok;
+        logline!(
+            "[sai-navigator] root=0x{:X} capture=0x{:X} crop=({},{},{},{})",
+            nav.root.hwnd as isize,
+            nav.capture.hwnd as isize,
+            rect.x,
+            rect.y,
+            rect.width,
+            rect.height
+        );
+        self.refresh_labels();
+        InvalidateRect(self.hwnd, std::ptr::null(), 1);
+        UpdateWindow(self.hwnd);
     }
 
     unsafe fn show_help(&self) {
@@ -1202,7 +1376,7 @@ impl App {
             );
             return;
         };
-        if !crate::capture::composition_enabled() {
+        if !self.full_view_mode && !crate::capture::composition_enabled() {
             message(
                 self.hwnd,
                 lang::s(lang::K::CannotRecord),
@@ -1233,6 +1407,8 @@ impl App {
             fill_rgb: [0, 0, 0],
             // GUI 流程启用"其他软件在前台就暂停"（用户点完录制会点进画布）
             fg_pause: true,
+            full_view: self.full_view_mode && !self.sai_navigator_mode,
+            navigator: self.sai_navigator_mode,
         };
         // 消耗掉录制开始前可能按住的 Esc，避免刚点开始就被误判为停止。
         let _ = win::escape_pressed_once();
@@ -1255,8 +1431,11 @@ impl App {
             }
             self.shared = None;
             if let Some(t) = &self.target {
-                self.preview_cap =
-                    ThumbnailCapture::new_scaled(t.hwnd, scale::px(PREVIEW_MAX_W)).ok();
+                self.preview_cap = if self.full_view_mode {
+                    ThumbnailCapture::new_scaled_direct(t.hwnd, scale::px(PREVIEW_MAX_W)).ok()
+                } else {
+                    ThumbnailCapture::new_scaled(t.hwnd, scale::px(PREVIEW_MAX_W)).ok()
+                };
             }
             self.ui_set_idle();
             message(
@@ -1275,8 +1454,15 @@ impl App {
 
     unsafe fn stop_and_encode(&mut self) {
         if let Some(w) = self.worker.take() {
-            if !join_with_timeout(Some(w), std::time::Duration::from_secs(5)) {
-                self.ui_set_idle();
+            if !wait_handle(&w, std::time::Duration::from_secs(5)) {
+                self.worker = Some(w);
+                ShowWindow(self.hwnd, SW_RESTORE);
+                SetForegroundWindow(self.hwnd);
+                let text = win::wide(lang::s(lang::K::ThreadTimeout));
+                SetWindowTextW(self.ctl.status, text.as_ptr());
+                EnableWindow(self.ctl.btn_record, 0);
+                EnableWindow(self.ctl.btn_pick, 0);
+                EnableWindow(self.ctl.btn_sai_navigator, 0);
                 message(
                     self.hwnd,
                     lang::s(lang::K::RecordingFailed),
@@ -1284,6 +1470,7 @@ impl App {
                 );
                 return;
             }
+            let _ = w.join();
         }
         let shared = self.shared.take();
         let dir = shared.as_ref().and_then(|s| s.session_dir());
@@ -1296,7 +1483,11 @@ impl App {
         SetForegroundWindow(self.hwnd);
         // 恢复实时预览（录制期间抓帧归录制线程独占）
         if let Some(t) = &self.target {
-            self.preview_cap = ThumbnailCapture::new_scaled(t.hwnd, scale::px(PREVIEW_MAX_W)).ok();
+            self.preview_cap = if self.full_view_mode {
+                ThumbnailCapture::new_scaled_direct(t.hwnd, scale::px(PREVIEW_MAX_W)).ok()
+            } else {
+                ThumbnailCapture::new_scaled(t.hwnd, scale::px(PREVIEW_MAX_W)).ok()
+            };
         }
 
         let failed = shared.as_ref().and_then(|s| s.error());
@@ -1441,13 +1632,19 @@ impl App {
             return;
         };
         let dir = s.dir.clone();
-        // 输出放在会话目录**外面**，并带帧率后缀，避免与"重新导出/清缓存"互相踩：
-        // 旧写法 out = dir/timelapse.mp4 + 自动清理 = 刚导出的视频被自己删掉。
-        let stem = s.name.clone();
-        let out = dir
-            .parent()
-            .map(|p| p.join(format!("{stem}_{}fps.mp4", EXPORT_FPS as i32)))
-            .unwrap_or_else(|| dir.join("timelapse.mp4"));
+        // 输出放在会话目录**外面**，文件名包含会话目录名和帧率。会话目录本身
+        // 保证唯一，因此不同会话不会互相覆盖；同一会话重复导出时再追加序号。
+        let stem = dir
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| s.name.clone());
+        let out_parent = dir.parent().unwrap_or(&dir);
+        let mut out = out_parent.join(format!("{stem}_{}fps.mp4", EXPORT_FPS as i32));
+        let mut suffix = 2;
+        while out.exists() {
+            out = out_parent.join(format!("{stem}_{}fps_{suffix}.mp4", EXPORT_FPS as i32));
+            suffix += 1;
+        }
         // 重新导出面向的是"已有缓存"，不应该清理它
         self.start_encoding(dir, out, false);
     }
@@ -1683,15 +1880,27 @@ impl App {
                     self.preview_size = (0, 0); // 重新抓一帧，尺寸变化日志不作数
                     logline!("[preview] 主窗口重新可见：恢复预览抓帧");
                 }
-                // 先抓完再把结果搬出来，避免 `&self.preview_cap` 的不可变借用挡住后面的字段修改
-                // 复用上一帧的 Frame，避免每 200/500ms 分配一块几百 KB 的预览缓冲。
-                let mut frame = self.preview.take().unwrap_or(Frame {
-                    width: 0,
-                    height: 0,
-                    bgra: Vec::new(),
-                });
+                // 先抓完再把结果搬出来，避免抓帧器借用挡住后面的字段修改。
+                // 复用上一帧的 Frame，避免每 200/500ms 重分配预览缓冲。
+                let full_view = self.full_view_mode;
+                let mut refresh_crop = false;
+                if let Some(cap) = self.preview_cap.as_mut() {
+                    match cap.sync_source_size() {
+                        Ok(changed) => refresh_crop = changed,
+                        Err(e) => logline!("[preview] 同步源窗口尺寸失败：{e}"),
+                    }
+                }
+                let mut frame = if full_view {
+                    std::mem::replace(&mut self.preview_raw, Frame::new(0, 0, Vec::new()))
+                } else {
+                    self.preview.take().unwrap_or(Frame {
+                        width: 0,
+                        height: 0,
+                        bgra: Vec::new(),
+                    })
+                };
                 let t_grab = std::time::Instant::now();
-                let grabbed = self.preview_cap.as_ref().map(|c| c.grab_into(&mut frame));
+                let grabbed = self.preview_cap.as_mut().map(|c| c.grab_into(&mut frame));
                 self.preview_us += t_grab.elapsed().as_micros() as u64;
                 self.preview_grabs += 1;
                 if self.preview_grabs >= 20 {
@@ -1706,6 +1915,30 @@ impl App {
                 if let Some(res) = grabbed {
                     match res {
                         Ok(()) => {
+                            if full_view && refresh_crop {
+                                if let Ok(rect) = crate::navigator::detect_canvas_rect(&frame) {
+                                    self.full_view_rect = Some(rect);
+                                    logline!(
+                                        "[preview] 完整画布区域更新为 ({},{},{},{})",
+                                        rect.x,
+                                        rect.y,
+                                        rect.width,
+                                        rect.height
+                                    );
+                                }
+                            }
+                            let cropped = self.crop_navigator_preview(&frame);
+                            let frame = if full_view {
+                                if let Some(cropped) = cropped {
+                                    self.preview_raw = frame;
+                                    cropped
+                                } else {
+                                    self.preview_raw = frame.clone();
+                                    frame
+                                }
+                            } else {
+                                frame
+                            };
                             let sz = (frame.width, frame.height);
                             if self.preview_size != (0, 0) && sz != self.preview_size {
                                 logline!(
@@ -1724,7 +1957,11 @@ impl App {
                             InvalidateRect(self.hwnd, &self.preview_rect, 0);
                         }
                         Err(e) => {
-                            self.preview = Some(frame);
+                            if full_view {
+                                self.preview_raw = frame;
+                            } else {
+                                self.preview = Some(frame);
+                            }
                             // 目标被关掉/最小化时这个错误每 500ms 重复一次：
                             // 只在"错误内容变了"或"距上次记录 ≥10 秒"时写
                             let now = std::time::Instant::now();
@@ -1935,22 +2172,6 @@ fn default_cache_root() -> PathBuf {
 
 fn default_output_dir() -> PathBuf {
     crate::default_output_dir()
-}
-
-/// 粗略判断"画布可能没浮动"：客户区里出现明显偏窄或偏宽的比例，
-/// 或者窗口类名是常见主框架。**只做提醒，不阻止用户继续**（规格要求保留强行继续的能力）。
-fn looks_like_panel(info: &win::WindowInfo) -> bool {
-    let (w, h) = info.client_size();
-    if w <= 0 || h <= 0 {
-        return false;
-    }
-    let ratio = w as f64 / h as f64;
-    // 常见绘画软件主窗口（还没把画布拖出来）的类名特征
-    let main_frame = matches!(
-        info.class_name.as_str(),
-        "Chrome_WidgetWin_1" | "Qt5157QWindowIcon" | "Photoshop" | "Sai2Class"
-    );
-    main_frame || ratio > 3.2 || ratio < 0.35
 }
 
 /// 窗口标题 / 界面标题统一用这个名字（带版本号）
@@ -2205,7 +2426,7 @@ pub fn run(initial_target: Option<isize>) -> i32 {
                 app.pick_state = PickState::Ok;
                 app.preview_cap =
                     ThumbnailCapture::new_scaled(h as HWND, scale::px(PREVIEW_MAX_W)).ok();
-                if let Some(cap) = &app.preview_cap {
+                if let Some(cap) = &mut app.preview_cap {
                     app.preview = cap.grab().ok();
                 }
                 logline!(
@@ -2220,6 +2441,15 @@ pub fn run(initial_target: Option<isize>) -> i32 {
         }
         ShowWindow(hwnd, SW_SHOW);
         UpdateWindow(hwnd);
+        SetWindowPos(
+            hwnd,
+            (-1isize) as HWND, // HWND_TOPMOST
+            0,
+            0,
+            0,
+            0,
+            0x0002 | 0x0001 | 0x0010, // SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
+        );
         logline!("[start] 首帧显示 {} ms", t_start.elapsed().as_millis());
         SetTimer(hwnd, TIMER_UI, 500, None);
 
@@ -2579,5 +2809,19 @@ pub unsafe fn finish_enc_dialog(text: &str) {
     if (*ptr).done.is_none() {
         (*ptr).done = Some((text.to_string(), std::time::Instant::now()));
         InvalidateRect(hwnd, std::ptr::null(), 1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SENS_DEFAULT, SENS_LEVELS};
+
+    #[test]
+    fn 灵敏度档位按0点002递增() {
+        assert_eq!(
+            SENS_LEVELS,
+            [0.016, 0.014, 0.012, 0.010, 0.008, 0.006, 0.002, 0.001]
+        );
+        assert_eq!(SENS_DEFAULT, 5);
     }
 }

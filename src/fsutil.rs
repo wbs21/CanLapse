@@ -46,18 +46,33 @@ pub fn create_temp(path: &Path) -> io::Result<(PathBuf, File)> {
 
 /// 把已经写好的临时文件替换到最终路径。
 ///
-/// Windows 上 `rename` 对已存在的目标不一定成功，因此失败时只在目标确实存在的情况下
-/// 删掉旧文件再重试。旧文件此时通常是上一次失败留下的残片；正常流程里目标不应存在。
+/// 使用 `MoveFileExW(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)`，
+/// 避免“先删旧文件、再 rename”时第二次操作失败而把原文件也丢掉。
 pub fn replace_file(tmp: &Path, dest: &Path) -> io::Result<()> {
-    match fs::rename(tmp, dest) {
-        Ok(()) => Ok(()),
-        Err(first) => {
-            if !dest.exists() {
-                return Err(first);
-            }
-            fs::remove_file(dest)?;
-            fs::rename(tmp, dest)
-        }
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let from = crate::win::wide(&tmp.to_string_lossy());
+    let to = crate::win::wide(&dest.to_string_lossy());
+    let ok = unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if ok != 0 {
+        return Ok(());
+    }
+    // Some network/virtual filesystems reject WRITE_THROUGH even though the
+    // atomic replacement itself is supported. Retry without that hint while
+    // still never deleting the destination first.
+    let ok = unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_REPLACE_EXISTING) };
+    if ok != 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
     }
 }
 
@@ -108,6 +123,15 @@ pub fn cleanup_stale_temps(root: &Path, max_age: Duration) -> usize {
             };
             let path = entry.path();
             if ft.is_dir() {
+                use std::os::windows::fs::MetadataExt;
+                const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+                // 不跟随 junction / symlink，避免清理任务越出缓存根目录。
+                if fs::symlink_metadata(&path)
+                    .map(|m| m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
+                    .unwrap_or(true)
+                {
+                    continue;
+                }
                 walk(&path, max_age, removed);
                 continue;
             }
@@ -147,6 +171,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("markers.json");
+        fs::write(&path, b"old").unwrap();
         write_atomic(&path, b"{\"ok\":true}").unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"{\"ok\":true}");
         assert!(!tmp_path(&path).exists());
