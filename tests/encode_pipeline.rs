@@ -205,7 +205,9 @@ fn 流式编码后仅重封装为普通mp4() {
     encoder.finish().unwrap();
 
     assert!(stream.is_file());
-    assert!(dir.join("stream.packets").is_file());
+    let packets = dir.join("stream.packets");
+    assert!(packets.is_file());
+    assert_eq!(canlapse::encode::count_stream_frames(&packets).unwrap(), 10);
     assert!(
         !std::fs::read_dir(&dir)
             .unwrap()

@@ -18,7 +18,7 @@ mod ffi;
 
 use std::ffi::CString;
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::os::raw::{c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
 use std::ptr;
@@ -424,12 +424,17 @@ struct JournalPacket {
 struct JournalReader {
     reader: BufReader<File>,
     header: JournalHeader,
+    file_len: u64,
 }
 
 impl JournalReader {
     fn open(path: &Path) -> Result<Self, String> {
         let file =
             File::open(path).map_err(|e| format!("打开流式索引 {} 失败: {e}", path.display()))?;
+        let file_len = file
+            .metadata()
+            .map_err(|e| format!("读取流式索引元数据失败: {e}"))?
+            .len();
         let mut reader = BufReader::new(file);
         let mut magic = [0u8; 8];
         reader
@@ -478,6 +483,7 @@ impl JournalReader {
                 time_base,
                 extradata,
             },
+            file_len,
         })
     }
 
@@ -523,6 +529,49 @@ impl JournalReader {
             flags,
             data,
         }))
+    }
+
+    fn count_remaining_packets(&mut self) -> Result<u32, String> {
+        let mut count = 0u32;
+        loop {
+            let mut first = [0u8; 4];
+            let read = self
+                .reader
+                .read(&mut first)
+                .map_err(|e| format!("读取编码包失败: {e}"))?;
+            if read == 0 {
+                break;
+            }
+            if read < 4
+                && !read_record_exact(&mut self.reader, &mut first[read..], "编码包标记尾部")?
+            {
+                break;
+            }
+            if u32::from_le_bytes(first) != PACKET_MAGIC {
+                return Err("编码包索引损坏".into());
+            }
+            let mut record = [0u8; 32];
+            if !read_record_exact(&mut self.reader, &mut record, "编码包头")? {
+                break;
+            }
+            let size = u32::from_le_bytes(record[28..32].try_into().expect("固定长度"));
+            if size == 0 || size > MAX_JOURNAL_PACKET {
+                return Err("编码包大小异常".into());
+            }
+            let position = self
+                .reader
+                .stream_position()
+                .map_err(|e| format!("读取流式索引位置失败: {e}"))?;
+            if position.saturating_add(size as u64) > self.file_len {
+                crate::logline!("[encode] 流式索引尾部编码包不完整，按已完成帧计数");
+                break;
+            }
+            self.reader
+                .seek(SeekFrom::Current(size as i64))
+                .map_err(|e| format!("跳过编码包失败: {e}"))?;
+            count = count.saturating_add(1);
+        }
+        Ok(count)
     }
 }
 
@@ -1205,6 +1254,12 @@ pub fn remux_stream(
     } else {
         EncodeOutcome::Done(stats)
     })
+}
+
+/// Count fully written H.264 packets without loading packet payloads into memory.
+pub fn count_stream_frames(journal: &Path) -> Result<u32, String> {
+    let mut reader = JournalReader::open(journal)?;
+    reader.count_remaining_packets()
 }
 
 /// 把会话目录整理为普通 MP4。

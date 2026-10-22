@@ -789,7 +789,7 @@ pub fn pick_window_interactive(owner: HWND, hint: Option<HWND>) -> Option<HWND> 
         }
         // 最小化有极短的过渡期，前 10 轮（约 0.6s）不判"被恢复"
         if ticks > 10 && !owner.is_null() && unsafe { IsIconic(owner) } == 0 {
-            logline!("[pick] 主窗口回到了前台，取消拾取（请重新点【拾取窗口】）");
+            logline!("[pick] 主窗口回到了前台，取消拾取（请重新点【选择画布窗口】）");
             break;
         }
         if OVERLAY_CANCEL.swap(false, Ordering::SeqCst) {

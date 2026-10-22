@@ -9,9 +9,12 @@
 #   pwsh -File tools\build.ps1                 # debug 构建 + 注入
 #   pwsh -File tools\build.ps1 -Profile release
 #   pwsh -File tools\build.ps1 -SkipInject     # 只构建（例如做纯编译检查）
+#   pwsh -File tools\build.ps1 -Profile release -SignThumbprint <证书指纹>
 param(
     [ValidateSet('debug', 'release')] [string]$Profile = 'debug',
-    [switch]$SkipInject
+    [switch]$SkipInject,
+    [string]$SignThumbprint = $env:CANLAPSE_SIGN_THUMBPRINT,
+    [string]$TimestampUrl = 'http://timestamp.digicert.com'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -34,4 +37,34 @@ $exeDir = if ($Profile -eq 'release') { 'target\release' } else { 'target\debug'
 & pwsh -NoProfile -File (Join-Path $PSScriptRoot 'embed-resources.ps1') -Dir $exeDir
 if ($LASTEXITCODE -ne 0) { throw '资源注入失败' }
 
-Write-Host '完成：已构建并注入图标 / 版本信息'
+if (-not [string]::IsNullOrWhiteSpace($SignThumbprint)) {
+    $signtool = Get-Command signtool.exe -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Source
+    if (-not $signtool) {
+        $programFilesX86 = [Environment]::GetFolderPath('ProgramFilesX86')
+        if ([string]::IsNullOrWhiteSpace($programFilesX86)) {
+            $programFilesX86 = [Environment]::GetFolderPath('ProgramFiles')
+        }
+        $kits = Join-Path $programFilesX86 'Windows Kits\10\bin'
+        if (Test-Path $kits) {
+            $signtool = Get-ChildItem $kits -Filter signtool.exe -Recurse -File |
+                Where-Object { $_.FullName -match '\\x64\\signtool\.exe$' } |
+                Sort-Object FullName -Descending |
+                Select-Object -First 1 -ExpandProperty FullName
+        }
+    }
+    if (-not $signtool) { throw '已指定签名证书，但找不到 signtool.exe（请安装 Windows SDK）' }
+
+    $thumbprint = $SignThumbprint.Replace(' ', '')
+    foreach ($name in @('CanLapse.exe', 'canlapse-cli.exe')) {
+        $file = Join-Path $exeDir $name
+        & $signtool sign /sha1 $thumbprint /fd SHA256 /tr $TimestampUrl /td SHA256 $file
+        if ($LASTEXITCODE -ne 0) { throw "签名失败：$file" }
+        $signature = Get-AuthenticodeSignature -LiteralPath $file
+        if ($signature.Status -ne 'Valid') {
+            throw "签名验证失败：$file（$($signature.Status)）"
+        }
+    }
+    Write-Host '完成：已构建、注入资源并完成 Authenticode 签名'
+} else {
+    Write-Host '完成：已构建并注入图标 / 版本信息（未签名）'
+}

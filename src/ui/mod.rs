@@ -16,6 +16,7 @@ mod theme;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -146,6 +147,37 @@ enum PickState {
     Ok,
 }
 
+#[derive(PartialEq, Eq, Debug)]
+enum CanvasAppKind {
+    Csp,
+    Sai2,
+    Other,
+}
+
+fn canvas_app_kind(info: &win::WindowInfo) -> CanvasAppKind {
+    let process = info.process.to_ascii_lowercase();
+    if process.starts_with("clipstudiopaint") {
+        CanvasAppKind::Csp
+    } else if process == "sai2.exe" || process == "sai.exe" {
+        CanvasAppKind::Sai2
+    } else {
+        CanvasAppKind::Other
+    }
+}
+
+fn largest_window_for_pid(mut windows: Vec<win::WindowInfo>, pid: u32) -> Option<win::WindowInfo> {
+    windows.retain(|window| window.pid == pid);
+    windows.into_iter().max_by_key(|window| {
+        let (width, height) = window.client_size();
+        width as i64 * height as i64
+    })
+}
+
+fn is_original_canvas_window(hwnd: HWND, pid: u32) -> bool {
+    let root = win::root_of(hwnd);
+    largest_window_for_pid(win::list_windows(), pid).is_some_and(|main| main.hwnd == root)
+}
+
 struct EncState {
     progress: Arc<AtomicU32>,
     total: Arc<AtomicU32>,
@@ -161,6 +193,147 @@ struct EncState {
     /// 合成线程句柄。保留它才能在退出时 join，避免进程退出把正在写
     /// trailer 的编码线程直接杀掉。
     worker: Option<JoinHandle<()>>,
+}
+
+enum PreviewCmd {
+    Grab,
+    SetVisible(bool),
+    Stop,
+}
+
+struct PreviewWorker {
+    tx: SyncSender<PreviewCmd>,
+    rx: Receiver<Result<Frame, String>>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl PreviewWorker {
+    fn new(target: HWND, max_w: i32, direct: bool) -> Result<(Self, Frame), String> {
+        let (cmd_tx, cmd_rx) = sync_channel::<PreviewCmd>(4);
+        let (init_tx, init_rx) = sync_channel::<Result<Frame, String>>(1);
+        let (frame_tx, frame_rx) = sync_channel::<Result<Frame, String>>(1);
+        let target_raw = target as isize;
+        let handle = std::thread::spawn(move || {
+            unsafe {
+                windows_sys::Win32::System::Threading::SetThreadPriority(
+                    windows_sys::Win32::System::Threading::GetCurrentThread(),
+                    -1,
+                );
+            }
+            let target = target_raw as HWND;
+            let mut cap = match if direct {
+                ThumbnailCapture::new_scaled_direct(target, max_w)
+            } else {
+                ThumbnailCapture::new_scaled_preferred(target, max_w)
+            } {
+                Ok(capture) => capture,
+                Err(e) => {
+                    let _ = init_tx.send(Err(e));
+                    return;
+                }
+            };
+            let initial = match cap.grab() {
+                Ok(frame) => frame,
+                Err(e) => {
+                    let _ = init_tx.send(Err(e));
+                    return;
+                }
+            };
+            if init_tx.send(Ok(initial.clone())).is_err() {
+                return;
+            }
+            let mut previous = Some(initial);
+            let mut next = Frame::new(0, 0, Vec::new());
+            while let Ok(cmd) = cmd_rx.recv() {
+                match cmd {
+                    PreviewCmd::SetVisible(visible) => {
+                        let _ = cap.set_visible(visible);
+                    }
+                    PreviewCmd::Grab => {
+                        if let Err(e) = cap.sync_source_size() {
+                            send_latest_preview(&frame_tx, Err(e));
+                            continue;
+                        }
+                        let result = match &previous {
+                            Some(frame) => cap
+                                .grab_if_changed(frame, 0.0, &mut next)
+                                .map(|changed| changed.then(|| next.clone())),
+                            None => cap.grab_into(&mut next).map(|_| Some(next.clone())),
+                        };
+                        match result {
+                            Ok(Some(frame)) => {
+                                if send_latest_preview(&frame_tx, Ok(frame.clone())) {
+                                    previous = Some(frame);
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                send_latest_preview(&frame_tx, Err(e));
+                            }
+                        }
+                    }
+                    PreviewCmd::Stop => break,
+                }
+            }
+        });
+        let initial = match init_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(Ok(frame)) => frame,
+            Ok(Err(e)) => {
+                let _ = cmd_tx.try_send(PreviewCmd::Stop);
+                let _ = wait_handle(&handle, std::time::Duration::from_secs(2));
+                return Err(e);
+            }
+            Err(_) => {
+                let _ = cmd_tx.try_send(PreviewCmd::Stop);
+                let _ = wait_handle(&handle, std::time::Duration::from_secs(2));
+                return Err("预览抓帧器初始化超时".into());
+            }
+        };
+        Ok((
+            Self {
+                tx: cmd_tx,
+                rx: frame_rx,
+                handle: Some(handle),
+            },
+            initial,
+        ))
+    }
+
+    fn request_frame(&self) {
+        let _ = self.tx.try_send(PreviewCmd::Grab);
+    }
+
+    fn set_visible(&self, visible: bool) {
+        let _ = self.tx.try_send(PreviewCmd::SetVisible(visible));
+    }
+
+    fn try_take(&self) -> Option<Result<Frame, String>> {
+        match self.rx.try_recv() {
+            Ok(result) => Some(result),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => Some(Err("预览抓帧线程已退出".into())),
+        }
+    }
+}
+
+fn send_latest_preview(
+    tx: &SyncSender<Result<Frame, String>>,
+    result: Result<Frame, String>,
+) -> bool {
+    tx.try_send(result).is_ok()
+}
+
+impl Drop for PreviewWorker {
+    fn drop(&mut self) {
+        let _ = self.tx.try_send(PreviewCmd::Stop);
+        if let Some(handle) = self.handle.take() {
+            if !wait_handle(&handle, std::time::Duration::from_secs(2)) {
+                logline!("[preview] 抓帧线程收尾超时，转为后台退出");
+                return;
+            }
+            let _ = handle.join();
+        }
+    }
 }
 
 #[derive(Default)]
@@ -201,16 +374,13 @@ struct App {
     threshold: f32,
     auto_clean: bool,
     target: Option<win::WindowInfo>,
-    full_view_mode: bool,
-    full_view_rect: Option<crate::navigator::CanvasRect>,
-    full_view_tip_shown: bool,
+    canvas_window_mode: bool,
+    canvas_rect: Option<crate::navigator::CanvasRect>,
     sai_navigator_mode: bool,
     preview: Option<Frame>,
-    /// 完整画布预览的直接抓取原始缓冲；裁剪结果另存 `preview`，避免每帧重分配。
-    preview_raw: Frame,
     preview_rect: RECT,
     pick_state: PickState,
-    preview_cap: Option<ThumbnailCapture>,
+    preview_worker: Option<PreviewWorker>,
     sessions: Vec<crate::session::SessionSummary>,
     sel: Option<usize>,
     shared: Option<Arc<Shared>>,
@@ -226,11 +396,10 @@ struct App {
     preview_err: Option<(String, std::time::Instant)>,
     /// 上一次成功抓到的预览尺寸，尺寸变化时记一条日志（换目标/改窗口大小时有用）
     preview_size: (i32, i32),
+    /// 预览抓帧器的原始输出尺寸，用于判断是否需要重新定位导航画布。
+    preview_source_size: (i32, i32),
     /// 预览抓帧是否因"主窗口不可见"而暂停（对应的 DWM 缩略图已关掉合成）
     preview_hidden: bool,
-    /// 预览抓帧耗时累计（每 20 次写一条 `[perf]`，用于验证降采样的效果）
-    preview_us: u64,
-    preview_grabs: u32,
 }
 
 /// 有界等待，但不消费 JoinHandle，超时后调用方仍可保留它。
@@ -262,17 +431,17 @@ impl App {
     fn status_text(&self) -> String {
         if self.sai_navigator_mode {
             let size = self
-                .full_view_rect
+                .canvas_rect
                 .map(|rect| format!("{}×{}", rect.width, rect.height))
                 .unwrap_or_else(|| "SAI2".to_string());
             return lang::f(lang::K::StatusNavigator, &[&size]);
         }
-        if self.full_view_mode {
+        if self.canvas_window_mode {
             let size = self
-                .full_view_rect
+                .canvas_rect
                 .map(|rect| format!("{}×{}", rect.width, rect.height))
                 .unwrap_or_else(|| "Navigator".to_string());
-            return lang::f(lang::K::StatusFullView, &[&size]);
+            return lang::f(lang::K::StatusCanvasWindow, &[&size]);
         }
         // 把目标尺寸/类名带出来：用户一眼就能分辨"选中的是画布还是整个窗口"
         // （之前只显示"已选中画布窗口"，选到主窗口也照样这么说，没法判断）。
@@ -291,23 +460,48 @@ impl App {
     }
 
     fn crop_navigator_preview(&self, frame: &Frame) -> Option<Frame> {
-        if !self.full_view_mode {
+        if !self.sai_navigator_mode {
             return None;
         }
-        let (Some(rect), Some(cap)) = (self.full_view_rect, self.preview_cap.as_ref()) else {
-            return None;
+        let rect = self.canvas_rect?;
+        frame.crop(rect.x, rect.y, rect.width, rect.height).ok()
+    }
+
+    fn restore_preview_worker(&mut self) {
+        self.preview_worker = None;
+        let Some(target) = self.target.as_ref() else {
+            return;
         };
-        let (source_w, source_h) = win::client_size(cap.target());
-        if source_w <= 0 || source_h <= 0 {
-            return None;
+        match PreviewWorker::new(
+            target.hwnd,
+            scale::px(PREVIEW_MAX_W),
+            self.sai_navigator_mode,
+        ) {
+            Ok((worker, raw)) => {
+                self.preview_worker = Some(worker);
+                self.preview_source_size = (raw.width, raw.height);
+                if self.sai_navigator_mode {
+                    if let Ok(rect) = crate::navigator::detect_canvas_rect(&raw) {
+                        self.canvas_rect = Some(rect);
+                    }
+                }
+                let frame = if self.sai_navigator_mode {
+                    self.canvas_rect
+                        .and_then(|rect| crate::navigator::crop_canvas(&raw, rect).ok())
+                        .unwrap_or(raw)
+                } else {
+                    raw
+                };
+                self.preview_size = (frame.width, frame.height);
+                self.preview = Some(frame);
+                self.preview_err = None;
+            }
+            Err(e) => {
+                self.preview = None;
+                self.preview_size = (0, 0);
+                logline!("[preview] 重建预览抓帧器失败：{e}");
+            }
         }
-        let x0 = rect.x as i64 * frame.width as i64 / source_w as i64;
-        let y0 = rect.y as i64 * frame.height as i64 / source_h as i64;
-        let x1 = (rect.x as i64 + rect.width as i64) * frame.width as i64 / source_w as i64;
-        let y1 = (rect.y as i64 + rect.height as i64) * frame.height as i64 / source_h as i64;
-        frame
-            .crop(x0 as i32, y0 as i32, (x1 - x0) as i32, (y1 - y0) as i32)
-            .ok()
     }
 }
 
@@ -649,15 +843,13 @@ impl App {
             auto_clean: true,
             // 默认导出到"程序所在目录\output"（不再放在缓存目录里）
             target: None,
-            full_view_mode: false,
-            full_view_rect: None,
-            full_view_tip_shown: false,
+            canvas_window_mode: false,
+            canvas_rect: None,
             sai_navigator_mode: false,
             preview: None,
-            preview_raw: Frame::new(0, 0, Vec::new()),
             preview_rect: rect(0, 0, 0, 0),
             pick_state: PickState::Empty,
-            preview_cap: None,
+            preview_worker: None,
             sessions: Vec::new(),
             sel: None,
             shared: None,
@@ -669,9 +861,8 @@ impl App {
             relayouting: false,
             preview_err: None,
             preview_size: (0, 0),
+            preview_source_size: (0, 0),
             preview_hidden: false,
-            preview_us: 0,
-            preview_grabs: 0,
         }
     }
 
@@ -689,7 +880,14 @@ impl App {
             0,
             f,
         );
-        c.btn_pick = mk(h, "Button", lang::s(lang::K::FullViewMode), ws, ID_PICK, f);
+        c.btn_pick = mk(
+            h,
+            "Button",
+            lang::s(lang::K::CanvasWindowMode),
+            ws,
+            ID_PICK,
+            f,
+        );
         c.btn_sai_navigator = mk(
             h,
             "Button",
@@ -996,7 +1194,7 @@ impl App {
     fn on_command(&mut self, id: usize, _code: u32) {
         unsafe {
             match id {
-                ID_PICK => self.select_full_view(),
+                ID_PICK => self.select_canvas_window(),
                 ID_SAI_NAVIGATOR => self.select_sai_navigator(),
                 ID_HELP => self.show_help(),
                 ID_BTN_CLEAN => {
@@ -1090,7 +1288,7 @@ impl App {
         );
     }
 
-    unsafe fn select_full_view(&mut self) {
+    unsafe fn select_canvas_window(&mut self) {
         if self.enc.is_some()
             || self.worker.is_some()
             || self.shared.as_ref().is_some_and(|s| s.phase().is_running())
@@ -1102,14 +1300,8 @@ impl App {
             );
             return;
         }
-        if !self.full_view_tip_shown {
-            message(
-                self.hwnd,
-                lang::s(lang::K::FullViewTitle),
-                lang::s(lang::K::FullViewHelp),
-            );
-            self.full_view_tip_shown = true;
-        }
+        self.preview_worker = None;
+        self.preview_hidden = false;
         // 拾取期间：**始终置顶 + 半透明**（按用户要求）。
         // 置顶保证提示始终可见；半透明让我们不完全挡住下面的目标，方便点它的标题栏。
         // GWL_EXSTYLE = -20，WS_EX_LAYERED = 0x00080000，LWA_ALPHA = 0x2
@@ -1161,25 +1353,36 @@ impl App {
 
         let Some(hwnd) = picked else {
             logline!("[pick] 拾取取消（Esc / 主窗口被恢复 / 点在本程序窗口上）");
+            self.restore_preview_worker();
             self.refresh_labels();
             let t = win::wide(lang::s(lang::K::PickCanceled));
             SetWindowTextW(self.ctl.status, t.as_ptr());
             return;
         };
         let info = win::describe(hwnd);
-        if info.process.eq_ignore_ascii_case("sai2.exe")
-            || info.process.eq_ignore_ascii_case("sai.exe")
-        {
-            message(
+        let original_window = is_original_canvas_window(hwnd, info.pid);
+        let proceed = match (canvas_app_kind(&info), original_window) {
+            (CanvasAppKind::Csp, true) => confirm_titled(
                 self.hwnd,
-                lang::s(lang::K::CannotRecord),
-                "SAI2 第二视图捕获不稳定，请使用【使用 SAI2 导航器】。",
-            );
+                lang::s(lang::K::CspCanvasTitle),
+                lang::s(lang::K::CspCanvasHelp),
+            ),
+            (CanvasAppKind::Sai2, true) => confirm_titled(
+                self.hwnd,
+                lang::s(lang::K::Sai2CanvasTitle),
+                lang::s(lang::K::Sai2CanvasHelp),
+            ),
+            _ => true,
+        };
+        if !proceed {
+            logline!("[pick] 用户根据软件提示取消了当前画布窗口选择");
+            self.restore_preview_worker();
+            self.refresh_labels();
             return;
         }
         let (cw, ch) = info.client_size();
         logline!(
-            "[full-view] 目标 0x{:X} | {} | 客户区 {}x{} | root=0x{:X} | 层级：{}",
+            "[canvas-window] 目标 0x{:X} | {} | 客户区 {}x{} | root=0x{:X} | 层级：{}",
             hwnd as isize,
             info.label(),
             cw,
@@ -1187,46 +1390,30 @@ impl App {
             win::root_of(hwnd) as isize,
             win::ancestor_chain(hwnd)
         );
-        let full = match ThumbnailCapture::new_direct(hwnd).and_then(|mut cap| cap.grab()) {
-            Ok(frame) => frame,
-            Err(e) => {
-                logline!("[full-view] 抓帧失败：{e}");
-                let t = win::wide(&lang::f(lang::K::GrabFailed, &[&e]));
-                SetWindowTextW(self.ctl.status, t.as_ptr());
-                return;
-            }
+        let (preview_worker, raw_preview) =
+            match PreviewWorker::new(hwnd, scale::px(PREVIEW_MAX_W), false) {
+                Ok(value) => value,
+                Err(e) => {
+                    logline!("[canvas-window] 抓帧失败：{e}");
+                    self.restore_preview_worker();
+                    let t = win::wide(&lang::f(lang::K::GrabFailed, &[&e]));
+                    SetWindowTextW(self.ctl.status, t.as_ptr());
+                    return;
+                }
+            };
+        let rect = crate::navigator::CanvasRect {
+            x: 0,
+            y: 0,
+            width: cw,
+            height: ch,
         };
-        let rect = match crate::navigator::detect_canvas_rect(&full) {
-            Ok(rect) => rect,
-            Err(e) => {
-                logline!("[full-view] 画布定位失败：{e}");
-                message(
-                    self.hwnd,
-                    lang::s(lang::K::CannotRecord),
-                    &lang::f(lang::K::NavigatorFailed, &[&e]),
-                );
-                return;
-            }
-        };
-        let preview = match crate::navigator::crop_canvas(&full, rect) {
-            Ok(frame) => frame,
-            Err(e) => {
-                message(
-                    self.hwnd,
-                    lang::s(lang::K::CannotRecord),
-                    &lang::f(lang::K::NavigatorFailed, &[&e]),
-                );
-                return;
-            }
-        };
-        self.preview_cap = None;
-        self.preview_cap = ThumbnailCapture::new_scaled_direct(hwnd, scale::px(PREVIEW_MAX_W)).ok();
-        self.preview_size = (preview.width, preview.height);
-        self.preview_raw = full;
-        self.preview = Some(preview);
+        self.preview_worker = Some(preview_worker);
+        self.preview_size = (raw_preview.width, raw_preview.height);
+        self.preview_source_size = self.preview_size;
+        self.preview = Some(raw_preview);
         self.preview_err = None;
-        self.full_view_mode = true;
-        self.full_view_rect = Some(rect);
+        self.canvas_window_mode = true;
+        self.canvas_rect = Some(rect);
         self.sai_navigator_mode = false;
         self.pick_state = PickState::Ok;
         logline!(
@@ -1285,9 +1472,9 @@ impl App {
                 return;
             }
         };
-        let full =
-            match ThumbnailCapture::new_direct(nav.capture.hwnd).and_then(|mut cap| cap.grab()) {
-                Ok(frame) => frame,
+        let (preview_worker, raw_preview) =
+            match PreviewWorker::new(nav.capture.hwnd, scale::px(PREVIEW_MAX_W), true) {
+                Ok(value) => value,
                 Err(e) => {
                     message(
                         self.hwnd,
@@ -1297,7 +1484,7 @@ impl App {
                     return;
                 }
             };
-        let rect = match crate::navigator::detect_canvas_rect(&full) {
+        let rect = match crate::navigator::detect_canvas_rect(&raw_preview) {
             Ok(rect) => rect,
             Err(e) => {
                 message(
@@ -1308,7 +1495,7 @@ impl App {
                 return;
             }
         };
-        let preview = match crate::navigator::crop_canvas(&full, rect) {
+        let preview = match crate::navigator::crop_canvas(&raw_preview, rect) {
             Ok(frame) => frame,
             Err(e) => {
                 message(
@@ -1319,16 +1506,14 @@ impl App {
                 return;
             }
         };
-        self.preview_cap = None;
-        self.preview_cap =
-            ThumbnailCapture::new_scaled_direct(nav.capture.hwnd, scale::px(PREVIEW_MAX_W)).ok();
+        self.preview_worker = Some(preview_worker);
         self.preview_size = (preview.width, preview.height);
-        self.preview_raw = full;
+        self.preview_source_size = (raw_preview.width, raw_preview.height);
         self.preview = Some(preview);
         self.preview_err = None;
         self.target = Some(nav.capture.clone());
-        self.full_view_mode = true;
-        self.full_view_rect = Some(rect);
+        self.canvas_window_mode = true;
+        self.canvas_rect = Some(rect);
         self.sai_navigator_mode = true;
         self.pick_state = PickState::Ok;
         logline!(
@@ -1376,7 +1561,7 @@ impl App {
             );
             return;
         };
-        if !self.full_view_mode && !crate::capture::composition_enabled() {
+        if !self.canvas_window_mode && !crate::capture::composition_enabled() {
             message(
                 self.hwnd,
                 lang::s(lang::K::CannotRecord),
@@ -1384,7 +1569,7 @@ impl App {
             );
             return;
         }
-        self.preview_cap = None; // 录制期间由录制线程独占抓帧
+        self.preview_worker = None; // 录制期间由录制线程独占抓帧
         logline!(
             "[record] 开始录制 target=0x{:X} | {} | fps={}（{}） | 灵敏度={}档 | threshold={:.3}",
             target.hwnd as isize,
@@ -1407,7 +1592,7 @@ impl App {
             fill_rgb: [0, 0, 0],
             // GUI 流程启用"其他软件在前台就暂停"（用户点完录制会点进画布）
             fg_pause: true,
-            full_view: self.full_view_mode && !self.sai_navigator_mode,
+            canvas_window: self.canvas_window_mode && !self.sai_navigator_mode,
             navigator: self.sai_navigator_mode,
         };
         // 消耗掉录制开始前可能按住的 Esc，避免刚点开始就被误判为停止。
@@ -1430,13 +1615,7 @@ impl App {
                 }
             }
             self.shared = None;
-            if let Some(t) = &self.target {
-                self.preview_cap = if self.full_view_mode {
-                    ThumbnailCapture::new_scaled_direct(t.hwnd, scale::px(PREVIEW_MAX_W)).ok()
-                } else {
-                    ThumbnailCapture::new_scaled(t.hwnd, scale::px(PREVIEW_MAX_W)).ok()
-                };
-            }
+            self.restore_preview_worker();
             self.ui_set_idle();
             message(
                 self.hwnd,
@@ -1482,13 +1661,7 @@ impl App {
         ShowWindow(self.hwnd, SW_RESTORE);
         SetForegroundWindow(self.hwnd);
         // 恢复实时预览（录制期间抓帧归录制线程独占）
-        if let Some(t) = &self.target {
-            self.preview_cap = if self.full_view_mode {
-                ThumbnailCapture::new_scaled_direct(t.hwnd, scale::px(PREVIEW_MAX_W)).ok()
-            } else {
-                ThumbnailCapture::new_scaled(t.hwnd, scale::px(PREVIEW_MAX_W)).ok()
-            };
-        }
+        self.restore_preview_worker();
 
         let failed = shared.as_ref().and_then(|s| s.error());
         let frames = shared.as_ref().map(|s| s.frames()).unwrap_or(0);
@@ -1856,70 +2029,42 @@ impl App {
             .as_ref()
             .map(|s| s.phase().is_running())
             .unwrap_or(false);
-        if !recording && self.enc.is_none() && self.preview_cap.is_some() {
-            // 主窗口最小化 / 不可见时没人看预览：让 DWM 停掉缩略图合成并跳过抓帧。
-            // 这是"后台占用"的大头 —— 缩略图是持续合成的，不看却一直在算。
+        if !recording && self.enc.is_none() && self.preview_worker.is_some() {
+            // 主窗口不可见时跳过抓帧，并让 DWM 停止为预览宿主继续合成。
             let hidden = unsafe {
                 windows_sys::Win32::UI::WindowsAndMessaging::IsIconic(self.hwnd) != 0
                     || windows_sys::Win32::UI::WindowsAndMessaging::IsWindowVisible(self.hwnd) == 0
             };
             if hidden {
                 if !self.preview_hidden {
-                    if let Some(cap) = &self.preview_cap {
-                        let _ = cap.set_visible(false);
+                    if let Some(worker) = &self.preview_worker {
+                        worker.set_visible(false);
                     }
                     self.preview_hidden = true;
-                    logline!("[preview] 主窗口不可见：暂停预览抓帧并关闭 DWM 合成");
+                    logline!("[preview] 主窗口不可见：暂停预览抓帧");
                 }
             } else {
                 if self.preview_hidden {
-                    if let Some(cap) = &self.preview_cap {
-                        let _ = cap.set_visible(true);
+                    if let Some(worker) = &self.preview_worker {
+                        worker.set_visible(true);
                     }
                     self.preview_hidden = false;
-                    self.preview_size = (0, 0); // 重新抓一帧，尺寸变化日志不作数
                     logline!("[preview] 主窗口重新可见：恢复预览抓帧");
                 }
-                // 先抓完再把结果搬出来，避免抓帧器借用挡住后面的字段修改。
-                // 复用上一帧的 Frame，避免每 200/500ms 重分配预览缓冲。
-                let full_view = self.full_view_mode;
-                let mut refresh_crop = false;
-                if let Some(cap) = self.preview_cap.as_mut() {
-                    match cap.sync_source_size() {
-                        Ok(changed) => refresh_crop = changed,
-                        Err(e) => logline!("[preview] 同步源窗口尺寸失败：{e}"),
-                    }
+                if let Some(worker) = &self.preview_worker {
+                    worker.request_frame();
                 }
-                let mut frame = if full_view {
-                    std::mem::replace(&mut self.preview_raw, Frame::new(0, 0, Vec::new()))
-                } else {
-                    self.preview.take().unwrap_or(Frame {
-                        width: 0,
-                        height: 0,
-                        bgra: Vec::new(),
-                    })
-                };
-                let t_grab = std::time::Instant::now();
-                let grabbed = self.preview_cap.as_mut().map(|c| c.grab_into(&mut frame));
-                self.preview_us += t_grab.elapsed().as_micros() as u64;
-                self.preview_grabs += 1;
-                if self.preview_grabs >= 20 {
-                    let avg = self.preview_us as f64 / self.preview_grabs as f64 / 1000.0;
-                    logline!(
-                        "[perf] 预览抓帧 {} 次，平均 {avg:.2} ms/帧",
-                        self.preview_grabs
-                    );
-                    self.preview_us = 0;
-                    self.preview_grabs = 0;
-                }
-                if let Some(res) = grabbed {
-                    match res {
-                        Ok(()) => {
-                            if full_view && refresh_crop {
-                                if let Ok(rect) = crate::navigator::detect_canvas_rect(&frame) {
-                                    self.full_view_rect = Some(rect);
+                if let Some(result) = self.preview_worker.as_ref().and_then(|w| w.try_take()) {
+                    match result {
+                        Ok(raw) => {
+                            let source_size = (raw.width, raw.height);
+                            let source_changed = source_size != self.preview_source_size;
+                            self.preview_source_size = source_size;
+                            if self.sai_navigator_mode && source_changed {
+                                if let Ok(rect) = crate::navigator::detect_canvas_rect(&raw) {
+                                    self.canvas_rect = Some(rect);
                                     logline!(
-                                        "[preview] 完整画布区域更新为 ({},{},{},{})",
+                                        "[preview] 导航画布区域更新为 ({},{},{},{})",
                                         rect.x,
                                         rect.y,
                                         rect.width,
@@ -1927,43 +2072,36 @@ impl App {
                                     );
                                 }
                             }
-                            let cropped = self.crop_navigator_preview(&frame);
-                            let frame = if full_view {
-                                if let Some(cropped) = cropped {
-                                    self.preview_raw = frame;
-                                    cropped
-                                } else {
-                                    self.preview_raw = frame.clone();
-                                    frame
+                            if self.canvas_window_mode && !self.sai_navigator_mode {
+                                if let Some(target) = &self.target {
+                                    let (width, height) = target.client_size();
+                                    self.canvas_rect = Some(crate::navigator::CanvasRect {
+                                        x: 0,
+                                        y: 0,
+                                        width,
+                                        height,
+                                    });
                                 }
-                            } else {
-                                frame
-                            };
-                            let sz = (frame.width, frame.height);
-                            if self.preview_size != (0, 0) && sz != self.preview_size {
+                            }
+                            let frame = self.crop_navigator_preview(&raw).unwrap_or(raw);
+                            let size = (frame.width, frame.height);
+                            if self.preview_size != (0, 0) && size != self.preview_size {
                                 logline!(
                                     "[preview] 输出尺寸变化 {}x{} -> {}x{}",
                                     self.preview_size.0,
                                     self.preview_size.1,
-                                    sz.0,
-                                    sz.1
+                                    size.0,
+                                    size.1
                                 );
                             }
                             if self.preview_err.take().is_some() {
                                 logline!("[preview] 抓帧恢复正常");
                             }
-                            self.preview_size = sz;
+                            self.preview_size = size;
                             self.preview = Some(frame);
                             InvalidateRect(self.hwnd, &self.preview_rect, 0);
                         }
                         Err(e) => {
-                            if full_view {
-                                self.preview_raw = frame;
-                            } else {
-                                self.preview = Some(frame);
-                            }
-                            // 目标被关掉/最小化时这个错误每 500ms 重复一次：
-                            // 只在"错误内容变了"或"距上次记录 ≥10 秒"时写
                             let now = std::time::Instant::now();
                             let due = match &self.preview_err {
                                 None => true,
@@ -2217,7 +2355,11 @@ unsafe fn message(owner: HWND, title: &str, text: &str) {
 }
 
 unsafe fn confirm(owner: HWND, text: &str) -> bool {
-    let t = win::wide(lang::s(lang::K::ConfirmTitle));
+    confirm_titled(owner, lang::s(lang::K::ConfirmTitle), text)
+}
+
+unsafe fn confirm_titled(owner: HWND, title: &str, text: &str) -> bool {
+    let t = win::wide(title);
     let b = win::wide(text);
     // MB_YESNO | MB_ICONQUESTION
     windows_sys::Win32::UI::WindowsAndMessaging::MessageBoxW(
@@ -2424,11 +2566,7 @@ pub fn run(initial_target: Option<isize>) -> i32 {
             if let Some(app) = app_mut(hwnd) {
                 app.target = Some(win::describe(h as HWND));
                 app.pick_state = PickState::Ok;
-                app.preview_cap =
-                    ThumbnailCapture::new_scaled(h as HWND, scale::px(PREVIEW_MAX_W)).ok();
-                if let Some(cap) = &mut app.preview_cap {
-                    app.preview = cap.grab().ok();
-                }
+                app.restore_preview_worker();
                 logline!(
                     "[start] 命令行指定目标 0x{:X} | {:?} | 预览={}x{}",
                     h,
@@ -2814,7 +2952,9 @@ pub unsafe fn finish_enc_dialog(text: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{SENS_DEFAULT, SENS_LEVELS};
+    use super::{
+        canvas_app_kind, largest_window_for_pid, CanvasAppKind, SENS_DEFAULT, SENS_LEVELS,
+    };
 
     #[test]
     fn 灵敏度档位按0点002递增() {
@@ -2823,5 +2963,61 @@ mod tests {
             [0.016, 0.014, 0.012, 0.010, 0.008, 0.006, 0.002, 0.001]
         );
         assert_eq!(SENS_DEFAULT, 5);
+    }
+
+    #[test]
+    fn 画布窗口软件检测() {
+        let info = |process: &str| crate::win::WindowInfo {
+            hwnd: std::ptr::null_mut(),
+            title: "Canvas".into(),
+            class_name: "Test".into(),
+            pid: 1,
+            process: process.into(),
+            rect: unsafe { std::mem::zeroed() },
+            client: unsafe { std::mem::zeroed() },
+            minimized: false,
+        };
+        assert_eq!(
+            canvas_app_kind(&info("clipstudiopaint504.exe")),
+            CanvasAppKind::Csp
+        );
+        assert_eq!(canvas_app_kind(&info("SAI2.EXE")), CanvasAppKind::Sai2);
+        assert_eq!(
+            canvas_app_kind(&info("Photoshop.exe")),
+            CanvasAppKind::Other
+        );
+    }
+
+    #[test]
+    fn 同一进程主窗口按客户区面积选择() {
+        let window = |hwnd: isize, pid: u32, width: i32, height: i32| crate::win::WindowInfo {
+            hwnd: hwnd as _,
+            title: format!("window-{hwnd}"),
+            class_name: "Test".into(),
+            pid,
+            process: "test.exe".into(),
+            rect: windows_sys::Win32::Foundation::RECT {
+                left: 0,
+                top: 0,
+                right: width,
+                bottom: height,
+            },
+            client: windows_sys::Win32::Foundation::RECT {
+                left: 0,
+                top: 0,
+                right: width,
+                bottom: height,
+            },
+            minimized: false,
+        };
+        let windows = vec![
+            window(1, 10, 800, 600),
+            window(2, 10, 1600, 900),
+            window(3, 20, 4000, 2000),
+        ];
+        assert_eq!(
+            largest_window_for_pid(windows, 10).map(|window| window.hwnd),
+            Some(2 as _)
+        );
     }
 }

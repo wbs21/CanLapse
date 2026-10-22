@@ -281,6 +281,16 @@ impl ThumbnailCapture {
         Self::new_inner(target, i32::MAX, false)
     }
 
+    /// 普通画布窗口：优先 DWM 缩略图，DWM 不可用时退回直接抓取。
+    pub fn new_preferred(target: HWND) -> Result<Self, String> {
+        match Self::new(target) {
+            Ok(capture) => Ok(capture),
+            Err(dwm_error) => Self::new_direct(target).map_err(|direct_error| {
+                format!("DWM 抓帧不可用（{dwm_error}）；直接抓取也失败：{direct_error}")
+            }),
+        }
+    }
+
     /// 始终直接抓取源窗口；用于 SAI2 导航器等需要持续刷新的源。
     pub fn new_direct(target: HWND) -> Result<Self, String> {
         Self::new_inner(target, i32::MAX, true)
@@ -293,6 +303,16 @@ impl ThumbnailCapture {
     /// 录制必须用 [`Self::new`]（1:1，像素级差分不能用缩放图）。
     pub fn new_scaled(target: HWND, max_w: i32) -> Result<Self, String> {
         Self::new_inner(target, max_w, false)
+    }
+
+    /// 普通画布窗口的缩放预览：优先 DWM，失败时退回直接抓取后缩放。
+    pub fn new_scaled_preferred(target: HWND, max_w: i32) -> Result<Self, String> {
+        match Self::new_scaled(target, max_w) {
+            Ok(capture) => Ok(capture),
+            Err(dwm_error) => Self::new_scaled_direct(target, max_w).map_err(|direct_error| {
+                format!("DWM 预览不可用（{dwm_error}）；直接预览也失败：{direct_error}")
+            }),
+        }
     }
 
     /// 始终直接抓取源窗口，并把结果缩放到预览宽度以内。
@@ -554,14 +574,27 @@ impl ThumbnailCapture {
             return Err("目标窗口已关闭".into());
         }
         if self.should_capture_direct() {
-            return self.grab_direct_into(frame);
+            return match self.grab_direct_into(frame) {
+                Ok(()) => Ok(()),
+                Err(direct_error) if !self.direct_source && !self.host.is_null() => {
+                    self.grab_host_into(frame).map_err(|host_error| {
+                        format!("直接抓取失败（{direct_error}）；DWM 回退也失败（{host_error}）")
+                    })
+                }
+                Err(e) => Err(e),
+            };
         }
+        self.grab_host_into(frame)
+    }
+
+    fn grab_host_into(&mut self, frame: &mut Frame) -> Result<(), String> {
         // 让宿主窗口处理掉待处理消息，保持它"活着"
         win::pump();
 
         let ok = unsafe { PrintWindow(self.host, self.dib.dc, PW_RENDERFULLCONTENT_FLAG) };
         if ok == 0 {
-            return Err("PrintWindow(宿主, PW_RENDERFULLCONTENT) 返回失败".into());
+            self.switch_to_direct();
+            return self.grab_into(frame);
         }
         let (w, h) = self.out;
         let pixels = self.dib.pixels();
@@ -587,12 +620,30 @@ impl ThumbnailCapture {
             return Err("目标窗口已关闭".into());
         }
         if self.should_capture_direct() {
-            return self.grab_direct_if_changed(prev, threshold, frame);
+            return match self.grab_direct_if_changed(prev, threshold, frame) {
+                Ok(changed) => Ok(changed),
+                Err(direct_error) if !self.direct_source && !self.host.is_null() => self
+                    .grab_host_if_changed(prev, threshold, frame)
+                    .map_err(|host_error| {
+                        format!("直接抓取失败（{direct_error}）；DWM 回退也失败（{host_error}）")
+                    }),
+                Err(e) => Err(e),
+            };
         }
+        self.grab_host_if_changed(prev, threshold, frame)
+    }
+
+    fn grab_host_if_changed(
+        &mut self,
+        prev: &Frame,
+        threshold: f32,
+        frame: &mut Frame,
+    ) -> Result<bool, String> {
         win::pump();
         let ok = unsafe { PrintWindow(self.host, self.dib.dc, PW_RENDERFULLCONTENT_FLAG) };
         if ok == 0 {
-            return Err("PrintWindow(宿主, PW_RENDERFULLCONTENT) 返回失败".into());
+            self.switch_to_direct();
+            return self.grab_if_changed(prev, threshold, frame);
         }
         let (w, h) = self.out;
         let pixels = self.dib.pixels();
@@ -611,7 +662,7 @@ impl ThumbnailCapture {
         if self.direct_source {
             PREFERRED_DIRECT_LOGGED.call_once(|| {
                 logline!(
-                    "[capture] 完整画布模式始终直接抓取源窗口 target=0x{:X}",
+                    "[capture] 强制直接抓取模式使用源窗口 target=0x{:X}",
                     self.target as isize
                 );
             });
@@ -628,6 +679,28 @@ impl ThumbnailCapture {
             return true;
         }
         false
+    }
+
+    fn switch_to_direct(&mut self) {
+        if self.direct_source {
+            return;
+        }
+        unsafe {
+            if self.thumb != 0 {
+                DwmUnregisterThumbnail(self.thumb);
+                self.thumb = 0;
+            }
+            if !self.host.is_null() {
+                DestroyWindow(self.host);
+                self.host = null_mut();
+            }
+        }
+        self.direct_source = true;
+        self.direct_dib = None;
+        logline!(
+            "[capture] DWM 宿主抓帧失败，切换为直接抓取源窗口 target=0x{:X}",
+            self.target as isize
+        );
     }
 
     fn grab_direct_into(&mut self, frame: &mut Frame) -> Result<(), String> {

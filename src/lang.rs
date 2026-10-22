@@ -63,7 +63,7 @@ keys! {
     // ---- 主窗口 ----
     Subtitle        => ("Canvas Timelapse Recorder", "画布缩时录屏"),
     SaiNavigatorMode => ("🧭 Use SAI2 Navigator", "🧭 使用 SAI2 导航器"),
-    FullViewMode    => ("🎯 Select CSP Full Canvas View", "🎯 选择 CSP 完整画布视图"),
+    CanvasWindowMode => ("🎯 Select Canvas Window", "🎯 选择画布窗口"),
     HowToLocate     => ("❓ How to Locate", "❓ 如何定位窗口"),
     FrameDensity    => ("Frame density", "帧密度"),
     Sensitivity     => ("Change sensitivity", "画面检测灵敏度"),
@@ -89,7 +89,7 @@ keys! {
     StatusEmpty     => ("No canvas selected yet", "尚未选择画布窗口"),
     StatusOkPlain   => ("✅ Canvas selected ({})", "✅ 已选中画布窗口（{}）"),
     StatusNavigator => ("✅ Navigator ready (canvas {})", "✅ 导航器模式已就绪（画布 {}）"),
-    StatusFullView  => ("✅ Full-canvas view ready ({})", "✅ 完整画布视图已就绪（{}）"),
+    StatusCanvasWindow => ("✅ Canvas window ready ({})", "✅ 画布窗口已就绪（{}）"),
     GrabFailed      => ("Cannot capture this window: {}. Please pick again.", "无法抓取该窗口：{}　请重新拾取"),
     PickCanceled    => ("Picking canceled, please try again", "已取消拾取，请重新拾取"),
     PickInstr       => ("Click the canvas border; Esc to cancel", "请点击画布边框；Esc 取消"),
@@ -105,16 +105,24 @@ keys! {
          4. 将导航器窗口拖动到边角等不影响画布的位置，然后重新点击【使用 SAI2 导航器】。",
     ),
     NavigatorFailed => ("Cannot use navigator: {}", "无法使用导航器：{}"),
-    FullViewTitle   => ("Record a full-canvas second view", "录制完整画布第二视图"),
-    FullViewHelp    => (
-        "For a stable CSP full-canvas recording:\n\n\
-         View → New View, or drag the canvas tab out\n\n\
-         Keep the second view showing the complete canvas at a fixed angle, then click its canvas area.\n\
-         Draw in the original view. CanLapse will remove the title bar and window borders automatically.",
-        "要稳定录制 CSP 完整画布：\n\n\
-         使用【视图 → 新建视图】，或把画布标签拖出来\n\n\
-         让第二视图保持完整画布和固定角度，然后点击它的画布区域。\n\
-         在原视图中正常绘画，CanLapse 会自动去掉标题栏和窗口边框。",
+    CspCanvasTitle  => ("CLIP STUDIO PAINT canvas detected", "检测到 CSP 画布窗口"),
+    CspCanvasHelp   => (
+        "For complete-canvas capture, click Window → Canvas → New Window, then drag the new canvas tab out to create a floating second view.\n\n\
+         Click View → Fit Window Size so the complete canvas fits in that window. Draw in the original window and select the second window for capture.\n\n\
+         This keeps the complete canvas in frame and excludes canvas pan, zoom, and rotation.\n\n\
+         If the current selection is already the fitted second view, you can continue. Otherwise choose No and select the second view.",
+        "建议点击“窗口”-“画布”-“新建窗口”，并在标签页中拖拽，让第二画布视图浮动出来；再点击“视图”-“匹配窗口大小”，让完整画布呈现在第二窗口中。\n\n\
+         在原窗口作画，选择第二窗口采集。这样可以保证全画布采集，并排除画布移动、缩放和旋转等操作。\n\n\
+         如果当前选择已经是匹配窗口大小的第二画布视图，可以直接继续；否则请选择“否”，然后重新选择第二窗口。",
+    ),
+    Sai2CanvasTitle => ("SAI2 canvas detected", "检测到 SAI2 画布窗口"),
+    Sai2CanvasHelp  => (
+        "The selected original canvas will include canvas pan, zoom, and rotation.\n\n\
+         For fixed complete-canvas capture, choose No and use “Use SAI2 Navigator” instead.\n\n\
+         Continue with the selected original canvas window?",
+        "当前采集的是原始画布窗口，画布的移动、缩放和旋转会一并录制。\n\n\
+         SAI2 如果要采集固定方向的完整画布，请选择“否”，然后点击【使用 SAI2 导航器】。\n\n\
+         是否继续使用当前原始画布窗口？",
     ),
 
     ConfirmTitle    => ("Please confirm", "请确认"),
@@ -122,7 +130,7 @@ keys! {
     CanvasFallback  => ("canvas", "画布"),
 
     // 预览占位
-    PreviewEmpty    => ("Preview\nshown after picking", "预览区域\n拾取窗口后显示"),
+    PreviewEmpty    => ("Preview\nshown after selecting a canvas window", "预览区域\n选择画布窗口后显示"),
 
     // 帧密度选项
     Fps1of5         => ("1 frame / 5 s", "1 帧 / 5 秒"),
@@ -140,7 +148,7 @@ keys! {
     PanelWarnTitle  => ("Check the canvas window", "检查画布窗口"),
     ExportInProgress => ("An export is still in progress. Please wait.", "视频合成仍在进行中，请稍候。"),
 
-    PickFirst       => ("Pick a canvas window first (🎯 Pick Window).", "请先点【🎯 拾取窗口】选择要录制的画布窗口。"),
+    PickFirst       => ("Select a canvas window first (🎯 Select Canvas Window).", "请先点【🎯 选择画布窗口】选择要录制的画布窗口。"),
     NoDwm           => ("Desktop composition (DWM) is off — thumbnail capture is unavailable.", "桌面合成（DWM）未开启，缩略图抓帧不可用。"),
     NoFrames        => ("No frames were saved this time (the picture may never have changed).", "这次没有保存到任何帧（画面可能始终没有变化）。"),
     SelectFirst     => ("Select a session in the list first.", "请先在列表里选择一个会话。"),
@@ -152,24 +160,20 @@ keys! {
     // 帮助正文
     HelpTitle       => ("How to locate the canvas window", "如何定位画布窗口"),
     HelpBody        => (
-        "To record only the canvas, detach it into its own floating window, then use Pick Window.\n\n\
-         SAI2: View → New Floating View\n\
-         Photoshop: drag the document tab out of the main frame\n\
-         CSP / PAINT: drag the canvas tab out, or View → New View\n\
-         Krita: Window → New Window\n\n\
-         Tip: after picking, check the preview. If it shows toolbars or layer panels, the canvas is not floating.\n\n\
-         SAI2: use the SAI2 navigator button. CSP: create a second full-canvas view and select it.\n\
-         The title bar and window borders are removed automatically, and no canvas calibration is needed.\n\n\
+        "Select the original canvas window for SAI2, Photoshop, Krita, and most other apps.\n\
+         Canvas pan, zoom, and rotation are recorded as they happen.\n\n\
+         CSP recommendation: Window → Canvas → New Window, drag the new canvas tab out,\n\
+         then View → Fit Window Size and select that floating second view.\n\n\
+         SAI2 fixed full canvas: use the SAI2 navigator button.\n\
+         Tip: after selecting, check the preview. It should show the intended canvas rather than toolbars or panel chrome.\n\n\
          About overlap: the drawing app's own floating panels (e.g. SAI2 Color) are recorded as-is — that is expected, no cropping, no warning.\n\
          When another app comes to the foreground, recording pauses automatically and resumes when you go back.",
-        "想要只录制画布，需要把画布拆成独立浮动窗口，再使用【拾取窗口】选中画布。\n\n\
-         SAI2：视图 → 新建浮动视图\n\
-         Photoshop：拖拽画布标签向外拉出，脱离主框架\n\
-         CSP / 优动漫 PAINT：拖拽画布标签分离，或 视图 → 新建视图\n\
-         Krita：窗口 → 新建窗口\n\n\
-         💡提示：拾取后看左上角的预览缩略图，如果画面包含工具栏 / 图层面板，说明画布没有浮动。\n\n\
-         SAI2：使用【使用 SAI2 导航器】。CSP：新建完整画布第二视图后选择它。\n\
-         程序会自动裁掉标题栏和窗口边框，不需要画布校准。\n\n\
+        "SAI2、Photoshop、Krita 和多数其他软件请使用【选择画布窗口】选择原始画布窗口。\n\
+         画布的移动、缩放和旋转会按实际操作一并录制。\n\n\
+         CSP 推荐：窗口 → 画布 → 新建窗口，将新画布标签页拖出，\n\
+         再使用 视图 → 匹配窗口大小，然后选择这个浮动的第二画布视图。\n\n\
+         SAI2 如需固定采集完整画布，请使用【使用 SAI2 导航器】。\n\
+         💡提示：选择后查看左上角预览，应显示目标画布，而不是工具栏或面板外框。\n\n\
          ℹ️ 关于遮挡：绘画软件自己的浮动面板（SAI2 的「颜色」等）若压在画布上，\n\
          会照原样录进画面 —— 这是正常的，不做裁切、也不提示。\n\
          而当你切到其他软件时，说明此刻没有在画画，录制会自动暂停，切回画布即继续。",
@@ -259,7 +263,7 @@ mod tests {
     #[test]
     fn 中英文案都不为空() {
         for k in [
-            K::FullViewMode,
+            K::CanvasWindowMode,
             K::StartRecording,
             K::CleanCache,
             K::OpenVideoFolder,

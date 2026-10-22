@@ -219,15 +219,21 @@ impl Session {
                 continue;
             }
             let (name, created, meta_frames, completed) = read_markers_meta(&dir);
-            let frames = meta_frames
-                .filter(|n| *n > 0)
-                .unwrap_or_else(|| count_frames(&dir));
+            let has_stream = dir.join(STREAM_FILE).is_file();
+            let frames = meta_frames.filter(|n| *n > 0).unwrap_or_else(|| {
+                let legacy = count_frames(&dir);
+                if legacy > 0 || !has_stream {
+                    legacy
+                } else {
+                    let packets = dir.join(STREAM_FILE).with_extension("packets");
+                    crate::encode::count_stream_frames(&packets).unwrap_or(0)
+                }
+            });
             let name = name.unwrap_or_else(|| {
                 dir.file_name()
                     .map(|s| s.to_string_lossy().to_string())
                     .unwrap_or_default()
             });
-            let has_stream = dir.join(STREAM_FILE).is_file();
             out.push(SessionSummary {
                 dir,
                 name,

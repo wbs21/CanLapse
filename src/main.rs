@@ -32,7 +32,7 @@ struct RecordArgs {
     /// 关闭"其他软件在前台就暂停抓帧"（录后台窗口时必需）
     no_fg_pause: bool,
     /// 从用户指定的第二视图采集完整画布。
-    full_view: bool,
+    canvas_window: bool,
     /// 旧兼容入口：自动查找 SAI2/CSP 导航器。
     navigator: bool,
 }
@@ -50,7 +50,7 @@ impl Default for RecordArgs {
             duration: None,
             quiet: false,
             no_fg_pause: false,
-            full_view: false,
+            canvas_window: false,
             navigator: false,
         }
     }
@@ -110,7 +110,7 @@ fn parse_record_args(args: &[String]) -> Result<RecordArgs, String> {
             }
             "--quiet" => a.quiet = true,
             "--no-fg-pause" => a.no_fg_pause = true,
-            "--full-view" | "--full" => a.full_view = true,
+            "--full-view" | "--full" => a.canvas_window = true,
             "--navigator" | "--nav" => a.navigator = true,
             other => return Err(format!("record 不支持参数 {other}")),
         }
@@ -151,8 +151,9 @@ fn help() {
                        但命令行录**后台窗口**时必须关掉，否则会一直暂停、一帧都不出。
   --navigator          从 SAI2/CSP 分离导航器录制完整画布。
                        自动查找导航器、裁掉标题/边距；目标可省略。
-  --full-view          从用户选择的 CSP 第二视图录制完整画布（推荐）。
-                       自动裁剪窗口边框/标题并持续直接抓取源窗口。
+  --full-view          采集用户选择的画布窗口。
+                       CSP 推荐使用匹配窗口大小的第二画布视图；
+                       SAI2 如需固定完整画布，请改用 --navigator。
 
 导出选项（canlapse encode）:
   --session DIR        会话缓存目录（必填）
@@ -290,11 +291,11 @@ fn unique_timelapse_output() -> PathBuf {
 }
 
 fn cmd_record(a: RecordArgs) -> i32 {
-    if a.full_view && a.navigator {
+    if a.canvas_window && a.navigator {
         eprintln!("--full-view 和 --navigator 不能同时使用");
         return 2;
     }
-    if !a.full_view && !a.navigator && !capture::composition_enabled() {
+    if !a.canvas_window && !a.navigator && !capture::composition_enabled() {
         eprintln!("桌面合成（DWM）未开启，无法使用缩略图抓帧。");
         return 2;
     }
@@ -311,13 +312,6 @@ fn cmd_record(a: RecordArgs) -> i32 {
         Some(i) => i,
         None => return 1,
     };
-    if a.full_view
-        && (info.process.eq_ignore_ascii_case("sai2.exe")
-            || info.process.eq_ignore_ascii_case("sai.exe"))
-    {
-        eprintln!("SAI2 第二视图不稳定，请改用 --navigator 导航器模式");
-        return 2;
-    }
     println!("目标: {}", info.label());
     if a.navigator {
         match navigator::probe(info.hwnd) {
@@ -356,8 +350,8 @@ fn cmd_record(a: RecordArgs) -> i32 {
             None => String::new(),
         }
     );
-    if a.full_view {
-        println!("模式: 完整画布视图（第二视图，推荐）");
+    if a.canvas_window {
+        println!("模式: 画布窗口（CSP 推荐使用匹配窗口大小的第二视图）");
     } else if a.navigator {
         println!("模式: 导航器兼容模式");
     }
@@ -366,10 +360,11 @@ fn cmd_record(a: RecordArgs) -> i32 {
             "提示: 导航器模式会录制固定方向的全画布，并自动裁掉导航器标题和边距；\n\
              录制中请保持导航器尺寸不变。"
         );
-    } else if a.full_view {
+    } else if a.canvas_window {
         println!(
-            "提示: 请确保第二视图保持完整画布和固定方向；程序会自动裁掉标题栏和窗口边框，\n\
-             并在窗口缩放时保持固定视频画面。"
+            "提示: CSP 建议在第二画布视图中选择“视图 → 匹配窗口大小”；\n\
+             SAI2 如需固定采集完整画布，请使用 --navigator。\n\
+             Photoshop、Krita 等其他软件请选择原始画布窗口，画布的移动、缩放和旋转会一并录制。"
         );
     } else {
         println!(
@@ -388,7 +383,7 @@ fn cmd_record(a: RecordArgs) -> i32 {
         threshold: a.threshold,
         fill_rgb: [0, 0, 0],
         fg_pause: !a.no_fg_pause,
-        full_view: a.full_view,
+        canvas_window: a.canvas_window,
         navigator: a.navigator,
     };
     let shared = recorder::Shared::new();

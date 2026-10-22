@@ -75,7 +75,7 @@ pub struct RecorderConfig {
     /// 规则会让录制一直暂停、一帧都不出 —— 所以这类场景要能关掉。
     pub fg_pause: bool,
     /// 从用户选择的第二视图采集完整画布。
-    pub full_view: bool,
+    pub canvas_window: bool,
     /// 旧兼容入口：自动查找 SAI2/CSP 导航器。
     pub navigator: bool,
 }
@@ -460,6 +460,16 @@ struct StreamWriter {
     handle: Option<JoinHandle<()>>,
     shared: Arc<Shared>,
     pool: Arc<Mutex<Vec<Frame>>>,
+    pool_limit: usize,
+}
+
+fn stream_queue_depth(width: i32, height: i32) -> usize {
+    let pixels = (width.max(0) as u64).saturating_mul(height.max(0) as u64);
+    if pixels >= 8_000_000 {
+        2
+    } else {
+        4
+    }
 }
 
 impl StreamWriter {
@@ -482,7 +492,8 @@ impl StreamWriter {
         let (enc_w, enc_h) = encoder.dimensions();
         session.update_geometry(enc_w, enc_h);
 
-        let (tx, rx) = sync_channel::<WriterCmd>(4);
+        let queue_depth = stream_queue_depth(enc_w, enc_h);
+        let (tx, rx) = sync_channel::<WriterCmd>(queue_depth);
         let shared_for_thread = shared.clone();
         let pool = Arc::new(Mutex::new(Vec::<Frame>::new()));
         let pool_for_thread = pool.clone();
@@ -516,7 +527,7 @@ impl StreamWriter {
                             shared_for_thread.dropped.fetch_add(1, Ordering::SeqCst);
                         }
                         if let Ok(mut pool) = pool_for_thread.lock() {
-                            if pool.len() < 4 {
+                            if pool.len() < queue_depth {
                                 pool.push(frame);
                             }
                         }
@@ -552,6 +563,7 @@ impl StreamWriter {
             handle: Some(handle),
             shared,
             pool,
+            pool_limit: queue_depth,
         })
     }
 
@@ -579,7 +591,7 @@ impl StreamWriter {
             Ok(()) => true,
             Err(TrySendError::Full(WriterCmd::Frame(job))) => {
                 if let Ok(mut pool) = self.pool.lock() {
-                    if pool.len() < 4 {
+                    if pool.len() < self.pool_limit {
                         pool.push(job);
                     }
                 }
@@ -588,7 +600,7 @@ impl StreamWriter {
             }
             Err(TrySendError::Disconnected(WriterCmd::Frame(job))) => {
                 if let Ok(mut pool) = self.pool.lock() {
-                    if pool.len() < 4 {
+                    if pool.len() < self.pool_limit {
                         pool.push(job);
                     }
                 }
@@ -633,7 +645,21 @@ impl StreamWriter {
 impl MarkerSink for StreamWriter {
     fn marker(&self, elapsed_ms: u64) {
         if let Some(tx) = &self.tx {
-            let _ = tx.send(WriterCmd::Marker { elapsed_ms });
+            match tx.try_send(WriterCmd::Marker { elapsed_ms }) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => {
+                    self.shared.dropped.fetch_add(1, Ordering::SeqCst);
+                    logline!("[record] 编码队列已满，标记 {elapsed_ms}ms 被丢弃");
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    if let Ok(mut slot) = self.shared.error.lock() {
+                        if slot.is_none() {
+                            *slot = Some("流式编码线程已退出".into());
+                        }
+                    }
+                    self.shared.request_stop();
+                }
+            }
         }
     }
 }
@@ -697,10 +723,10 @@ fn run(cfg: &RecorderConfig, shared: &Arc<Shared>) -> Result<(), String> {
     if cfg.navigator {
         return run_navigator(cfg, shared);
     }
-    if cfg.full_view {
+    if cfg.canvas_window {
         let hwnd = cfg.hwnd as HWND;
         let info = win::describe(hwnd);
-        return run_full_canvas(cfg, shared, hwnd, &info, true);
+        return run_canvas_capture(cfg, shared, hwnd, &info, false);
     }
     let hwnd = cfg.hwnd as HWND;
     let info = win::describe(hwnd);
@@ -923,27 +949,36 @@ fn run_navigator(cfg: &RecorderConfig, shared: &Arc<Shared>) -> Result<(), Strin
     use crate::navigator;
 
     let nav = navigator::probe(cfg.hwnd as HWND)?;
-    run_full_canvas(cfg, shared, nav.capture.hwnd, &nav.root, true)
+    run_canvas_capture(cfg, shared, nav.capture.hwnd, &nav.root, true)
 }
 
-fn run_full_canvas(
+fn run_canvas_capture(
     cfg: &RecorderConfig,
     shared: &Arc<Shared>,
     capture_hwnd: HWND,
     source_info: &win::WindowInfo,
-    force_direct: bool,
+    navigator_mode: bool,
 ) -> Result<(), String> {
     use crate::navigator;
 
     let target_pid = win::pid_of(capture_hwnd);
     // 抓帧器必须在本线程创建、使用和销毁（GDI/DWM 线程亲和性）。
-    let mut cap = if force_direct {
+    let mut cap = if navigator_mode {
         ThumbnailCapture::new_direct(capture_hwnd)?
     } else {
-        ThumbnailCapture::new(capture_hwnd)?
+        ThumbnailCapture::new_preferred(capture_hwnd)?
     };
     let full = cap.grab()?;
-    let mut canvas_rect = navigator::detect_canvas_rect(&full)?;
+    let mut canvas_rect = if navigator_mode {
+        navigator::detect_canvas_rect(&full)?
+    } else {
+        navigator::CanvasRect {
+            x: 0,
+            y: 0,
+            width: full.width,
+            height: full.height,
+        }
+    };
     let initial = navigator::crop_canvas(&full, canvas_rect)?;
     let (rw, rh) = cap.size();
 
@@ -972,10 +1007,10 @@ fn run_full_canvas(
         .phase
         .store(Phase::Recording.code(), Ordering::SeqCst);
     if !writer.save(&initial) {
-        return Err("导航器首帧写入队列失败".into());
+        return Err("画布窗口首帧写入队列失败".into());
     }
     logline!(
-        "[full-view] 开始录制 source=0x{:X} | {} | raw={}x{} crop=({},{},{},{})",
+        "[canvas-window] 开始录制 source=0x{:X} | {} | raw={}x{} crop=({},{},{},{})",
         capture_hwnd as isize,
         source_info.label(),
         rw,
@@ -1009,6 +1044,7 @@ fn run_full_canvas(
     let mut grab_us: u64 = 0;
     let mut grab_n: u32 = 0;
     let mut grab_failures: u32 = 0;
+    let mut rect_failures: u32 = 0;
     let mut last_disk_check = Instant::now();
     let mut last_rect_check = Instant::now();
     let mut rect_dirty = false;
@@ -1065,14 +1101,14 @@ fn run_full_canvas(
                             .max(4)
                     ],
                 );
-                logline!("[full-view] 视图尺寸变化，重新定位画布 ({nw}x{nh})");
+                logline!("[canvas-capture] 视图尺寸变化，重新定位画布 ({nw}x{nh})");
             }
             Ok(false) => {}
             Err(e) => {
                 shared.dropped.fetch_add(1, Ordering::SeqCst);
                 grab_failures += 1;
                 if grab_failures >= 30 {
-                    return Err(format!("连续 {grab_failures} 次同步导航器尺寸失败: {e}"));
+                    return Err(format!("连续 {grab_failures} 次同步画布窗口尺寸失败: {e}"));
                 }
             }
         }
@@ -1088,42 +1124,97 @@ fn run_full_canvas(
             Ok(false) => {}
             Ok(true) => {
                 grab_failures = 0;
-                if rect_dirty
-                    || last_rect_check.elapsed() >= Duration::from_secs(30)
-                    || canvas_rect.width > raw_cur.width
-                    || canvas_rect.height > raw_cur.height
-                    || canvas_rect.x < 0
-                    || canvas_rect.y < 0
-                    || canvas_rect.x.saturating_add(canvas_rect.width) > raw_cur.width
-                    || canvas_rect.y.saturating_add(canvas_rect.height) > raw_cur.height
+                if navigator_mode
+                    && (rect_dirty
+                        || last_rect_check.elapsed() >= Duration::from_secs(30)
+                        || canvas_rect.width > raw_cur.width
+                        || canvas_rect.height > raw_cur.height
+                        || canvas_rect.x < 0
+                        || canvas_rect.y < 0
+                        || canvas_rect.x.saturating_add(canvas_rect.width) > raw_cur.width
+                        || canvas_rect.y.saturating_add(canvas_rect.height) > raw_cur.height)
                 {
-                    canvas_rect = navigator::detect_canvas_rect(&raw_cur)?;
+                    last_rect_check = Instant::now();
+                    match navigator::detect_canvas_rect(&raw_cur) {
+                        Ok(rect) => {
+                            canvas_rect = rect;
+                            rect_dirty = false;
+                            rect_failures = 0;
+                        }
+                        Err(e) => {
+                            rect_failures += 1;
+                            shared.dropped.fetch_add(1, Ordering::SeqCst);
+                            rect_dirty = true;
+                            if rect_failures == 1 || rect_failures % 10 == 0 {
+                                logline!(
+                                    "[navigator] 画布区域重新定位失败 {rect_failures} 次，继续使用上次有效区域：{e}"
+                                );
+                            }
+                        }
+                    }
+                } else if !navigator_mode && rect_dirty {
+                    canvas_rect = navigator::CanvasRect {
+                        x: 0,
+                        y: 0,
+                        width: raw_cur.width,
+                        height: raw_cur.height,
+                    };
                     rect_dirty = false;
                     last_rect_check = Instant::now();
                 }
-                let cropped = navigator::crop_canvas(&raw_cur, canvas_rect)?;
-                let image_changed = prev.as_ref().map_or(true, |previous| {
-                    previous.width != cropped.width
-                        || previous.height != cropped.height
-                        || previous.changed_enough_bytes(&cropped.bgra, cfg.threshold)
-                });
-                if image_changed {
-                    if shared.blank_warned.load(Ordering::SeqCst) {
-                        if !cropped.is_blank() {
-                            shared.blank_warned.store(false, Ordering::SeqCst);
-                        }
-                    } else if cropped.is_blank() {
-                        shared.blank_warned.store(true, Ordering::SeqCst);
+                let cropped = match navigator::crop_canvas(&raw_cur, canvas_rect) {
+                    Ok(frame) => {
+                        rect_failures = 0;
+                        Some(frame)
                     }
-                    let (bw, bh) = shared.base_size();
-                    let to_save: &Frame = if cropped.width == bw && cropped.height == bh {
-                        &cropped
+                    Err(e) => {
+                        rect_failures += 1;
+                        shared.dropped.fetch_add(1, Ordering::SeqCst);
+                        rect_dirty = true;
+                        raw_prev = None;
+                        logline!("[navigator] 上次画布区域已失效，等待重新定位：{e}");
+                        None
+                    }
+                };
+                if rect_failures >= 30 {
+                    return Err(format!("连续 {rect_failures} 次无法重新定位导航器画布"));
+                }
+                if let Some(cropped) = cropped {
+                    let image_changed = prev.as_ref().map_or(true, |previous| {
+                        previous.width != cropped.width
+                            || previous.height != cropped.height
+                            || previous.changed_enough_bytes(&cropped.bgra, cfg.threshold)
+                    });
+                    if image_changed {
+                        if shared.blank_warned.load(Ordering::SeqCst) {
+                            if !cropped.is_blank() {
+                                shared.blank_warned.store(false, Ordering::SeqCst);
+                            }
+                        } else if cropped.is_blank() {
+                            shared.blank_warned.store(true, Ordering::SeqCst);
+                        }
+                        let (bw, bh) = shared.base_size();
+                        let to_save: &Frame = if cropped.width == bw && cropped.height == bh {
+                            &cropped
+                        } else {
+                            // 后续帧统一适配首帧画布尺寸，避免预览/视频在导航器调整尺寸时抖动。
+                            &cropped.fit_into(bw.max(1), bh.max(1), cfg.fill_rgb)
+                        };
+                        if writer.save(to_save) {
+                            prev = Some(cropped);
+                            let old = raw_prev.take();
+                            let next = old
+                                .filter(|f| f.width == raw_cur.width && f.height == raw_cur.height)
+                                .unwrap_or_else(|| {
+                                    Frame::new(
+                                        raw_cur.width,
+                                        raw_cur.height,
+                                        vec![0u8; raw_cur.bgra.len()],
+                                    )
+                                });
+                            raw_prev = Some(std::mem::replace(&mut raw_cur, next));
+                        }
                     } else {
-                        // 后续帧统一适配首帧画布尺寸，避免预览/视频在导航器调整尺寸时抖动。
-                        &cropped.fit_into(bw.max(1), bh.max(1), cfg.fill_rgb)
-                    };
-                    if writer.save(to_save) {
-                        prev = Some(cropped);
                         let old = raw_prev.take();
                         let next = old
                             .filter(|f| f.width == raw_cur.width && f.height == raw_cur.height)
@@ -1136,21 +1227,13 @@ fn run_full_canvas(
                             });
                         raw_prev = Some(std::mem::replace(&mut raw_cur, next));
                     }
-                } else {
-                    let old = raw_prev.take();
-                    let next = old
-                        .filter(|f| f.width == raw_cur.width && f.height == raw_cur.height)
-                        .unwrap_or_else(|| {
-                            Frame::new(raw_cur.width, raw_cur.height, vec![0u8; raw_cur.bgra.len()])
-                        });
-                    raw_prev = Some(std::mem::replace(&mut raw_cur, next));
                 }
             }
             Err(e) => {
                 shared.dropped.fetch_add(1, Ordering::SeqCst);
                 grab_failures += 1;
                 if grab_failures >= 30 {
-                    return Err(format!("连续 {grab_failures} 次导航器抓帧失败: {e}"));
+                    return Err(format!("连续 {grab_failures} 次画布窗口抓帧失败: {e}"));
                 }
             }
         }
@@ -1167,7 +1250,7 @@ fn run_full_canvas(
                 0.0
             };
             logline!(
-                "[full-view][perf] 抓帧 {grab_n} 次，平均 {avg:.2} ms/帧，丢弃 {}",
+                "[canvas-capture][perf] 抓帧 {grab_n} 次，平均 {avg:.2} ms/帧，丢弃 {}",
                 shared.dropped.load(Ordering::SeqCst)
             );
             grab_us = 0;
@@ -1227,6 +1310,13 @@ mod tests {
         s.request_mark();
         assert_eq!(s.take_marks(), vec![120, 340]);
         assert!(s.take_marks().is_empty());
+    }
+
+    #[test]
+    fn 高分辨率使用更小的编码队列() {
+        assert_eq!(stream_queue_depth(1920, 1080), 4);
+        assert_eq!(stream_queue_depth(3840, 2160), 2);
+        assert_eq!(stream_queue_depth(7680, 4320), 2);
     }
 
     #[test]

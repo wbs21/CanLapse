@@ -38,10 +38,12 @@ Photoshop, CLIP STUDIO PAINT or Krita.
 1. Extract `CanLapse-v2.0.0-win64.zip` to any writable folder (for example `D:\Tools\CanLapse`).
 2. Run `CanLapse.exe`.
 3. Choose the source for your app:
-   - SAI2: detach the navigator and click **Use SAI2 Navigator**
-   - CSP: **View → New View** (or drag the canvas tab out), then click
-     **Select CSP Full Canvas View**
-4. Keep the selected source showing the complete canvas at a fixed angle.
+   - SAI2, Photoshop, Krita, and most other apps: click **Select Canvas Window** and
+     choose the original canvas window. Canvas pan, zoom, and rotation are recorded.
+   - SAI2 fixed full canvas: detach the navigator and click **Use SAI2 Navigator**.
+   - CSP: use **Window → Canvas → New Window**, drag the new canvas tab out, then use
+     **View → Fit Window Size** and click **Select Canvas Window** on that second view.
+4. For CSP, keep the second view fitted to the complete canvas at a fixed angle.
 5. Choose **Frame density** and **Change sensitivity**, then click **Start Recording**.
 6. Draw in the original view. Use the floating bar to **Pause**, **Mark** or **Stop**.
 7. The MP4 lands in `output\timelapse_YYYYMMDD-HHMMSS.mp4` next to the exe.
@@ -49,11 +51,16 @@ Photoshop, CLIP STUDIO PAINT or Krita.
 > The first captured frame defines the video resolution. If you resize the canvas mid-session, frames are
 > scaled proportionally and letterboxed.
 
-### SAI2 navigator and CSP full-canvas view
+### Canvas window, CSP second view, and SAI2 navigator
 
-SAI2 uses its detached navigator because SAI2 child views become unreliable when
-dragged partially outside the parent window. CSP uses a second full-canvas view,
-which is more stable and avoids navigator position indicators.
+**Select Canvas Window** records the selected original canvas window for SAI2,
+Photoshop, Krita, and most other apps. Pan, zoom, and rotation are recorded as part
+of the artwork session.
+
+For CSP, a second fitted canvas view is recommended because it keeps the complete
+canvas visible while the original view is used for drawing; pan, zoom, and rotation
+can then be excluded from the timelapse. For SAI2, use **Use SAI2 Navigator** when a
+fixed full-canvas recording is required.
 
 CLI equivalents:
 
@@ -72,7 +79,7 @@ USB-stick copy stays self-contained.
 | Item | Requirement |
 |---|---|
 | OS | Windows 10 / 11, 64-bit (x64). ARM64 works through emulation. |
-| Desktop composition | Recommended for legacy thumbnail capture. Full-canvas and SAI2 navigator modes use direct capture and do not require DWM. |
+| Desktop composition | Recommended. Canvas-window capture uses DWM when available and falls back to direct capture; SAI2 navigator mode always uses direct capture. |
 | Runtime | **None.** No DLLs, no .NET, no Visual C++ redistributable, no installer. |
 | Drawing apps | Any app with a floating canvas window: SAI2, Photoshop, CLIP STUDIO PAINT, Krita… |
 
@@ -106,8 +113,8 @@ canvas HWND ──► DWM thumbnail (DwmRegisterThumbnail + rcSource crop)
   it does not save image files and does not encode the video a second time.
 - If a target is mostly or completely outside the virtual desktop, CanLapse automatically switches from
   the DWM thumbnail path to direct `PrintWindow(PW_RENDERFULLCONTENT)` capture.
-- Full-canvas view mode always uses direct source capture, so partial occlusion or an off-screen
-  position does not stop the second view from refreshing.
+- Canvas-window capture uses DWM when available and automatically falls back to direct source capture
+  if the DWM path fails or the window leaves the visible desktop.
 
 ---
 
@@ -155,10 +162,13 @@ pwsh -File tools\build.ps1
 # release build (what ships)
 pwsh -File tools\build.ps1 -Profile release
 
+# optional Authenticode signing (Windows SDK signtool + certificate thumbprint)
+pwsh -File tools\build.ps1 -Profile release -SignThumbprint <certificate-thumbprint>
+
 # assemble dist\CanLapse-v<version>-win64.zip (exe + 使用说明.txt only)
 pwsh -File tools\package.ps1 -Version 2.0.0
 
-# tests (55 unit + 5 integration)
+# tests
 cargo test --offline
 ```
 
@@ -169,6 +179,8 @@ Notes:
   vendored libs automatically (override with `CANLAPSE_FFMPEG_STATIC`).
 - Resource injection (icon + version info) happens **after** linking via `tools\embed-resources.ps1`;
   run the build and the injection script as a pair (that is what `build.ps1` does).
+- If `-SignThumbprint` or `CANLAPSE_SIGN_THUMBPRINT` is set, the final binaries are signed after
+  resource injection and verified with `Get-AuthenticodeSignature`. Without a certificate they remain unsigned.
 - Rebuilding the static libraries themselves (only needed when bumping ffmpeg/openh264) is documented in
   [`deps/ffmpeg-static/README.md`](deps/ffmpeg-static/README.md).
 
@@ -188,7 +200,7 @@ docs/evidence/        screenshots used in this README and in the logs
 | Symptom | Cause / fix |
 |---|---|
 | Preview shows toolbars and layer panels | The canvas is not a floating window. Click **How to Locate** for per-app steps. |
-| “Desktop composition (DWM) is off” | Legacy thumbnail capture is unavailable. Use the CSP full-canvas or SAI2 navigator mode. |
+| “Desktop composition (DWM) is off” | CanLapse tries direct capture instead. If the app does not support `PrintWindow`, check `canlapse.log`. |
 | Target is mostly/fully outside the screen | CanLapse switches to direct `PrintWindow`; if that app does not support it, the reason is written to `canlapse.log`. |
 | No frames at all | The canvas never changed during the recording — the session is discarded with a notice. |
 | Video is short | Playback is fixed at 30 fps; `seconds = frames / 30`. Raise frame density for more frames. |
