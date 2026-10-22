@@ -1,4 +1,4 @@
-CanLapse v1.3.0 —— 画布窗口缩时录屏（Windows 10/11 x64）
+CanLapse v1.3.2 —— 画布窗口缩时录屏（Windows 10/11 x64）
 Canvas Timelapse Recorder for drawing apps
 ==========================================================
 

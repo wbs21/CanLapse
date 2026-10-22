@@ -6,7 +6,7 @@ Pick a canvas window once, and CanLapse quietly captures it on a schedule, keeps
 actually changed, and exports a 30 fps MP4 when you stop. Built for digital painters using SAI2,
 Photoshop, CLIP STUDIO PAINT or Krita.
 
-`v1.3.0` · single-file executable · no DLLs · English / 中文 UI (follows system language)
+`v1.3.2` · single-file executable · no DLLs · English / 中文 UI (follows system language)
 
 ![Main window](docs/evidence/ui-main-en.png)
 
@@ -35,7 +35,7 @@ Photoshop, CLIP STUDIO PAINT or Krita.
 
 ## Quick start
 
-1. Extract `CanLapse-v1.3.0-win64.zip` to any writable folder (for example `D:\Tools\CanLapse`).
+1. Extract `CanLapse-v1.3.2-win64.zip` to any writable folder (for example `D:\Tools\CanLapse`).
 2. Run `CanLapse.exe`.
 3. Click **Pick Window** — CanLapse minimizes itself and shows *“Click the canvas border”*.
    Click the canvas (its border or its content; `Esc`/right-click cancels).
@@ -134,7 +134,7 @@ pwsh -File tools\build.ps1
 pwsh -File tools\build.ps1 -Profile release
 
 # assemble dist\CanLapse-v<version>-win64.zip (exe + 使用说明.txt only)
-pwsh -File tools\package.ps1 -Version 1.3.0
+pwsh -File tools\package.ps1 -Version 1.3.2
 
 # tests (49 unit + 4 integration)
 cargo test --offline
