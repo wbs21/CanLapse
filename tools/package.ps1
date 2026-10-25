@@ -6,8 +6,8 @@
 #   * 这里固定"只放 CanLapse.exe + 使用说明 + 许可文件"，防止历史 DLL 或 CLI 被误拷进去。
 #     许可文件必须随二进制分发（ffmpeg 是 LGPL-2.1+ 静态链接，openh264 是 BSD-2）。
 #
-# 用法：pwsh -File tools\package.ps1 [-Version 2.0.0]
-param([string]$Version = '2.0.0')
+# 用法：pwsh -File tools\package.ps1 [-Version 2.0.1]
+param([string]$Version = '2.0.1')
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot

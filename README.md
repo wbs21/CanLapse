@@ -6,7 +6,7 @@ Pick a canvas window once, and CanLapse quietly captures it on a schedule, keeps
 actually changed, and exports a 30 fps MP4 when you stop. Built for digital painters using SAI2,
 Photoshop, CLIP STUDIO PAINT or Krita.
 
-`v2.0.0` · single-file executable · no DLLs · English / 中文 UI (follows system language)
+`v2.0.1` · single-file executable · no DLLs · English / 中文 UI (follows system language)
 
 ![Main window](docs/evidence/ui-main-en.png)
 
@@ -35,7 +35,7 @@ Photoshop, CLIP STUDIO PAINT or Krita.
 
 ## Quick start
 
-1. Extract `CanLapse-v2.0.0-win64.zip` to any writable folder (for example `D:\Tools\CanLapse`).
+1. Extract `CanLapse-v2.0.1-win64.zip` to any writable folder (for example `D:\Tools\CanLapse`).
 2. Run `CanLapse.exe`.
 3. Choose the source for your app:
    - SAI2, Photoshop, Krita, and most other apps: click **Select Canvas Window** and
@@ -123,7 +123,7 @@ canvas HWND ──► DWM thumbnail (DwmRegisterThumbnail + rcSource crop)
 | Setting | Options | Default |
 |---|---|---|
 | Frame density | 1 frame / 5 s · 1 frame / 2 s · 1 frame / s · 2 frames / s | **1 frame / 5 s** |
-| Change sensitivity | 1 = 0.016 · 2 = 0.014 · 3 = 0.012 · 4 = 0.010 · 5 = 0.008 · **6 = 0.006** · 7 = 0.002 · 8 = 0.001 | **6** |
+| Change sensitivity | 1 = 0.007 · 2 = 0.006 · 3 = 0.005 · 4 = 0.004 · 5 = 0.003 · **6 = 0.002** · 7 = 0.001 · 8 = 0.00075 · 9 = 0.0005 | **6** |
 | Playback rate | fixed 30 fps | — |
 | Quality | fixed medium (H.264, ~0.06 bpp) | — |
 | Auto-clean cache | delete streaming session data after a successful finalize | on |
@@ -166,7 +166,7 @@ pwsh -File tools\build.ps1 -Profile release
 pwsh -File tools\build.ps1 -Profile release -SignThumbprint <certificate-thumbprint>
 
 # assemble dist\CanLapse-v<version>-win64.zip (exe + 使用说明.txt only)
-pwsh -File tools\package.ps1 -Version 2.0.0
+pwsh -File tools\package.ps1 -Version 2.0.1
 
 # tests
 cargo test --offline

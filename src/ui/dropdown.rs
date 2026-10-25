@@ -48,6 +48,9 @@ struct PopupData {
     sel: usize,
     hover_row: isize,
     field: HWND,
+    /// 字段在 WM_LBUTTONDOWN 中创建弹层并设置捕获后，同一次点击的
+    /// WM_LBUTTONUP 会被重定向到这里；它不能用于选择或关闭。
+    swallow_next_up: bool,
 }
 
 static FIELDS: Mutex<Option<HashMap<isize, FieldData>>> = Mutex::new(None);
@@ -309,6 +312,7 @@ unsafe fn open_popup(field: HWND) {
         sel,
         hover_row: sel as isize,
         field,
+        swallow_next_up: true,
     });
     SetWindowLongPtrW(popup, GWLP_USERDATA, Box::into_raw(data) as isize);
     OPEN.store(popup as isize, Ordering::SeqCst);
@@ -410,6 +414,13 @@ unsafe extern "system" fn popup_proc(
                 0
             }
             WM_LBUTTONUP => {
+                if let Some(data) = popup_data(hwnd) {
+                    let d = &mut *data;
+                    if d.swallow_next_up {
+                        d.swallow_next_up = false;
+                        return 0;
+                    }
+                }
                 let mut sel: Option<usize> = None;
                 let mut field: HWND = std::ptr::null_mut();
                 if let Some(data) = popup_data(hwnd) {
@@ -439,6 +450,9 @@ unsafe extern "system" fn popup_proc(
                 0
             }
             WM_LBUTTONDOWN => {
+                if let Some(data) = popup_data(hwnd) {
+                    (*data).swallow_next_up = false;
+                }
                 let mut cr: RECT = std::mem::zeroed();
                 GetClientRect(hwnd, &mut cr);
                 if x < 0 || y < 0 || x >= cr.right || y >= cr.bottom {
